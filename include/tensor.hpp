@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <span>
 #include <stdexcept>
@@ -8,18 +9,32 @@
 
 #include "gpu_buffer.h"
 
+enum class DeviceType {
+    CPU,
+    CUDA
+};
+
 class Tensor {
 public:
-    explicit Tensor(std::vector<std::size_t> shape)
+    explicit Tensor(
+        std::vector<std::size_t> shape,
+        DeviceType device_type = DeviceType::CUDA
+    )
         : shape_(std::move(shape)),
-          storage_(element_count(shape_)) {}
+          device_type_(device_type),
+          storage_(device_type == DeviceType::CUDA ? element_count(shape_) : 0),
+          host_storage_(device_type == DeviceType::CPU ? element_count(shape_) : 0) {}
 
     [[nodiscard]] float* data() noexcept {
-        return storage_.data();
+        return device_type_ == DeviceType::CUDA
+            ? storage_.data()
+            : host_storage_.data();
     }
 
     [[nodiscard]] const float* data() const noexcept {
-        return storage_.data();
+        return device_type_ == DeviceType::CUDA
+            ? storage_.data()
+            : host_storage_.data();
     }
 
     [[nodiscard]] const std::vector<std::size_t>& shape() const noexcept {
@@ -27,11 +42,21 @@ public:
     }
 
     [[nodiscard]] std::size_t numel() const noexcept {
-        return storage_.size();
+        return device_type_ == DeviceType::CUDA
+            ? storage_.size()
+            : host_storage_.size();
     }
 
     [[nodiscard]] std::size_t dim() const noexcept {
         return shape_.size();
+    }
+
+    [[nodiscard]] DeviceType device_type() const noexcept {
+        return device_type_;
+    }
+
+    [[nodiscard]] DeviceType deviceType() const noexcept {
+        return device_type();
     }
 
     [[nodiscard]] std::size_t size(std::size_t axis) const {
@@ -46,7 +71,11 @@ public:
             throw std::invalid_argument("Tensor: invalid input size");
         }
 
-        storage_.copy_from_host(source.data(), source.size());
+        if (device_type_ == DeviceType::CUDA) {
+            storage_.copy_from_host(source.data(), source.size());
+        } else {
+            std::copy(source.begin(), source.end(), host_storage_.begin());
+        }
     }
 
     void copy_to_host(std::span<float> destination) const {
@@ -54,7 +83,11 @@ public:
             throw std::invalid_argument("Tensor: invalid output size");
         }
 
-        storage_.copy_to_host(destination.data(), destination.size());
+        if (device_type_ == DeviceType::CUDA) {
+            storage_.copy_to_host(destination.data(), destination.size());
+        } else {
+            std::copy(host_storage_.begin(), host_storage_.end(), destination.begin());
+        }
     }
 
 private:
@@ -76,5 +109,7 @@ private:
     }
 
     std::vector<std::size_t> shape_;
+    DeviceType device_type_;
     GpuBuffer<float> storage_;
+    std::vector<float> host_storage_;
 };

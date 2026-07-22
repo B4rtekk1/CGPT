@@ -113,6 +113,22 @@ void expect_invalid_argument(
     std::exit(EXIT_FAILURE);
 }
 
+void test_device_type() {
+    Tensor cpu_tensor({2, 3}, DeviceType::CPU);
+    if (cpu_tensor.device_type() != DeviceType::CPU ||
+        cpu_tensor.deviceType() != DeviceType::CPU) {
+        std::cerr << "Tensor did not preserve CPU device type\n";
+        std::exit(EXIT_FAILURE);
+    }
+
+    const std::vector<float> values{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    cpu_tensor.copy_from_host(values);
+
+    std::vector<float> copied(values.size());
+    cpu_tensor.copy_to_host(copied);
+    expect_close(copied, values, 0.0f);
+}
+
 } // namespace
 
 int main() {
@@ -128,6 +144,12 @@ int main() {
     Tensor mismatched_input({2, 4});
     Tensor mismatched_weight({3});
     expect_invalid_argument(mismatched_input, mismatched_weight);
+
+    test_device_type();
+    expect_invalid_argument(
+        Tensor({2, 4}, DeviceType::CPU),
+        Tensor({4}, DeviceType::CPU)
+    );
 
     std::cout << "RMSNorm tests passed.\n";
     return EXIT_SUCCESS;
