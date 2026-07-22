@@ -4,7 +4,7 @@
 #include <cuda_runtime_api.h>
 #include <utility>
 
-#include "../src/common/cuda_check.h"
+#include "cuda_check.h"
 
 template <typename T>
 class GpuBuffer {

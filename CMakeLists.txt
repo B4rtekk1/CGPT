@@ -1,11 +1,30 @@
 cmake_minimum_required(VERSION 4.3)
 project(CGPT CUDA)
 
+enable_testing()
+
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_ARCHITECTURES 86-real)
 
-add_executable(CGPT main.cu src/common/cuda_check.h
-        include/gpu_buffer.h)
+add_executable(CGPT src/main.cu include/cuda_check.h
+        include/gpu_buffer.h
+        include/ops/rmsnorm.h
+        src/ops/rmsnorm.cu)
+
+target_include_directories(CGPT PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 set_target_properties(CGPT PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
+
+add_executable(rmsnorm_test
+        tests/rmsnorm_test.cu
+        src/ops/rmsnorm.cu)
+
+target_include_directories(rmsnorm_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+set_target_properties(rmsnorm_test PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON)
+
+add_test(NAME rmsnorm_test COMMAND rmsnorm_test)
