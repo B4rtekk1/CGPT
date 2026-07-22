@@ -86,6 +86,10 @@ void run_case(std::vector<std::size_t> shape, float epsilon) {
     weight_tensor.copy_from_host(weight);
 
     Tensor output_tensor = rmsnorm_forward(input_tensor, weight_tensor, epsilon);
+    if (output_tensor.shape() != shape || output_tensor.dim() != 2) {
+        std::cerr << "RMSNorm returned an invalid output shape\n";
+        std::exit(EXIT_FAILURE);
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> actual(input.size());

@@ -20,7 +20,11 @@ set_target_properties(CGPT PROPERTIES
 
 add_executable(rmsnorm_test
         tests/rmsnorm_test.cu
-        src/ops/rmsnorm.cu)
+        src/ops/rmsnorm.cu
+        include/ops/rmsnorm.h
+        include/tensor.hpp
+        include/gpu_buffer.h
+        include/cuda_check.h)
 
 target_include_directories(rmsnorm_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include)

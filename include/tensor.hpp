@@ -31,7 +31,7 @@ public:
     }
 
     [[nodiscard]] std::size_t dim() const noexcept {
-        return storage_.size();
+        return shape_.size();
     }
 
     [[nodiscard]] std::size_t size(std::size_t axis) const {
