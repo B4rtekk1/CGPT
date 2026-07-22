@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -60,7 +61,9 @@ std::vector<float> rmsnorm_reference(
     return expected;
 }
 
-void run_case(int rows, int hidden, float epsilon) {
+void run_case(std::vector<std::size_t> shape, float epsilon) {
+    const int rows = static_cast<int>(shape[0]);
+    const int hidden = static_cast<int>(shape[1]);
     std::vector<float> input(rows * hidden);
     std::vector<float> weight(hidden);
 
@@ -77,60 +80,50 @@ void run_case(int rows, int hidden, float epsilon) {
     const std::vector<float> expected =
         rmsnorm_reference(input, weight, rows, hidden, epsilon);
 
-    float* device_output = nullptr;
-    float* device_input = nullptr;
-    float* device_weight = nullptr;
+    Tensor input_tensor(shape);
+    Tensor weight_tensor({shape[1]});
+    input_tensor.copy_from_host(input);
+    weight_tensor.copy_from_host(weight);
 
-    CUDA_CHECK(cudaMalloc(&device_output, input.size() * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&device_input, input.size() * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&device_weight, weight.size() * sizeof(float)));
-
-    CUDA_CHECK(cudaMemcpy(
-        device_input,
-        input.data(),
-        input.size() * sizeof(float),
-        cudaMemcpyHostToDevice
-    ));
-    CUDA_CHECK(cudaMemcpy(
-        device_weight,
-        weight.data(),
-        weight.size() * sizeof(float),
-        cudaMemcpyHostToDevice
-    ));
-
-    rmsnorm_forward(
-        device_output,
-        device_input,
-        device_weight,
-        rows,
-        hidden,
-        epsilon
-    );
+    Tensor output_tensor = rmsnorm_forward(input_tensor, weight_tensor, epsilon);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> actual(input.size());
-    CUDA_CHECK(cudaMemcpy(
-        actual.data(),
-        device_output,
-        actual.size() * sizeof(float),
-        cudaMemcpyDeviceToHost
-    ));
-
-    CUDA_CHECK(cudaFree(device_weight));
-    CUDA_CHECK(cudaFree(device_input));
-    CUDA_CHECK(cudaFree(device_output));
+    output_tensor.copy_to_host(actual);
 
     expect_close(actual, expected, 1.0e-4f);
+}
+
+void expect_invalid_argument(
+    const Tensor& input,
+    const Tensor& weight
+) {
+    try {
+        const Tensor output = rmsnorm_forward(input, weight, 1.0e-5f);
+        (void)output;
+    } catch (const std::invalid_argument&) {
+        return;
+    }
+
+    std::cerr << "Expected RMSNorm to reject invalid tensor shapes\n";
+    std::exit(EXIT_FAILURE);
 }
 
 } // namespace
 
 int main() {
     // Exercises several rows and a hidden size below one CUDA block.
-    run_case(3, 7, 1.0e-5f);
+    run_case({3, 7}, 1.0e-5f);
 
     // Exercises the second loop iteration in each thread and the reduction.
-    run_case(2, 513, 1.0e-5f);
+    run_case({2, 513}, 1.0e-5f);
+
+    expect_invalid_argument(Tensor({2, 4, 1}), Tensor({4}));
+    expect_invalid_argument(Tensor({2, 4}), Tensor({2, 4}));
+
+    Tensor mismatched_input({2, 4});
+    Tensor mismatched_weight({3});
+    expect_invalid_argument(mismatched_input, mismatched_weight);
 
     std::cout << "RMSNorm tests passed.\n";
     return EXIT_SUCCESS;

@@ -2,6 +2,8 @@
 #include "cuda_check.h"
 
 #include <cmath>
+#include <limits>
+#include <stdexcept>
 
 __global__ void rmsnorm_kernel(
     float* output,
@@ -42,20 +44,40 @@ __global__ void rmsnorm_kernel(
     }
 }
 
-void rmsnorm_forward(
-    float* output,
-    const float* input,
-    const float* weight,
-    int rows,
-    int hidden,
+Tensor rmsnorm_forward(
+    const Tensor& input,
+    const Tensor& weight,
     float epsilon,
     cudaStream_t stream
 ) {
+    if (input.shape().size() != 2) {
+        throw std::invalid_argument("RMSNorm input must have shape [rows, hidden]");
+    }
+    if (weight.shape().size() != 1) {
+        throw std::invalid_argument("RMSNorm weight must have shape [hidden]");
+    }
+
+    const std::size_t rows_size = input.size(0);
+    const std::size_t hidden_size = input.size(1);
+    if (weight.size(0) != hidden_size) {
+        throw std::invalid_argument(
+            "RMSNorm weight size must match input hidden size"
+        );
+    }
+    if (rows_size > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        hidden_size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument("RMSNorm dimensions exceed supported range");
+    }
+
+    const int rows = static_cast<int>(rows_size);
+    const int hidden = static_cast<int>(hidden_size);
+    Tensor output(input.shape());
     constexpr int threads = 256;
 
     rmsnorm_kernel<<<rows, threads, threads * sizeof(float), stream>>>(
-        output, input, weight, hidden, epsilon
+        output.data(), input.data(), weight.data(), hidden, epsilon
     );
 
     CUDA_CHECK(cudaGetLastError());
+    return output;
 }

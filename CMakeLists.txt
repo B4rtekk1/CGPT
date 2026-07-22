@@ -9,7 +9,8 @@ set(CMAKE_CUDA_ARCHITECTURES 86-real)
 add_executable(CGPT src/main.cu include/cuda_check.h
         include/gpu_buffer.h
         include/ops/rmsnorm.h
-        src/ops/rmsnorm.cu)
+        src/ops/rmsnorm.cu
+        include/tensor.hpp)
 
 target_include_directories(CGPT PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include)

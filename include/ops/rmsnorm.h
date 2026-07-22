@@ -2,12 +2,11 @@
 
 #include <cuda_runtime.h>
 
-void rmsnorm_forward(
-    float* output,
-    const float* input,
-    const float* weight,
-    int rows,
-    int hidden,
+#include "tensor.hpp"
+
+Tensor rmsnorm_forward(
+    const Tensor& input,
+    const Tensor& weight,
     float epsilon,
     cudaStream_t stream = nullptr
-    );
+);
