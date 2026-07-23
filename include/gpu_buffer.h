@@ -1,7 +1,8 @@
 #pragma once
 
-#include <complex.h>
 #include <cuda_runtime_api.h>
+#include <limits>
+#include <stdexcept>
 #include <utility>
 
 #include "cuda_check.h"
@@ -43,6 +44,10 @@ public:
             return;
         }
 
+        if (count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+            throw std::invalid_argument("GpuBuffer: allocation size overflows");
+        }
+
         CUDA_CHECK(cudaMalloc(&data_, count * sizeof(T)));
         count_ = count;
     }
@@ -56,6 +61,9 @@ public:
     }
 
     void copy_from_host(const T* source, std::size_t count) {
+        if (source == nullptr && count != 0) {
+            throw std::invalid_argument("GpuBuffer: source cannot be null");
+        }
         if (count > count_) {
             throw std::out_of_range("GpuBuffer: source is larger than the buffer size");
         }
@@ -64,6 +72,9 @@ public:
     }
 
     void copy_to_host(T* destination, std::size_t count) const {
+        if (destination == nullptr && count != 0) {
+            throw std::invalid_argument("GpuBuffer: destination cannot be null");
+        }
         if (count > count_) {
             throw std::out_of_range("GpuBuffer: destination is larger than the buffer size");
         }

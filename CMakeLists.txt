@@ -11,7 +11,8 @@ add_executable(CGPT src/main.cu include/cuda_check.h
         include/ops/rmsnorm.h
         src/ops/rmsnorm.cu
         include/tensor.h
-        src/tensor.cu)
+        src/tensor.cu
+        include/device_guard.h)
 
 target_include_directories(CGPT PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include)

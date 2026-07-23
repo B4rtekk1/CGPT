@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -22,7 +23,7 @@ public:
         DeviceType device_type = DeviceType::CUDA
     )
         : shape_(std::move(shape)),
-          device_type_(device_type),
+          device_type_(validate_device_type(device_type)),
           storage_(device_type == DeviceType::CUDA ? element_count(shape_) : 0),
           host_storage_(device_type == DeviceType::CPU ? element_count(shape_) : 0) {}
 
@@ -123,6 +124,13 @@ public:
     }
 
 private:
+    static DeviceType validate_device_type(DeviceType device_type) {
+        if (device_type != DeviceType::CPU && device_type != DeviceType::CUDA) {
+            throw std::invalid_argument("Tensor: invalid device type");
+        }
+        return device_type;
+    }
+
     static std::size_t element_count(const std::vector<std::size_t>& shape) {
         if (shape.empty()) {
             throw std::invalid_argument("Tensor shape cannot be empty");
@@ -133,6 +141,10 @@ private:
         for (const std::size_t dimension : shape) {
             if (dimension == 0) {
                 throw std::invalid_argument("Tensor dimension cannot be zero");
+            }
+
+            if (count > std::numeric_limits<std::size_t>::max() / dimension) {
+                throw std::invalid_argument("Tensor shape size overflows");
             }
 
             count *= dimension;

@@ -68,6 +68,9 @@ Tensor rmsnorm_forward(
     float epsilon,
     cudaStream_t stream
 ) {
+    if (!std::isfinite(epsilon) || epsilon <= 0.0f) {
+        throw std::invalid_argument("RMSNorm epsilon must be finite and positive");
+    }
     if (input.device_type() != DeviceType::CUDA ||
         weight.device_type() != DeviceType::CUDA) {
         throw std::invalid_argument("RMSNorm requires CUDA tensors");
