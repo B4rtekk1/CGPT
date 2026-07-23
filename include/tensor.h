@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <cuda_runtime.h>
 
 #include "gpu_buffer.h"
 
@@ -65,6 +66,37 @@ public:
         }
         return shape_[axis];
     }
+
+    [[nodiscard]] static Tensor empty(
+        std::vector<std::size_t> shape,
+        DeviceType device_type = DeviceType::CUDA
+        );
+
+    [[nodiscard]] static Tensor zeros(
+        std::vector<std::size_t> shape,
+        DeviceType device_type = DeviceType::CUDA,
+        cudaStream_t stream = nullptr
+        );
+
+    [[nodiscard]] static Tensor ones(
+        std::vector<std::size_t> shape,
+        DeviceType device_type = DeviceType::CUDA,
+        cudaStream_t stream = nullptr
+        );
+
+    [[nodiscard]] static Tensor full(
+        std::vector<std::size_t> shape,
+        float value,
+        DeviceType device_type = DeviceType::CUDA,
+        cudaStream_t stream = nullptr
+        );
+
+    [[nodiscard]] static Tensor eye(
+        std::size_t rows,
+        std::size_t columns,
+        DeviceType device_type = DeviceType::CUDA,
+        cudaStream_t stream = nullptr
+        );
 
     void copy_from_host(std::span<const float> source) {
         if (source.size() != numel()) {

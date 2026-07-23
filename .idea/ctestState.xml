@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CidrCTestProjectState">
+    <ctestState>
+      <lineNumber testId="path:null test:rmsnorm_test" value="35" />
+      <lineNumber testId="path:null test:tensor_test" value="50" />
+    </ctestState>
+  </component>
+</project>
