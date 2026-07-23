@@ -1,13 +1,68 @@
 #include "../include/core/cuda_check.h"
 #include "ops/rmsnorm.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
 namespace {
+
+void print_tensor(
+    const char* name,
+    const std::vector<float>& values,
+    const std::vector<std::size_t>& shape,
+    std::size_t max_rows = 8,
+    std::size_t max_columns = 12
+) {
+    std::cout << name << " shape=[";
+    for (std::size_t dimension = 0; dimension < shape.size(); ++dimension) {
+        if (dimension != 0) {
+            std::cout << ", ";
+        }
+        std::cout << shape[dimension];
+    }
+    std::cout << "]\n";
+
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
+        std::cout << "  <empty or non-matrix tensor>\n";
+        return;
+    }
+
+    const std::size_t rows = shape[0];
+    const std::size_t columns = shape[1];
+    const std::size_t rows_to_print = std::min(rows, max_rows);
+    const std::size_t head_columns = std::min(columns, max_columns);
+    const std::size_t tail_columns =
+        columns > max_columns ? std::min<std::size_t>(3, columns - head_columns) : 0;
+
+    std::cout << std::fixed << std::setprecision(5);
+    for (std::size_t row = 0; row < rows_to_print; ++row) {
+        std::cout << "  [";
+        for (std::size_t column = 0; column < head_columns; ++column) {
+            if (column != 0) {
+                std::cout << ", ";
+            }
+            std::cout << std::setw(9) << values[row * columns + column];
+        }
+
+        if (tail_columns != 0) {
+            std::cout << ", ...";
+            for (std::size_t column = columns - tail_columns; column < columns; ++column) {
+                std::cout << ", " << std::setw(9) << values[row * columns + column];
+            }
+        }
+        std::cout << "]\n";
+    }
+
+    if (rows_to_print < rows) {
+        std::cout << "  ... (" << rows - rows_to_print << " more row(s))\n";
+    }
+}
 
 void expect_close(
     const std::vector<float>& actual,
@@ -17,17 +72,20 @@ void expect_close(
     if (actual.size() != expected.size()) {
         std::cerr << "Size mismatch: got " << actual.size()
                   << ", expected " << expected.size() << '\n';
-        std::exit(EXIT_FAILURE);
+        throw std::runtime_error("RMSNorm result size mismatch");
     }
 
     for (std::size_t i = 0; i < actual.size(); ++i) {
         const float difference = std::fabs(actual[i] - expected[i]);
-        if (difference > tolerance) {
+        const float scale = std::max(1.0f, std::fabs(expected[i]));
+        if (!std::isfinite(actual[i]) ||
+            !std::isfinite(expected[i]) ||
+            difference > tolerance * scale) {
             std::cerr << "Mismatch at index " << i
                       << ": got " << actual[i]
                       << ", expected " << expected[i]
                       << ", difference " << difference << '\n';
-            std::exit(EXIT_FAILURE);
+            throw std::runtime_error("RMSNorm result mismatch");
         }
     }
 }
@@ -35,25 +93,25 @@ void expect_close(
 std::vector<float> rmsnorm_reference(
     const std::vector<float>& input,
     const std::vector<float>& weight,
-    int rows,
-    int hidden,
+    std::size_t rows,
+    std::size_t hidden,
     float epsilon
 ) {
     std::vector<float> expected(input.size());
 
-    for (int row = 0; row < rows; ++row) {
-        float sum_squares = 0.0f;
-        for (int column = 0; column < hidden; ++column) {
+    for (std::size_t row = 0; row < rows; ++row) {
+        double sum_squares = 0.0;
+        for (std::size_t column = 0; column < hidden; ++column) {
             const float value = input[row * hidden + column];
-            sum_squares += value * value;
+            sum_squares += static_cast<double>(value) * value;
         }
 
-        const float rms = std::sqrt(
-            sum_squares / static_cast<float>(hidden) + epsilon
-        );
+        const float rms = static_cast<float>(std::sqrt(
+            sum_squares / static_cast<double>(hidden) + epsilon
+        ));
 
-        for (int column = 0; column < hidden; ++column) {
-            const int index = row * hidden + column;
+        for (std::size_t column = 0; column < hidden; ++column) {
+            const std::size_t index = row * hidden + column;
             expected[index] = input[index] / rms * weight[column];
         }
     }
@@ -61,19 +119,32 @@ std::vector<float> rmsnorm_reference(
     return expected;
 }
 
-void run_case(std::vector<std::size_t> shape, float epsilon) {
-    const int rows = static_cast<int>(shape[0]);
-    const int hidden = static_cast<int>(shape[1]);
-    std::vector<float> input(rows * hidden);
+void run_case(const std::vector<std::size_t>& shape, float epsilon) {
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
+        throw std::invalid_argument("RMSNorm shape must be [rows, hidden]");
+    }
+    if (shape[0] > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        shape[1] > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument("RMSNorm shape exceeds the supported range");
+    }
+    if (shape[0] > std::numeric_limits<std::size_t>::max() / shape[1]) {
+        throw std::invalid_argument("RMSNorm shape has too many elements");
+    }
+
+    const std::size_t rows = shape[0];
+    const std::size_t hidden = shape[1];
+    const std::size_t elements = rows * hidden;
+    std::vector<float> input(elements);
     std::vector<float> weight(hidden);
 
-    for (int row = 0; row < rows; ++row) {
-        for (int column = 0; column < hidden; ++column) {
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t column = 0; column < hidden; ++column) {
             input[row * hidden + column] =
-                0.25f * static_cast<float>((row + 1) * (column % 7 - 3));
+                0.25f * static_cast<float>((row + 1) *
+                                            (static_cast<int>(column % 7) - 3));
         }
     }
-    for (int column = 0; column < hidden; ++column) {
+    for (std::size_t column = 0; column < hidden; ++column) {
         weight[column] = 0.5f + 0.125f * static_cast<float>(column % 5);
     }
 
@@ -88,13 +159,14 @@ void run_case(std::vector<std::size_t> shape, float epsilon) {
     Tensor output_tensor = rmsnorm_forward(input_tensor, weight_tensor, epsilon);
     if (output_tensor.shape() != shape || output_tensor.dim() != 2) {
         std::cerr << "RMSNorm returned an invalid output shape\n";
-        std::exit(EXIT_FAILURE);
+        throw std::runtime_error("RMSNorm returned an invalid output shape");
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::vector<float> actual(input.size());
     output_tensor.copy_to_host(actual);
 
+    print_tensor("RMSNorm output", actual, shape);
     expect_close(actual, expected, 1.0e-4f);
 }
 
@@ -110,7 +182,7 @@ void expect_invalid_argument(
     }
 
     std::cerr << "Expected RMSNorm to reject invalid tensor shapes\n";
-    std::exit(EXIT_FAILURE);
+    throw std::runtime_error("RMSNorm accepted invalid tensor shapes");
 }
 
 void test_invalid_epsilon() {
@@ -125,7 +197,7 @@ void test_invalid_epsilon() {
             continue;
         }
         std::cerr << "RMSNorm accepted invalid epsilon\n";
-        std::exit(EXIT_FAILURE);
+        throw std::runtime_error("RMSNorm accepted invalid epsilon");
     }
 }
 
@@ -165,7 +237,7 @@ void test_device_type() {
     if (cpu_tensor.device_type() != DeviceType::CPU ||
         cpu_tensor.deviceType() != DeviceType::CPU) {
         std::cerr << "Tensor did not preserve CPU device type\n";
-        std::exit(EXIT_FAILURE);
+        throw std::runtime_error("Tensor did not preserve CPU device type");
     }
 
     const std::vector<float> values{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};

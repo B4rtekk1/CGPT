@@ -137,6 +137,29 @@ void test_invalid_shapes() {
         throw std::runtime_error("Tensor accepted a zero dimension");
     } catch (const std::invalid_argument&) {
     }
+
+    try {
+        const Tensor tensor({2, 3}, DeviceType::CPU);
+        (void)tensor.size(2);
+        throw std::runtime_error("Tensor accepted an out-of-range axis");
+    } catch (const std::out_of_range&) {
+    }
+
+    try {
+        const auto max_dimension = std::numeric_limits<std::size_t>::max();
+        const Tensor tensor({max_dimension, 2}, DeviceType::CPU);
+        (void)tensor;
+        throw std::runtime_error("Tensor accepted an overflowing shape");
+    } catch (const std::invalid_argument&) {
+    }
+}
+
+void test_self_assignment() {
+    Tensor tensor({2, 2}, DeviceType::CPU);
+    const std::vector<float> expected{1.0f, 2.0f, 3.0f, 4.0f};
+    tensor.copy_from_host(expected);
+    tensor = tensor;
+    expect_values(read_values(tensor), expected);
 }
 
 } // namespace
@@ -150,6 +173,7 @@ int main() {
         test_cpu_gpu_copy_round_trip();
         test_tensor_copy_and_move();
         test_invalid_shapes();
+        test_self_assignment();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;
