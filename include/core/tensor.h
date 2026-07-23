@@ -9,6 +9,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 
+#include "dtype.h"
 #include "gpu_buffer.h"
 
 enum class DeviceType {
@@ -20,16 +21,25 @@ class Tensor {
 public:
     explicit Tensor(
         std::vector<std::size_t> shape,
-        DeviceType device_type = DeviceType::CUDA
+        DeviceType device_type = DeviceType::CUDA,
+        Dtype dtype = Dtype::F32
     )
         : shape_(std::move(shape)),
           device_type_(validate_device_type(device_type)),
+          dtype_(validate_storage_dtype(dtype)),
           storage_(device_type == DeviceType::CUDA ? element_count(shape_) : 0),
           host_storage_(device_type == DeviceType::CPU ? element_count(shape_) : 0) {}
+
+    explicit Tensor(
+        std::vector<std::size_t> shape,
+        Dtype dtype,
+        DeviceType device_type = DeviceType::CUDA
+    ) : Tensor(std::move(shape), device_type, dtype) {}
 
     Tensor(const Tensor& other)
         : shape_(other.shape_),
           device_type_(other.device_type_),
+          dtype_(other.dtype_),
           storage_(other.device_type_ == DeviceType::CUDA ? other.numel() : 0),
           host_storage_(other.device_type_ == DeviceType::CPU ? other.numel() : 0) {
         if (device_type_ == DeviceType::CUDA) {
@@ -88,6 +98,10 @@ public:
         return device_type();
     }
 
+    [[nodiscard]] Dtype dtype() const noexcept {
+        return dtype_;
+    }
+
     [[nodiscard]] std::size_t size(std::size_t axis) const {
         if (axis >= shape_.size()) {
             throw std::out_of_range("Tensor axis out of range");
@@ -97,33 +111,38 @@ public:
 
     [[nodiscard]] static Tensor empty(
         std::vector<std::size_t> shape,
-        DeviceType device_type = DeviceType::CUDA
+        DeviceType device_type = DeviceType::CUDA,
+        Dtype dtype = Dtype::F32
         );
 
     [[nodiscard]] static Tensor zeros(
         std::vector<std::size_t> shape,
         DeviceType device_type = DeviceType::CUDA,
-        cudaStream_t stream = nullptr
+        cudaStream_t stream = nullptr,
+        Dtype dtype = Dtype::F32
         );
 
     [[nodiscard]] static Tensor ones(
         std::vector<std::size_t> shape,
         DeviceType device_type = DeviceType::CUDA,
-        cudaStream_t stream = nullptr
+        cudaStream_t stream = nullptr,
+        Dtype dtype = Dtype::F32
         );
 
     [[nodiscard]] static Tensor full(
         std::vector<std::size_t> shape,
         float value,
         DeviceType device_type = DeviceType::CUDA,
-        cudaStream_t stream = nullptr
+        cudaStream_t stream = nullptr,
+        Dtype dtype = Dtype::F32
         );
 
     [[nodiscard]] static Tensor eye(
         std::size_t rows,
         std::size_t columns,
         DeviceType device_type = DeviceType::CUDA,
-        cudaStream_t stream = nullptr
+        cudaStream_t stream = nullptr,
+        Dtype dtype = Dtype::F32
         );
 
     void copy_from_host(std::span<const float> source) {
@@ -155,6 +174,7 @@ private:
         using std::swap;
         swap(shape_, other.shape_);
         swap(device_type_, other.device_type_);
+        swap(dtype_, other.dtype_);
         swap(storage_, other.storage_);
         swap(host_storage_, other.host_storage_);
     }
@@ -164,6 +184,13 @@ private:
             throw std::invalid_argument("Tensor: invalid device type");
         }
         return device_type;
+    }
+
+    static Dtype validate_storage_dtype(Dtype dtype) {
+        if (dtype != Dtype::F32) {
+            throw std::invalid_argument("Tensor currently supports only F32 storage");
+        }
+        return dtype;
     }
 
     static std::size_t element_count(const std::vector<std::size_t>& shape) {
@@ -189,6 +216,7 @@ private:
 
     std::vector<std::size_t> shape_;
     DeviceType device_type_;
+    Dtype dtype_;
     GpuBuffer<float> storage_;
     std::vector<float> host_storage_;
 };

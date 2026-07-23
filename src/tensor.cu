@@ -47,20 +47,22 @@ void fill(Tensor& tensor, float value, cudaStream_t stream) {
 
 Tensor Tensor::empty(
     std::vector<std::size_t> shape,
-    DeviceType device) {
-    return Tensor(std::move(shape), device);
+    DeviceType device,
+    Dtype dtype) {
+    return Tensor(std::move(shape), device, dtype);
 }
 
 Tensor Tensor::zeros(
     std::vector<std::size_t> shape,
     DeviceType device,
-    cudaStream_t stream) {
-    Tensor result(std::move(shape), device);
+    cudaStream_t stream,
+    Dtype dtype) {
+    Tensor result(std::move(shape), device, dtype);
 
     if (device == DeviceType::CUDA) {
         // cudaMemset is faster than a kernel for zeros.
         CUDA_CHECK(cudaMemsetAsync(
-            result.data(), 0, result.numel() * sizeof(float), stream));
+            result.data(), 0, result.numel() * dtype_size(result.dtype()), stream));
     }
 
     return result;
@@ -69,8 +71,9 @@ Tensor Tensor::zeros(
 Tensor Tensor::ones(
     std::vector<std::size_t> shape,
     DeviceType device,
-    cudaStream_t stream) {
-    Tensor result(std::move(shape), device);
+    cudaStream_t stream,
+    Dtype dtype) {
+    Tensor result(std::move(shape), device, dtype);
     fill(result, 1.0f, stream);
     return result;
 }
@@ -79,8 +82,9 @@ Tensor Tensor::full(
     std::vector<std::size_t> shape,
     float value,
     DeviceType device,
-    cudaStream_t stream) {
-    Tensor result(std::move(shape), device);
+    cudaStream_t stream,
+    Dtype dtype) {
+    Tensor result(std::move(shape), device, dtype);
     fill(result, value, stream);
     return result;
 }
@@ -89,9 +93,10 @@ Tensor Tensor::eye(
     std::size_t rows,
     std::size_t columns,
     DeviceType device,
-    cudaStream_t stream
+    cudaStream_t stream,
+    Dtype dtype
 ) {
-    Tensor result(std::vector<std::size_t>{rows, columns}, device);
+    Tensor result(std::vector<std::size_t>{rows, columns}, device, dtype);
 
     const std::size_t count = rows * columns;
 

@@ -14,6 +14,7 @@ set(CMAKE_CUDA_ARCHITECTURES 86-real CACHE STRING "CUDA architectures")
 set(CGPT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_library(cgpt_core STATIC
+        src/ops/linear.cu
         src/ops/rmsnorm.cu
         src/tensor.cu)
 
@@ -23,8 +24,7 @@ target_include_directories(cgpt_core PUBLIC
 target_link_libraries(cgpt_core PUBLIC CUDA::cudart CUDA::cublasLt)
 set_target_properties(cgpt_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-add_executable(CGPT src/main.cu
-        include/core/cublas_context.h)
+add_executable(CGPT src/main.cu)
 target_link_libraries(CGPT PRIVATE cgpt_core)
 
 function(add_cgpt_test name source)
@@ -35,11 +35,12 @@ function(add_cgpt_test name source)
 endfunction()
 
 add_cgpt_test(rmsnorm_test tests/rmsnorm_test.cu)
+add_cgpt_test(linear_test tests/linear_test.cu)
 add_cgpt_test(tensor_test tests/tensor_test.cu)
 add_cgpt_test(device_buffer_test tests/device_buffer_test.cu)
 add_cgpt_test(gpu_buffer_test tests/gpu_buffer_test.cu)
 add_cgpt_test(dtype_test tests/dtype_test.cu)
 
 set_tests_properties(
-        rmsnorm_test tensor_test device_buffer_test gpu_buffer_test dtype_test
+        rmsnorm_test linear_test tensor_test device_buffer_test gpu_buffer_test dtype_test
         PROPERTIES TIMEOUT 30)
