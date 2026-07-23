@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.3)
-project(CGPT LANGUAGES CXX CUDA)
+project(CGPT VERSION 1.0 LANGUAGES CXX CUDA)
 
 include(CTest)
 enable_testing()
@@ -24,23 +24,29 @@ target_include_directories(cgpt_core PUBLIC
 target_link_libraries(cgpt_core PUBLIC CUDA::cudart CUDA::cublasLt)
 set_target_properties(cgpt_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-add_executable(CGPT src/main.cu)
-target_link_libraries(CGPT PRIVATE cgpt_core)
+add_library(cgpt_tokenizer STATIC
+        include/tokenizer/bpe_tokenizer.h
+        src/tokenizer/bpe_tokenizer.cpp)
+target_include_directories(cgpt_tokenizer PUBLIC ${CGPT_INCLUDE_DIR})
 
-function(add_cgpt_test name source)
+add_executable(CGPT src/main.cu)
+target_link_libraries(CGPT PRIVATE cgpt_core cgpt_tokenizer)
+
+function(add_cgpt_test name source dependency)
     add_executable(${name} ${source})
-    target_link_libraries(${name} PRIVATE cgpt_core)
+    target_link_libraries(${name} PRIVATE ${dependency})
     add_test(NAME ${name} COMMAND ${name})
     set_target_properties(${name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endfunction()
 
-add_cgpt_test(rmsnorm_test tests/rmsnorm_test.cu)
-add_cgpt_test(linear_test tests/linear_test.cu)
-add_cgpt_test(tensor_test tests/tensor_test.cu)
-add_cgpt_test(device_buffer_test tests/device_buffer_test.cu)
-add_cgpt_test(gpu_buffer_test tests/gpu_buffer_test.cu)
-add_cgpt_test(dtype_test tests/dtype_test.cu)
+add_cgpt_test(rmsnorm_test tests/rmsnorm_test.cu cgpt_core)
+add_cgpt_test(linear_test tests/linear_test.cu cgpt_core)
+add_cgpt_test(tensor_test tests/tensor_test.cu cgpt_core)
+add_cgpt_test(device_buffer_test tests/device_buffer_test.cu cgpt_core)
+add_cgpt_test(gpu_buffer_test tests/gpu_buffer_test.cu cgpt_core)
+add_cgpt_test(dtype_test tests/dtype_test.cu cgpt_core)
+add_cgpt_test(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp cgpt_tokenizer)
 
 set_tests_properties(
-        rmsnorm_test linear_test tensor_test device_buffer_test gpu_buffer_test dtype_test
+        rmsnorm_test linear_test tensor_test device_buffer_test gpu_buffer_test dtype_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)

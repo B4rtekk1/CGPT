@@ -2,12 +2,6 @@
 <project version="4">
   <component name="CidrCTestProjectState">
     <ctestState>
-      <lineNumber testId="path:CMakeLists.txt test:device_buffer_test" value="32" />
-      <lineNumber testId="path:CMakeLists.txt test:dtype_test" value="32" />
-      <lineNumber testId="path:CMakeLists.txt test:gpu_buffer_test" value="32" />
-      <lineNumber testId="path:CMakeLists.txt test:linear_test" value="32" />
-      <lineNumber testId="path:CMakeLists.txt test:rmsnorm_test" value="32" />
-      <lineNumber testId="path:CMakeLists.txt test:tensor_test" value="32" />
       <lineNumber testId="path:null test:rmsnorm_test" value="35" />
       <lineNumber testId="path:null test:tensor_test" value="50" />
     </ctestState>
