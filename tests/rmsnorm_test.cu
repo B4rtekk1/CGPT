@@ -113,6 +113,53 @@ void expect_invalid_argument(
     std::exit(EXIT_FAILURE);
 }
 
+void test_invalid_epsilon() {
+    Tensor input({1, 4});
+    Tensor weight({4});
+
+    for (const float epsilon : {0.0f, -1.0f, NAN, INFINITY}) {
+        try {
+            const Tensor output = rmsnorm_forward(input, weight, epsilon);
+            (void)output;
+        } catch (const std::invalid_argument&) {
+            continue;
+        }
+        std::cerr << "RMSNorm accepted invalid epsilon\n";
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+void test_custom_stream() {
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    try {
+        Tensor input({2, 7});
+        Tensor weight = Tensor::ones({7}, DeviceType::CUDA, stream);
+        input.copy_from_host(std::vector<float>(14, 1.0f));
+
+        Tensor output = rmsnorm_forward(input, weight, 1.0e-5f, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        const auto values = [&] {
+            std::vector<float> result(output.numel());
+            output.copy_to_host(result);
+            return result;
+        }();
+
+        for (const float value : values) {
+            if (std::fabs(value - 1.0f) > 1.0e-4f) {
+                throw std::runtime_error("RMSNorm stream result is incorrect");
+            }
+        }
+    } catch (...) {
+        cudaStreamDestroy(stream);
+        throw;
+    }
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 void test_device_type() {
     Tensor cpu_tensor({2, 3}, DeviceType::CPU);
     if (cpu_tensor.device_type() != DeviceType::CPU ||
@@ -150,6 +197,8 @@ int main() {
         Tensor({2, 4}, DeviceType::CPU),
         Tensor({4}, DeviceType::CPU)
     );
+    test_invalid_epsilon();
+    test_custom_stream();
 
     std::cout << "RMSNorm tests passed.\n";
     return EXIT_SUCCESS;

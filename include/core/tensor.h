@@ -27,6 +27,33 @@ public:
           storage_(device_type == DeviceType::CUDA ? element_count(shape_) : 0),
           host_storage_(device_type == DeviceType::CPU ? element_count(shape_) : 0) {}
 
+    Tensor(const Tensor& other)
+        : shape_(other.shape_),
+          device_type_(other.device_type_),
+          storage_(other.device_type_ == DeviceType::CUDA ? other.numel() : 0),
+          host_storage_(other.device_type_ == DeviceType::CPU ? other.numel() : 0) {
+        if (device_type_ == DeviceType::CUDA) {
+            CUDA_CHECK(cudaMemcpy(
+                storage_.data(), other.storage_.data(),
+                other.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
+        } else {
+            host_storage_ = other.host_storage_;
+        }
+    }
+
+    Tensor& operator=(const Tensor& other) {
+        if (this == &other) {
+            return *this;
+        }
+
+        Tensor copy(other);
+        swap(copy);
+        return *this;
+    }
+
+    Tensor(Tensor&&) noexcept = default;
+    Tensor& operator=(Tensor&&) noexcept = default;
+
     [[nodiscard]] float* data() noexcept {
         return device_type_ == DeviceType::CUDA
             ? storage_.data()
@@ -124,6 +151,14 @@ public:
     }
 
 private:
+    void swap(Tensor& other) noexcept {
+        using std::swap;
+        swap(shape_, other.shape_);
+        swap(device_type_, other.device_type_);
+        swap(storage_, other.storage_);
+        swap(host_storage_, other.host_storage_);
+    }
+
     static DeviceType validate_device_type(DeviceType device_type) {
         if (device_type != DeviceType::CPU && device_type != DeviceType::CUDA) {
             throw std::invalid_argument("Tensor: invalid device type");

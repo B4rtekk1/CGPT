@@ -5,6 +5,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <utility>
 
 namespace {
 
@@ -86,6 +87,42 @@ void test_copy_validation() {
     }
 }
 
+void test_cpu_gpu_copy_round_trip() {
+    const std::vector<float> expected{1.0f, -2.0f, 3.5f, 4.25f};
+    Tensor gpu_tensor({2, 2});
+    gpu_tensor.copy_from_host(expected);
+
+    std::vector<float> actual(expected.size());
+    gpu_tensor.copy_to_host(actual);
+    expect_values(actual, expected);
+
+    Tensor cpu_tensor({2, 2}, DeviceType::CPU);
+    cpu_tensor.copy_from_host(actual);
+    actual.assign(expected.size(), 0.0f);
+    cpu_tensor.copy_to_host(actual);
+    expect_values(actual, expected);
+}
+
+void test_tensor_copy_and_move() {
+    const std::vector<float> expected{1.0f, 2.0f, 3.0f, 4.0f};
+    Tensor original({2, 2});
+    original.copy_from_host(expected);
+
+    Tensor copied(original);
+    original.copy_from_host(std::vector<float>{9.0f, 9.0f, 9.0f, 9.0f});
+    expect_values(read_values(copied), expected);
+
+    Tensor assigned({1});
+    assigned = copied;
+    expect_values(read_values(assigned), expected);
+
+    Tensor moved(std::move(assigned));
+    expect_values(read_values(moved), expected);
+    if (assigned.numel() != 0) {
+        throw std::runtime_error("Moved-from Tensor should be empty");
+    }
+}
+
 void test_invalid_shapes() {
     try {
         const Tensor tensor(std::vector<std::size_t>{});
@@ -110,6 +147,8 @@ int main() {
         test_cpu_factories();
         test_cuda_factories();
         test_copy_validation();
+        test_cpu_gpu_copy_round_trip();
+        test_tensor_copy_and_move();
         test_invalid_shapes();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

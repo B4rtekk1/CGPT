@@ -54,7 +54,7 @@ void test_checked_byte_size() {
 
     const auto max_count = std::numeric_limits<std::size_t>::max() / dtype_size(Dtype::F32);
     assert(dtype_bytes(max_count, Dtype::F32) == max_count * sizeof(std::uint32_t));
-    expects_throw<std::invalid_argument>([&] { dtype_bytes(max_count + 1, Dtype::F32); });
+    expects_throw<std::invalid_argument>([&] { (void)dtype_bytes(max_count + 1, Dtype::F32); });
     expects_throw<std::invalid_argument>([] {
         dtype_size(static_cast<Dtype>(std::numeric_limits<std::uint8_t>::max()));
     });
@@ -67,8 +67,8 @@ void test_compute_types() {
     assert(compute_type_from_name("F32") == ComputeType::F32);
     assert(to_cublas_compute_type(ComputeType::F32) == CUBLAS_COMPUTE_32F);
     assert(to_cublas_compute_type(ComputeType::TF32) == CUBLAS_COMPUTE_32F_FAST_TF32);
-    expects_throw<std::invalid_argument>([] { dtype_from_name("float32"); });
-    expects_throw<std::invalid_argument>([] { compute_type_from_name("FP16"); });
+    expects_throw<std::invalid_argument>([] { (void)dtype_from_name("float32"); });
+    expects_throw<std::invalid_argument>([] { (void)compute_type_from_name("FP16"); });
 }
 
 } // namespace

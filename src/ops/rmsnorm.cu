@@ -68,7 +68,9 @@ __global__ void rmsnorm_kernel(
         total = warp_reduce_sum(total);
     }
 
-    __shared__ float inv_rms = 0.0f;
+    // Shared memory variables cannot have a C++ initializer in a CUDA kernel.
+    // Thread 0 writes the value before the synchronization below.
+    __shared__ float inv_rms;
     if (tid == 0) {
         inv_rms = rsqrtf(total / static_cast<float>(hidden) + epsilon);
     }
