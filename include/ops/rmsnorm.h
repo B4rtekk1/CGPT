@@ -2,7 +2,7 @@
 
 #include <cuda_runtime.h>
 
-#include "tensor.h"
+#include "../core/tensor.h"
 
 Tensor rmsnorm_forward(
     const Tensor& input,

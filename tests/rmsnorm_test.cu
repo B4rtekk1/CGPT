@@ -1,4 +1,4 @@
-#include "cuda_check.h"
+#include "../include/core/cuda_check.h"
 #include "ops/rmsnorm.h"
 
 #include <cmath>

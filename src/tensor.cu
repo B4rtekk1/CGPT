@@ -1,5 +1,5 @@
-#include "tensor.h"
-#include "cuda_check.h"
+#include "../include/core/tensor.h"
+#include "../include/core/cuda_check.h"
 
 namespace {
 

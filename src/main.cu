@@ -2,7 +2,7 @@
 #include <iostream>
 #include <vector>
 
-#include "../include/cuda_check.h"
+#include "../include/core/cuda_check.h"
 
 __global__ void add_one(float* values, int count) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;

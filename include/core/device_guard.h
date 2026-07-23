@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cuda_check.h"BENIGN_RACE_BEGIN
+#include "cuda_check.h"
 #include <stdexcept>
 
 class DeviceGuard {
