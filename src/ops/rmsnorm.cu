@@ -2,17 +2,17 @@
 #include "../../include/core/cuda_check.h"
 #include "device_guard.h"
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 
 namespace {
 
 __inline__ __device__ float warp_reduce_sum(float value) {
-    // Every launch uses a block size that is a multiple of a warp, so all
-    // lanes participate in this reduction.  Capturing __activemask() here is
-    // unsafe because independent warp scheduling can make it vary by lane.
+    // Every launch uses a whole number of warps.  A full mask is therefore
+    // valid even when some lanes contributed zero work to the input loop.
     constexpr unsigned mask = 0xffffffffu;
-    for (int offset = 16; offset > 0; offset /= 2) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
         value += __shfl_down_sync(mask, value, offset);
     }
     return value;
@@ -55,27 +55,21 @@ __global__ void rmsnorm_kernel(
         }
     }
 
-    // Threads can execute a different number of loop iterations when the
-    // hidden size is not divisible by the block size.  Re-converge the block
-    // before using a full-warp shuffle mask.
-    __syncthreads();
+    __syncwarp();
+
     sum_squares = warp_reduce_sum(sum_squares);
 
-    __shared__ float warp_sums[32];
-
+    __shared__ float warp_sums[8];
     const int lane = tid & 31;
     const int warp = tid >> 5;
-
     if (lane == 0) {
         warp_sums[warp] = sum_squares;
     }
     __syncthreads();
 
     __shared__ float total_sum;
-    float total = 0.0f;
     if (warp == 0) {
-        const int warp_count = (block_size + 31) / 32;
-        total = lane < warp_count ? warp_sums[lane] : 0.0f;
+        float total = lane < (block_size + 31) / 32 ? warp_sums[lane] : 0.0f;
         total = warp_reduce_sum(total);
         if (lane == 0) {
             total_sum = total;
@@ -83,13 +77,8 @@ __global__ void rmsnorm_kernel(
     }
     __syncthreads();
 
-    // Shared memory variables cannot have a C++ initializer in a CUDA kernel.
-    // Thread 0 writes the value before the synchronization below.
-    __shared__ float inv_rms;
-    if (tid == 0) {
-        inv_rms = rsqrtf(total_sum / static_cast<float>(hidden) + epsilon);
-    }
-    __syncthreads();
+    const float inv_rms = rsqrtf(
+        total_sum / static_cast<float>(hidden) + epsilon);
 
     if constexpr (Vectorized) {
         const auto row_input_vec = reinterpret_cast<const float4*>(row_input);
@@ -159,13 +148,14 @@ Tensor rmsnorm_forward(
         return output;
     }
 
-    const bool vectorized = (hidden % 4) == 0;
+    const bool aligned =
+        (reinterpret_cast<std::uintptr_t>(input.data()) % alignof(float4) == 0) &&
+        (reinterpret_cast<std::uintptr_t>(output.data()) % alignof(float4) == 0) &&
+        (reinterpret_cast<std::uintptr_t>(weight.data()) % alignof(float4) == 0);
+    const bool vectorized = (hidden % 4) == 0 && aligned;
     const int work_items = vectorized ? hidden / 4 : hidden;
-    // Avoid launching mostly idle warps for small workloads. All selected
-    // sizes are multiples of a warp, which keeps the reduction efficient.
     const int threads = work_items <= 32 ? 32 :
-                        work_items <= 64 ? 64 :
-                        work_items <= 128 ? 128 : 256;
+                        work_items <= 256 ? 128 : 256;
 
     if (vectorized) {
         rmsnorm_kernel<true><<<rows, threads, 0, stream>>>(

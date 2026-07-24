@@ -139,9 +139,12 @@ void run_case(const std::vector<std::size_t>& shape, float epsilon) {
 
     for (std::size_t row = 0; row < rows; ++row) {
         for (std::size_t column = 0; column < hidden; ++column) {
+            // Keep the multiplication signed.  `row` is size_t, so doing
+            // the multiplication before the cast would convert negative
+            // values to very large unsigned integers.
             input[row * hidden + column] =
-                0.25f * static_cast<float>((row + 1) *
-                                            (static_cast<int>(column % 7) - 3));
+                0.25f * static_cast<float>(row + 1) *
+                static_cast<float>(static_cast<int>(column % 7) - 3);
         }
     }
     for (std::size_t column = 0; column < hidden; ++column) {
