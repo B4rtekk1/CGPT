@@ -1,9 +1,11 @@
 #include "tokenizer/bpe_tokenizer.h"
+#include "utils/progress_bar.h"
 
 #include <algorithm>
 #include <array>
 #include <fstream>
 #include <limits>
+#include <queue>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -46,6 +48,11 @@ namespace bpe {
             const std::size_t item_count,
             const std::size_t workers,
             Function &&function) {
+            if (workers <= 1) {
+                function(0, 0, item_count);
+                return;
+            }
+
             std::vector<std::thread> threads;
             threads.reserve(workers);
 
@@ -141,15 +148,42 @@ namespace bpe {
             }
         }
 
+        // Keep the best candidates in a heap. Scanning global_counts for every
+        // merge is needlessly expensive when the vocabulary is large.
+        struct CandidateCompare {
+            bool operator()(const std::pair<std::uint64_t, PairKey> &left,
+                            const std::pair<std::uint64_t, PairKey> &right) const noexcept {
+                if (left.first != right.first) {
+                    return left.first < right.first;
+                }
+                // For equal frequencies, prefer the smaller pair key.
+                return left.second > right.second;
+            }
+        };
+        std::priority_queue<
+            std::pair<std::uint64_t, PairKey>,
+            std::vector<std::pair<std::uint64_t, PairKey>>,
+            CandidateCompare> candidates;
+
+        for (const auto &[pair, count]: global_counts) {
+            candidates.emplace(count, pair);
+        }
+
+        const std::size_t requested_merges = config.vocab_size - tokenizer.vocab_size();
+        ProgressBar progress(requested_merges, "BPE training");
+
         while (tokenizer.vocab_size() < config.vocab_size) {
             PairKey best_pair = 0;
             std::uint64_t best_count = 0;
 
-            // The tie-break makes training deterministic independently of hash order.
-            for (const auto &[pair, count]: global_counts) {
-                if (count > best_count || (count == best_count && pair < best_pair)) {
+            // Heap entries are immutable snapshots. Discard stale snapshots.
+            while (!candidates.empty()) {
+                const auto [count, pair] = candidates.top();
+                candidates.pop();
+                if (global_counts.contains(pair) && global_counts[pair] == count) {
                     best_pair = pair;
                     best_count = count;
+                    break;
                 }
             }
 
@@ -174,16 +208,17 @@ namespace bpe {
                                     for (std::size_t index = begin; index < end; ++index) {
                                         const auto &source = corpus[index];
                                         std::vector<TokenId> replaced;
-                                        replaced.reserve(source.size());
+                                        bool changed = false;
 
                                         for (std::size_t i = 0; i < source.size();) {
                                             if (i + 1 < source.size() &&
                                                 source[i] == left && source[i + 1] == right) {
-                                                // If the previous two source
-                                                // tokens formed this rule,
-                                                // their pair with the current
-                                                // token was already removed as
-                                                // the previous match's suffix.
+                                                if (!changed) {
+                                                    replaced.reserve(source.size());
+                                                    replaced.insert(replaced.end(), source.begin(),
+                                                                    source.begin() + static_cast<std::ptrdiff_t>(i));
+                                                    changed = true;
+                                                }
                                                 const bool follows_merge =
                                                     i >= 2 && source[i - 2] == left &&
                                                     source[i - 1] == right;
@@ -204,12 +239,16 @@ namespace bpe {
                                                 replaced.push_back(merged);
                                                 i += 2;
                                             } else {
-                                                replaced.push_back(source[i]);
+                                                if (changed) {
+                                                    replaced.push_back(source[i]);
+                                                }
                                                 ++i;
                                             }
                                         }
 
-                                        corpus[index] = std::move(replaced);
+                                        if (changed) {
+                                            corpus[index] = std::move(replaced);
+                                        }
                                     }
                                 }
             );
@@ -221,9 +260,14 @@ namespace bpe {
                     } else {
                         global_counts[pair] += static_cast<std::uint64_t>(change);
                     }
+                    candidates.emplace(global_counts[pair], pair);
                 }
             }
+
+            progress.update(tokenizer.vocab_size() - kByteVocabularySize -
+                            config.special_tokens.size());
         }
+        progress.finish();
         return tokenizer;
     }
 
@@ -322,7 +366,20 @@ namespace bpe {
     }
 
 std::string BpeTokenizer::decode(const std::span<const TokenId> ids) const {
+    std::size_t decoded_size = 0;
+    for (const TokenId id : ids) {
+        if (is_special(id)) {
+            decoded_size += special_tokens_[id - kByteVocabularySize].size();
+        } else {
+            if (id >= token_bytes_.size()) {
+                throw std::out_of_range("Token ID is outside this tokenizer vocabulary");
+            }
+            decoded_size += token_bytes_[id].size();
+        }
+    }
+
     std::string text;
+    text.reserve(decoded_size);
 
     for (const TokenId id : ids) {
         if (is_special(id)) {

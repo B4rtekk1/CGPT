@@ -23,10 +23,13 @@ target_include_directories(cgpt_core PUBLIC
         ${CGPT_INCLUDE_DIR}/core)
 target_link_libraries(cgpt_core PUBLIC CUDA::cudart CUDA::cublasLt)
 set_target_properties(cgpt_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(cgpt_core PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 add_library(cgpt_tokenizer STATIC
         include/tokenizer/bpe_tokenizer.h
-        src/tokenizer/bpe_tokenizer.cpp)
+        include/utils/progress_bar.h
+        src/tokenizer/bpe_tokenizer.cpp
+        src/utils/progress_bar.cpp)
 target_include_directories(cgpt_tokenizer PUBLIC ${CGPT_INCLUDE_DIR})
 
 add_executable(CGPT src/main.cu)
@@ -36,7 +39,9 @@ function(add_cgpt_test name source dependency)
     add_executable(${name} ${source})
     target_link_libraries(${name} PRIVATE ${dependency})
     add_test(NAME ${name} COMMAND ${name})
-    set_target_properties(${name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    set_target_properties(${name} PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 endfunction()
 
 add_cgpt_test(rmsnorm_test tests/rmsnorm_test.cu cgpt_core)

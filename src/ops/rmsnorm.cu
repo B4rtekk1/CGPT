@@ -8,8 +8,10 @@
 namespace {
 
 __inline__ __device__ float warp_reduce_sum(float value) {
-    // Using the active-lane mask also keeps this correct for a partial warp.
-    const unsigned mask = __activemask();
+    // Every launch uses a block size that is a multiple of a warp, so all
+    // lanes participate in this reduction.  Capturing __activemask() here is
+    // unsafe because independent warp scheduling can make it vary by lane.
+    constexpr unsigned mask = 0xffffffffu;
     for (int offset = 16; offset > 0; offset /= 2) {
         value += __shfl_down_sync(mask, value, offset);
     }
@@ -42,6 +44,10 @@ __global__ void rmsnorm_kernel(
             sum_squares = fmaf(x.z, x.z, sum_squares);
             sum_squares = fmaf(x.w, x.w, sum_squares);
         }
+        for (int i = hidden / 4 * 4 + tid; i < hidden; i += block_size) {
+            const float x = row_input[i];
+            sum_squares = fmaf(x, x, sum_squares);
+        }
     } else {
         for (int i = tid; i < hidden; i += block_size) {
             const float x = row_input[i];
@@ -49,6 +55,10 @@ __global__ void rmsnorm_kernel(
         }
     }
 
+    // Threads can execute a different number of loop iterations when the
+    // hidden size is not divisible by the block size.  Re-converge the block
+    // before using a full-warp shuffle mask.
+    __syncthreads();
     sum_squares = warp_reduce_sum(sum_squares);
 
     __shared__ float warp_sums[32];
@@ -61,18 +71,23 @@ __global__ void rmsnorm_kernel(
     }
     __syncthreads();
 
+    __shared__ float total_sum;
     float total = 0.0f;
     if (warp == 0) {
         const int warp_count = (block_size + 31) / 32;
         total = lane < warp_count ? warp_sums[lane] : 0.0f;
         total = warp_reduce_sum(total);
+        if (lane == 0) {
+            total_sum = total;
+        }
     }
+    __syncthreads();
 
     // Shared memory variables cannot have a C++ initializer in a CUDA kernel.
     // Thread 0 writes the value before the synchronization below.
     __shared__ float inv_rms;
     if (tid == 0) {
-        inv_rms = rsqrtf(total / static_cast<float>(hidden) + epsilon);
+        inv_rms = rsqrtf(total_sum / static_cast<float>(hidden) + epsilon);
     }
     __syncthreads();
 
@@ -89,6 +104,9 @@ __global__ void rmsnorm_kernel(
                 x.z * inv_rms * w.z,
                 x.w * inv_rms * w.w
             );
+        }
+        for (int i = hidden / 4 * 4 + tid; i < hidden; i += block_size) {
+            row_output[i] = row_input[i] * inv_rms * weight[i];
         }
     } else {
         for (int i = tid; i < hidden; i += block_size) {
