@@ -4,6 +4,7 @@
 #include <array>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -118,34 +119,29 @@ namespace bpe {
         }
 
         const std::size_t workers = worker_count_for(config.worker_count, corpus.size());
+        PairCounts global_counts;
 
-        while (tokenizer.vocab_size() < config.vocab_size) {
-            // Each worker owns its map: no locks on the hot pair-counting path.
-            std::vector<PairCounts> local_counts(workers);
-
-            parallel_for_ranges(corpus.size(), workers,
-                                [&corpus, &local_counts](const std::size_t worker,
-                                                         const std::size_t begin,
-                                                         const std::size_t end) {
-                                    PairCounts &counts = local_counts[worker];
-
-                                    for (std::size_t index = begin; index < end; ++index) {
-                                        const auto &sequence = corpus[index];
-
-                                        for (std::size_t i = 1; i < sequence.size(); ++i) {
-                                            ++counts[pair_key(sequence[i - 1], sequence[i])];
-                                        }
+        std::vector<PairCounts> initial_counts(workers);
+        parallel_for_ranges(corpus.size(), workers,
+                            [&corpus, &initial_counts](const std::size_t worker,
+                                                       const std::size_t begin,
+                                                       const std::size_t end) {
+                                PairCounts &counts = initial_counts[worker];
+                                for (std::size_t index = begin; index < end; ++index) {
+                                    const auto &sequence = corpus[index];
+                                    for (std::size_t i = 1; i < sequence.size(); ++i) {
+                                        ++counts[pair_key(sequence[i - 1], sequence[i])];
                                     }
                                 }
-            );
+                            });
 
-            PairCounts global_counts;
-            for (const PairCounts &counts: local_counts) {
-                for (const auto &[pair, count]: counts) {
-                    global_counts[pair] += count;
-                }
+        for (const PairCounts &counts: initial_counts) {
+            for (const auto &[pair, count]: counts) {
+                global_counts[pair] += count;
             }
+        }
 
+        while (tokenizer.vocab_size() < config.vocab_size) {
             PairKey best_pair = 0;
             std::uint64_t best_count = 0;
 
@@ -163,14 +159,18 @@ namespace bpe {
 
             const TokenId left = pair_left(best_pair);
             const TokenId right = pair_right(best_pair);
-            const TokenId merged = static_cast<TokenId>(tokenizer.vocab_size());
+            const auto merged = static_cast<TokenId>(tokenizer.vocab_size());
             tokenizer.add_merge(left, right);
 
-            // Documents are independent, so replacements can be done in parallel.
+            // Documents are independent. Update pair frequencies incrementally:
+            // only the pairs touching a replacement can have changed.
+            using PairDelta = std::unordered_map<PairKey, std::int64_t>;
+            std::vector<PairDelta> local_deltas(workers);
             parallel_for_ranges(corpus.size(), workers,
-                                [&corpus, left, right, merged](const std::size_t,
+                                [&corpus, &local_deltas, left, right, merged](const std::size_t worker,
                                                                const std::size_t begin,
                                                                const std::size_t end) {
+                                    PairDelta &delta = local_deltas[worker];
                                     for (std::size_t index = begin; index < end; ++index) {
                                         const auto &source = corpus[index];
                                         std::vector<TokenId> replaced;
@@ -179,6 +179,28 @@ namespace bpe {
                                         for (std::size_t i = 0; i < source.size();) {
                                             if (i + 1 < source.size() &&
                                                 source[i] == left && source[i + 1] == right) {
+                                                // If the previous two source
+                                                // tokens formed this rule,
+                                                // their pair with the current
+                                                // token was already removed as
+                                                // the previous match's suffix.
+                                                const bool follows_merge =
+                                                    i >= 2 && source[i - 2] == left &&
+                                                    source[i - 1] == right;
+                                                if (i > 0 && !follows_merge) {
+                                                    --delta[pair_key(source[i - 1], source[i])];
+                                                }
+                                                --delta[pair_key(left, right)];
+                                                if (i + 2 < source.size()) {
+                                                    --delta[pair_key(right, source[i + 2])];
+                                                }
+
+                                                if (!replaced.empty()) {
+                                                    ++delta[pair_key(replaced.back(), merged)];
+                                                }
+                                                if (i + 2 < source.size()) {
+                                                    ++delta[pair_key(merged, source[i + 2])];
+                                                }
                                                 replaced.push_back(merged);
                                                 i += 2;
                                             } else {
@@ -191,35 +213,113 @@ namespace bpe {
                                     }
                                 }
             );
+
+            for (const PairDelta &delta: local_deltas) {
+                for (const auto &[pair, change]: delta) {
+                    if (change < 0) {
+                        global_counts[pair] -= static_cast<std::uint64_t>(-change);
+                    } else {
+                        global_counts[pair] += static_cast<std::uint64_t>(change);
+                    }
+                }
+            }
         }
         return tokenizer;
     }
 
     std::vector<TokenId> BpeTokenizer::encode(const std::string_view text) const {
-    std::vector<TokenId> tokens = bytes_to_tokens(text);
+        if (text.empty()) {
+            return {};
+        }
 
-    // Merge order is rank. Re-evaluating after every merge is required because
-    // a new merge can create a lower-ranked pair next to it.
-    for (const MergeRule& rule : merges_) {
-        std::vector<TokenId> merged_tokens;
-        merged_tokens.reserve(tokens.size());
+        // Keep the token stream as an intrusive doubly-linked list. A merge
+        // only changes the two pairs touching the merged node, so encoding no
+        // longer allocates and rescans the complete stream for every rule.
+        std::vector<TokenId> tokens = bytes_to_tokens(text);
+        const std::size_t size = tokens.size();
+        std::vector<std::size_t> next(size);
+        std::vector<std::size_t> previous(size);
+        constexpr std::size_t end = std::numeric_limits<std::size_t>::max();
 
-        for (std::size_t i = 0; i < tokens.size();) {
-            if (i + 1 < tokens.size() &&
-                tokens[i] == rule.left && tokens[i + 1] == rule.right) {
-                merged_tokens.push_back(rule.merged);
-                i += 2;
-            } else {
-                merged_tokens.push_back(tokens[i]);
-                ++i;
+        for (std::size_t i = 0; i < size; ++i) {
+            next[i] = i + 1 < size ? i + 1 : end;
+            previous[i] = i == 0 ? end : i - 1;
+        }
+
+        using Positions = std::set<std::size_t>;
+        std::unordered_map<PairKey, Positions> positions;
+        positions.reserve(size + merges_.size() * 2 + 1);
+
+        for (std::size_t i = 0; i + 1 < size; ++i) {
+            positions[pair_key(tokens[i], tokens[i + 1])].insert(i);
+        }
+
+        const auto remove_pair = [&positions, &tokens, &next](const std::size_t start) {
+            if (start == end || next[start] == end) {
+                return;
+            }
+            const PairKey key = pair_key(tokens[start], tokens[next[start]]);
+            auto found = positions.find(key);
+            if (found != positions.end()) {
+                found->second.erase(start);
+            }
+        };
+
+        const auto add_pair = [&positions, &tokens, &next](const std::size_t start) {
+            if (start != end && next[start] != end) {
+                positions[pair_key(tokens[start], tokens[next[start]])].insert(start);
+            }
+        };
+
+        for (const MergeRule& rule : merges_) {
+            const PairKey key = pair_key(rule.left, rule.right);
+            auto found = positions.find(key);
+            if (found == positions.end()) {
+                continue;
+            }
+
+            // The set is ordered, matching the original left-to-right scan.
+            // Snapshot the positions because updating neighbouring pairs can
+            // insert into the unordered map and invalidate its iterators.
+            const std::vector<std::size_t> candidates(
+                found->second.begin(), found->second.end());
+            for (const std::size_t left : candidates) {
+                const std::size_t right = next[left];
+                if (right == end || tokens[left] != rule.left ||
+                    tokens[right] != rule.right) {
+                    continue;
+                }
+
+                const std::size_t before = previous[left];
+                const std::size_t after = next[right];
+                remove_pair(before);
+                remove_pair(left);
+                remove_pair(right);
+
+                tokens[left] = rule.merged;
+                next[left] = after;
+                if (after != end) {
+                    previous[after] = left;
+                }
+                if (before != end) {
+                    next[before] = left;
+                }
+                // Mark the consumed node detached so a stale candidate from
+                // the snapshot cannot be processed a second time.
+                next[right] = end;
+                previous[right] = end;
+                add_pair(before);
+                add_pair(left);
             }
         }
 
-        tokens = std::move(merged_tokens);
+        std::vector<TokenId> result;
+        result.reserve(size);
+        for (std::size_t index = 0; index != end; index = next[index]) {
+            result.push_back(tokens[index]);
+        }
+        return result;
     }
-
-    return tokens;
-}
 
 std::string BpeTokenizer::decode(const std::span<const TokenId> ids) const {
     std::string text;
@@ -341,7 +441,7 @@ const std::vector<std::string>& BpeTokenizer::special_tokens() const noexcept {
 }
 
 void BpeTokenizer::add_merge(const TokenId left, const TokenId right) {
-    const TokenId merged = static_cast<TokenId>(token_bytes_.size());
+    const auto merged = static_cast<TokenId>(token_bytes_.size());
 
     if (left >= merged || right >= merged) {
         throw std::invalid_argument("BPE merge references an unknown token");
