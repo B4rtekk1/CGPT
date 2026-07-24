@@ -6,7 +6,6 @@
 #include <fstream>
 #include <limits>
 #include <queue>
-#include <set>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -15,6 +14,24 @@ namespace bpe {
     namespace {
         using PairKey = std::uint64_t;
         using PairCounts = std::unordered_map<PairKey, std::uint64_t>;
+        using Occurrence = std::uint64_t;
+
+        [[nodiscard]] Occurrence occurrence_key(
+            const std::size_t document, const std::size_t position) {
+            if (document > 0xFFFF'FFFFULL || position > 0xFFFF'FFFFULL) {
+                throw std::length_error("BPE corpus document or position exceeds 32-bit limit");
+            }
+            return (static_cast<Occurrence>(document) << 32U) |
+                   static_cast<Occurrence>(position);
+        }
+
+        [[nodiscard]] std::size_t occurrence_document(const Occurrence value) noexcept {
+            return static_cast<std::size_t>(value >> 32U);
+        }
+
+        [[nodiscard]] std::size_t occurrence_position(const Occurrence value) noexcept {
+            return static_cast<std::size_t>(value & 0xFFFF'FFFFULL);
+        }
 
         [[nodiscard]] PairKey pair_key(const TokenId left, const TokenId right) noexcept {
             return (static_cast<PairKey>(left) << 32U) | static_cast<PairKey>(right);
@@ -111,6 +128,9 @@ namespace bpe {
             throw std::invalid_argument("min_pair_frequency must be at least one");
         }
 
+        const std::size_t requested_merges = config.vocab_size - minimum_vocab;
+        ProgressBar progress(requested_merges, "BPE training");
+
         BpeTokenizer tokenizer(config.special_tokens);
         std::vector<std::vector<TokenId> > corpus;
         corpus.reserve(documents.size());
@@ -127,6 +147,28 @@ namespace bpe {
 
         const std::size_t workers = worker_count_for(config.worker_count, corpus.size());
         PairCounts global_counts;
+        std::unordered_map<PairKey, std::vector<Occurrence>> occurrences;
+        occurrences.reserve(4096);
+        std::size_t active_edges = 0;
+        std::size_t occurrence_entries = 0;
+
+        using Link = std::uint32_t;
+        constexpr Link end = std::numeric_limits<Link>::max();
+        std::vector<std::vector<Link>> next_positions(corpus.size());
+        std::vector<std::vector<Link>> previous_positions(corpus.size());
+        for (std::size_t document = 0; document < corpus.size(); ++document) {
+            const std::size_t size = corpus[document].size();
+            if (size >= end) {
+                throw std::length_error("BPE document is too large for the 32-bit occurrence index");
+            }
+            active_edges += size > 0 ? size - 1 : 0;
+            next_positions[document].resize(size);
+            previous_positions[document].resize(size);
+            for (std::size_t i = 0; i < size; ++i) {
+                next_positions[document][i] = i + 1 < size ? static_cast<Link>(i + 1) : end;
+                previous_positions[document][i] = i == 0 ? end : static_cast<Link>(i - 1);
+            }
+        }
 
         std::vector<PairCounts> initial_counts(workers);
         parallel_for_ranges(corpus.size(), workers,
@@ -148,15 +190,21 @@ namespace bpe {
             }
         }
 
-        // Keep the best candidates in a heap. Scanning global_counts for every
-        // merge is needlessly expensive when the vocabulary is large.
+        for (std::size_t document = 0; document < corpus.size(); ++document) {
+            const auto &sequence = corpus[document];
+            for (std::size_t i = 1; i < sequence.size(); ++i) {
+                occurrences[pair_key(sequence[i - 1], sequence[i])].push_back(
+                    occurrence_key(document, i - 1));
+                ++occurrence_entries;
+            }
+        }
+
         struct CandidateCompare {
             bool operator()(const std::pair<std::uint64_t, PairKey> &left,
                             const std::pair<std::uint64_t, PairKey> &right) const noexcept {
                 if (left.first != right.first) {
                     return left.first < right.first;
                 }
-                // For equal frequencies, prefer the smaller pair key.
                 return left.second > right.second;
             }
         };
@@ -169,14 +217,10 @@ namespace bpe {
             candidates.emplace(count, pair);
         }
 
-        const std::size_t requested_merges = config.vocab_size - tokenizer.vocab_size();
-        ProgressBar progress(requested_merges, "BPE training");
-
         while (tokenizer.vocab_size() < config.vocab_size) {
             PairKey best_pair = 0;
             std::uint64_t best_count = 0;
 
-            // Heap entries are immutable snapshots. Discard stale snapshots.
             while (!candidates.empty()) {
                 const auto [count, pair] = candidates.top();
                 candidates.pop();
@@ -196,71 +240,88 @@ namespace bpe {
             const auto merged = static_cast<TokenId>(tokenizer.vocab_size());
             tokenizer.add_merge(left, right);
 
-            // Documents are independent. Update pair frequencies incrementally:
-            // only the pairs touching a replacement can have changed.
-            using PairDelta = std::unordered_map<PairKey, std::int64_t>;
-            std::vector<PairDelta> local_deltas(workers);
-            parallel_for_ranges(corpus.size(), workers,
-                                [&corpus, &local_deltas, left, right, merged](const std::size_t worker,
-                                                               const std::size_t begin,
-                                                               const std::size_t end) {
-                                    PairDelta &delta = local_deltas[worker];
-                                    for (std::size_t index = begin; index < end; ++index) {
-                                        const auto &source = corpus[index];
-                                        std::vector<TokenId> replaced;
-                                        bool changed = false;
+            auto found = occurrences.find(best_pair);
+            if (found != occurrences.end()) {
+                auto positions = std::move(found->second);
+                occurrence_entries -= positions.size();
+                std::sort(positions.begin(), positions.end());
 
-                                        for (std::size_t i = 0; i < source.size();) {
-                                            if (i + 1 < source.size() &&
-                                                source[i] == left && source[i + 1] == right) {
-                                                if (!changed) {
-                                                    replaced.reserve(source.size());
-                                                    replaced.insert(replaced.end(), source.begin(),
-                                                                    source.begin() + static_cast<std::ptrdiff_t>(i));
-                                                    changed = true;
-                                                }
-                                                const bool follows_merge =
-                                                    i >= 2 && source[i - 2] == left &&
-                                                    source[i - 1] == right;
-                                                if (i > 0 && !follows_merge) {
-                                                    --delta[pair_key(source[i - 1], source[i])];
-                                                }
-                                                --delta[pair_key(left, right)];
-                                                if (i + 2 < source.size()) {
-                                                    --delta[pair_key(right, source[i + 2])];
-                                                }
+                for (const Occurrence occurrence: positions) {
+                    const std::size_t document = occurrence_document(occurrence);
+                    const std::size_t position = occurrence_position(occurrence);
+                    auto &sequence = corpus[document];
+                    auto &next = next_positions[document];
+                    auto &previous = previous_positions[document];
 
-                                                if (!replaced.empty()) {
-                                                    ++delta[pair_key(replaced.back(), merged)];
-                                                }
-                                                if (i + 2 < source.size()) {
-                                                    ++delta[pair_key(merged, source[i + 2])];
-                                                }
-                                                replaced.push_back(merged);
-                                                i += 2;
-                                            } else {
-                                                if (changed) {
-                                                    replaced.push_back(source[i]);
-                                                }
-                                                ++i;
-                                            }
-                                        }
-
-                                        if (changed) {
-                                            corpus[index] = std::move(replaced);
-                                        }
-                                    }
-                                }
-            );
-
-            for (const PairDelta &delta: local_deltas) {
-                for (const auto &[pair, change]: delta) {
-                    if (change < 0) {
-                        global_counts[pair] -= static_cast<std::uint64_t>(-change);
-                    } else {
-                        global_counts[pair] += static_cast<std::uint64_t>(change);
+                    if (position >= sequence.size() || sequence[position] != left ||
+                        next[position] == end || sequence[next[position]] != right) {
+                        continue;
                     }
-                    candidates.emplace(global_counts[pair], pair);
+
+                    const std::size_t right_position = next[position];
+                    const std::size_t before = previous[position];
+                    const std::size_t after = next[right_position];
+
+                    const auto remove_pair = [&](const std::size_t start) {
+                        if (start != end && next[start] != end) {
+                            const PairKey pair = pair_key(sequence[start], sequence[next[start]]);
+                            const auto count = --global_counts[pair];
+                            if (count != 0) {
+                                candidates.emplace(count, pair);
+                            }
+                        }
+                    };
+                    const auto add_pair = [&](const std::size_t start) {
+                        if (start != end && next[start] != end) {
+                            const PairKey pair = pair_key(sequence[start], sequence[next[start]]);
+                            const auto count = ++global_counts[pair];
+                            occurrences[pair].push_back(occurrence_key(document, start));
+                            ++occurrence_entries;
+                            candidates.emplace(count, pair);
+                        }
+                    };
+
+                    remove_pair(before);
+                    remove_pair(position);
+                    remove_pair(right_position);
+
+                    sequence[position] = merged;
+                    next[position] = after;
+                    if (after != end) {
+                        previous[after] = position;
+                    }
+                    if (before != end) {
+                        next[before] = position;
+                    }
+                    next[right_position] = end;
+                    previous[right_position] = end;
+
+                    add_pair(before);
+                    add_pair(position);
+                    --active_edges;
+                }
+
+                // The occurrence lists use lazy deletion for speed. Compact
+                // them before stale entries can dominate memory. Rebuilding
+                // walks only the current linked streams, not the original
+                // byte corpus, and keeps the index within roughly 8 MiB of
+                // the number of active edges.
+                constexpr std::size_t compact_slack = 1'000'000;
+                if (occurrence_entries > active_edges + compact_slack) {
+                    occurrences.clear();
+                    occurrences.reserve(global_counts.size());
+                    occurrence_entries = 0;
+                    for (std::size_t document = 0; document < corpus.size(); ++document) {
+                        const auto &sequence = corpus[document];
+                        const auto &next = next_positions[document];
+                        for (std::size_t start = 0; start < sequence.size(); ++start) {
+                            if (next[start] != end) {
+                                occurrences[pair_key(sequence[start], sequence[next[start]])].push_back(
+                                    occurrence_key(document, start));
+                                ++occurrence_entries;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -276,9 +337,6 @@ namespace bpe {
             return {};
         }
 
-        // Keep the token stream as an intrusive doubly-linked list. A merge
-        // only changes the two pairs touching the merged node, so encoding no
-        // longer allocates and rescans the complete stream for every rule.
         std::vector<TokenId> tokens = bytes_to_tokens(text);
         const std::size_t size = tokens.size();
         std::vector<std::size_t> next(size);
@@ -290,28 +348,20 @@ namespace bpe {
             previous[i] = i == 0 ? end : i - 1;
         }
 
-        using Positions = std::set<std::size_t>;
+        // Positions are append-only while a merge rule is being applied. The
+        // linked token stream below makes stale entries cheap to reject, so a
+        // tree is unnecessary here and would allocate one node per position.
+        using Positions = std::vector<std::size_t>;
         std::unordered_map<PairKey, Positions> positions;
-        positions.reserve(size + merges_.size() * 2 + 1);
+        positions.reserve(std::min(size, merges_.size() * 2 + 1));
 
         for (std::size_t i = 0; i + 1 < size; ++i) {
-            positions[pair_key(tokens[i], tokens[i + 1])].insert(i);
+            positions[pair_key(tokens[i], tokens[i + 1])].push_back(i);
         }
-
-        const auto remove_pair = [&positions, &tokens, &next](const std::size_t start) {
-            if (start == end || next[start] == end) {
-                return;
-            }
-            const PairKey key = pair_key(tokens[start], tokens[next[start]]);
-            auto found = positions.find(key);
-            if (found != positions.end()) {
-                found->second.erase(start);
-            }
-        };
 
         const auto add_pair = [&positions, &tokens, &next](const std::size_t start) {
             if (start != end && next[start] != end) {
-                positions[pair_key(tokens[start], tokens[next[start]])].insert(start);
+                positions[pair_key(tokens[start], tokens[next[start]])].push_back(start);
             }
         };
 
@@ -322,11 +372,12 @@ namespace bpe {
                 continue;
             }
 
-            // The set is ordered, matching the original left-to-right scan.
-            // Snapshot the positions because updating neighbouring pairs can
-            // insert into the unordered map and invalidate its iterators.
-            const std::vector<std::size_t> candidates(
-                found->second.begin(), found->second.end());
+            auto candidates = std::move(found->second);
+            positions.erase(found);
+            // Initial positions are already ordered, but newly formed pairs
+            // are appended as merges progress. Sorting the compact snapshot
+            // preserves the left-to-right BPE rule without tree operations.
+            std::sort(candidates.begin(), candidates.end());
             for (const std::size_t left : candidates) {
                 const std::size_t right = next[left];
                 if (right == end || tokens[left] != rule.left ||
@@ -336,9 +387,6 @@ namespace bpe {
 
                 const std::size_t before = previous[left];
                 const std::size_t after = next[right];
-                remove_pair(before);
-                remove_pair(left);
-                remove_pair(right);
 
                 tokens[left] = rule.merged;
                 next[left] = after;
@@ -348,8 +396,6 @@ namespace bpe {
                 if (before != end) {
                     next[before] = left;
                 }
-                // Mark the consumed node detached so a stale candidate from
-                // the snapshot cannot be processed a second time.
                 next[right] = end;
                 previous[right] = end;
                 add_pair(before);

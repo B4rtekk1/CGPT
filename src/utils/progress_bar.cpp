@@ -26,8 +26,13 @@ void ProgressBar::increment(const std::size_t amount) {
 }
 
 void ProgressBar::finish() {
-    update(current_);
-    std::cout << '\n';
+    const auto now = std::chrono::steady_clock::now();
+    current_ = total_;
+    draw(now);
+
+    const double elapsed = std::chrono::duration<double>(now - start_).count();
+    std::cout << " | Total time: " << std::fixed << std::setprecision(2)
+              << elapsed << " s\n";
 }
 
 void ProgressBar::draw(const std::chrono::steady_clock::time_point now) const {

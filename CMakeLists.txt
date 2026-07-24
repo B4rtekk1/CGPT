@@ -51,7 +51,12 @@ add_cgpt_test(device_buffer_test tests/device_buffer_test.cu cgpt_core)
 add_cgpt_test(gpu_buffer_test tests/gpu_buffer_test.cu cgpt_core)
 add_cgpt_test(dtype_test tests/dtype_test.cu cgpt_core)
 add_cgpt_test(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp cgpt_tokenizer)
+add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_tokenizer)
 
 set_tests_properties(
         rmsnorm_test linear_test tensor_test device_buffer_test gpu_buffer_test dtype_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
+
+set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES
+        TIMEOUT 900
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

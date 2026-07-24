@@ -1,4 +1,6 @@
 build
+build-vs
+data
 
 ### CUDA template
 *.i
