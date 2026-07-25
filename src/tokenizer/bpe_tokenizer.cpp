@@ -241,19 +241,36 @@ namespace bpe {
             Punctuation
         };
 
-        [[nodiscard]] ByteClass classify_byte(const unsigned char byte) noexcept {
-            if (byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r' ||
-                byte == '\f' || byte == '\v') {
-                return ByteClass::Whitespace;
+        [[nodiscard]] constexpr std::array<ByteClass, 256> make_byte_classes() noexcept {
+            std::array<ByteClass, 256> classes{};
+            classes.fill(ByteClass::Punctuation);
+
+            for (std::size_t byte = 0x80; byte < 256; ++byte) {
+                classes[byte] = ByteClass::Letter;
             }
-            if ((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
-                byte == '_' || byte >= 0x80) {
-                return ByteClass::Letter;
+            for (unsigned char byte = 'A'; byte <= 'Z'; ++byte) {
+                classes[byte] = ByteClass::Letter;
             }
-            if (byte >= '0' && byte <= '9') {
-                return ByteClass::Digit;
+            for (unsigned char byte = 'a'; byte <= 'z'; ++byte) {
+                classes[byte] = ByteClass::Letter;
             }
-            return ByteClass::Punctuation;
+            classes[static_cast<unsigned char>('_')] = ByteClass::Letter;
+            for (unsigned char byte = '0'; byte <= '9'; ++byte) {
+                classes[byte] = ByteClass::Digit;
+            }
+            classes[static_cast<unsigned char>(' ')] = ByteClass::Whitespace;
+            classes[static_cast<unsigned char>('\t')] = ByteClass::Whitespace;
+            classes[static_cast<unsigned char>('\n')] = ByteClass::Whitespace;
+            classes[static_cast<unsigned char>('\r')] = ByteClass::Whitespace;
+            classes[static_cast<unsigned char>('\f')] = ByteClass::Whitespace;
+            classes[static_cast<unsigned char>('\v')] = ByteClass::Whitespace;
+            return classes;
+        }
+
+        alignas(64) constexpr auto kByteClasses = make_byte_classes();
+
+        [[nodiscard]] inline ByteClass classify_byte(const unsigned char byte) noexcept {
+            return kByteClasses[byte];
         }
 
         template<typename Function>
@@ -768,7 +785,9 @@ namespace bpe {
         // faster in the common no-match case because the CRT implementation is
         // vectorized. We repeat the search only after an actual special token.
         std::vector<TokenId> result;
-        result.reserve(text.size());
+        // Natural-language corpora usually average well above 2 bytes/token.
+        // Avoid reserving four bytes of TokenId storage for every input byte.
+        result.reserve(text.size() / 2 + 16);
 
         std::size_t cursor = 0;
         while (cursor < text.size()) {
@@ -842,12 +861,26 @@ namespace bpe {
         const unsigned dense_limit_bits =
             std::min(dense_merge_bits_, batch_dense_bits);
 
-        // Contiguous static ranges avoid one atomic RMW per document and keep
-        // writes to the result vector local to each worker. This is ideal for
-        // the equally-sized blocks used by the training/benchmark pipeline.
+        // Split by input bytes rather than document count. Real datasets often
+        // contain highly uneven documents, which otherwise leaves some workers idle.
+        std::vector<std::uint64_t> byte_prefix(texts.size() + 1, 0);
+        for (std::size_t index = 0; index < texts.size(); ++index) {
+            byte_prefix[index + 1] = byte_prefix[index] + texts[index].size();
+        }
+
+        const std::uint64_t total_bytes = byte_prefix.back();
         for (std::size_t worker = 0; worker < workers; ++worker) {
-            const std::size_t begin = texts.size() * worker / workers;
-            const std::size_t end = texts.size() * (worker + 1) / workers;
+            const std::uint64_t target_begin = total_bytes * worker / workers;
+            const std::uint64_t target_end = total_bytes * (worker + 1) / workers;
+            const std::size_t begin = static_cast<std::size_t>(
+                std::lower_bound(byte_prefix.begin(), byte_prefix.end(), target_begin) -
+                byte_prefix.begin());
+            const std::size_t end = worker + 1 == workers
+                ? texts.size()
+                : static_cast<std::size_t>(
+                    std::lower_bound(byte_prefix.begin(), byte_prefix.end(), target_end) -
+                    byte_prefix.begin());
+
             threads.emplace_back(
                 [this, &texts, &result, &options, dense_limit_bits, begin, end] {
                     for (std::size_t index = begin; index < end; ++index) {
@@ -917,8 +950,8 @@ namespace bpe {
                     append_encoded_bytes_uncached(piece, encoded, dense_limit_bits);
                     output.insert(output.end(), encoded.begin(), encoded.end());
                     if (cache.entries.size() >= options.cache_entries) {
-                        cache.entries.clear();
-                        cache.entries.reserve(options.cache_entries);
+                        // Incremental eviction avoids periodic full-cache latency spikes.
+                        cache.entries.erase(cache.entries.begin());
                     }
                     cache.entries.emplace(std::string(piece), std::move(encoded));
                 });
@@ -976,8 +1009,7 @@ namespace bpe {
         output.insert(output.end(), encoded.begin(), encoded.end());
 
         if (cache.entries.size() >= options.cache_entries) {
-            cache.entries.clear();
-            cache.entries.reserve(options.cache_entries);
+            cache.entries.erase(cache.entries.begin());
         }
         cache.entries.emplace(std::string(text), std::move(encoded));
     }
@@ -1502,10 +1534,9 @@ void BpeTokenizer::rebuild_fast_merge_lookup() {
         return;
     }
 
-    // As in GigaToken, cover IDs 0..2047 rather than only raw bytes. The
-    // 16 MiB table fits in modern last-level caches and turns most early and
-    // mid-merge hits/misses into a single indexed load.
-    constexpr unsigned dense_bits = 11;
+    // A physically compact 1024 x 1024 table occupies exactly 4 MiB. Keeping
+    // the row stride equal to the checked ID range is important for cache locality.
+    constexpr unsigned dense_bits = 10;
     constexpr std::size_t dense_side = std::size_t{1} << dense_bits;
     dense_merge_lookup_.assign(dense_side * dense_side, missing);
     dense_merge_bits_ = dense_bits;

@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
               << " MiB\n";
 
     bpe::TrainerConfig config;
-    config.vocab_size = 2048;
+    config.vocab_size = 50000;
     const std::size_t worker_count = std::max<std::size_t>(
         1, std::thread::hardware_concurrency());
     config.worker_count = worker_count;
