@@ -469,9 +469,6 @@ namespace bpe {
             std::size_t token_count = nodes.size();
             for (std::size_t rank = 0; rank < merges_.size(); ++rank) {
                 const MergeRule& rule = merges_[rank];
-                // A pair can first appear only while its newest operand is being
-                // created. Since every earlier rule is applied left-to-right,
-                // these append-only position lists are already ordered.
                 for (const Link left_index : positions[rank]) {
                     Node& left = nodes[left_index];
                     if (left.next == end) {

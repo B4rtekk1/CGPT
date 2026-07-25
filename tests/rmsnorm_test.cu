@@ -119,7 +119,12 @@ std::vector<float> rmsnorm_reference(
     return expected;
 }
 
-void run_case(const std::vector<std::size_t>& shape, float epsilon) {
+void run_case(
+    const std::vector<std::size_t>& shape,
+    float epsilon,
+    Dtype dtype = Dtype::F32,
+    float tolerance = 1.0e-4f
+) {
     if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
         throw std::invalid_argument("RMSNorm shape must be [rows, hidden]");
     }
@@ -154,8 +159,8 @@ void run_case(const std::vector<std::size_t>& shape, float epsilon) {
     const std::vector<float> expected =
         rmsnorm_reference(input, weight, rows, hidden, epsilon);
 
-    Tensor input_tensor(shape);
-    Tensor weight_tensor({shape[1]});
+    Tensor input_tensor(shape, DeviceType::CUDA, dtype);
+    Tensor weight_tensor({shape[1]}, DeviceType::CUDA, dtype);
     input_tensor.copy_from_host(input);
     weight_tensor.copy_from_host(weight);
 
@@ -170,7 +175,7 @@ void run_case(const std::vector<std::size_t>& shape, float epsilon) {
     output_tensor.copy_to_host(actual);
 
     print_tensor("RMSNorm output", actual, shape);
-    expect_close(actual, expected, 1.0e-4f);
+    expect_close(actual, expected, tolerance);
 }
 
 void expect_invalid_argument(
@@ -235,6 +240,29 @@ void test_custom_stream() {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+void test_preallocated_output() {
+    Tensor input({2, 4});
+    Tensor weight({4});
+    Tensor output({2, 4});
+    input.copy_from_host(std::vector<float>{
+        1.0f, -2.0f, 3.0f, -4.0f,
+        2.0f, 2.0f, -2.0f, -2.0f});
+    weight.copy_from_host(std::vector<float>{0.5f, 1.0f, 1.5f, 2.0f});
+
+    rmsnorm_forward(output, input, weight, 1.0e-5f);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> actual(output.numel());
+    output.copy_to_host(actual);
+    const auto expected = rmsnorm_reference(
+        {1.0f, -2.0f, 3.0f, -4.0f, 2.0f, 2.0f, -2.0f, -2.0f},
+        {0.5f, 1.0f, 1.5f, 2.0f},
+        2,
+        4,
+        1.0e-5f);
+    expect_close(actual, expected, 1.0e-4f);
+}
+
 void test_device_type() {
     Tensor cpu_tensor({2, 3}, DeviceType::CPU);
     if (cpu_tensor.device_type() != DeviceType::CPU ||
@@ -260,6 +288,13 @@ int main() {
     // Exercises the second loop iteration in each thread and the reduction.
     run_case({2, 513}, 1.0e-5f);
 
+    // Exercises the register-cached float4 path used by model-sized layers.
+    run_case({2, 4096}, 1.0e-5f);
+
+    // F16/BF16 inputs accumulate the RMS in F32, then round on output.
+    run_case({3, 513}, 1.0e-5f, Dtype::F16, 3.0e-3f);
+    run_case({3, 513}, 1.0e-5f, Dtype::BF16, 2.0e-2f);
+
     expect_invalid_argument(Tensor({2, 4, 1}), Tensor({4}));
     expect_invalid_argument(Tensor({2, 4}), Tensor({2, 4}));
 
@@ -274,6 +309,7 @@ int main() {
     );
     test_invalid_epsilon();
     test_custom_stream();
+    test_preallocated_output();
 
     std::cout << "RMSNorm tests passed.\n";
     return EXIT_SUCCESS;

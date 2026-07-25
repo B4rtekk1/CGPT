@@ -43,15 +43,21 @@ template <typename T>
 __global__ void add_bias_kernel(
     T* output,
     const T* bias,
-    const std::size_t count,
+    const std::size_t rows,
     const std::size_t columns
 ) {
-    const std::size_t index =
+    const std::size_t column =
         static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < count) {
+    if (column >= columns) {
+        return;
+    }
+
+    // A 2-D mapping avoids an integer modulo for every output element.
+    for (std::size_t row = blockIdx.y; row < rows; row += gridDim.y) {
+        const std::size_t index = row * columns + column;
         output[index] = static_cast<T>(
             static_cast<float>(output[index]) +
-            static_cast<float>(bias[index % columns]));
+            static_cast<float>(bias[column]));
     }
 }
 
@@ -61,27 +67,30 @@ void launch_bias_fallback(
     cudaStream_t stream
 ) {
     constexpr int threads = 256;
-    const int blocks = static_cast<int>(
-        (output.numel() + threads - 1) / threads);
     const std::size_t columns = bias.numel();
+    const std::size_t rows = output.numel() / columns;
+    constexpr std::size_t max_grid_y = 65535;
+    const dim3 blocks(
+        static_cast<unsigned>((columns + threads - 1) / threads),
+        static_cast<unsigned>(rows < max_grid_y ? rows : max_grid_y));
 
     if (output.dtype() == Dtype::F16) {
         add_bias_kernel<<<blocks, threads, 0, stream>>>(
             static_cast<__half*>(output.raw_data()),
             static_cast<const __half*>(bias.raw_data()),
-            output.numel(),
+            rows,
             columns);
     } else if (output.dtype() == Dtype::BF16) {
         add_bias_kernel<<<blocks, threads, 0, stream>>>(
             static_cast<__nv_bfloat16*>(output.raw_data()),
             static_cast<const __nv_bfloat16*>(bias.raw_data()),
-            output.numel(),
+            rows,
             columns);
     } else {
         add_bias_kernel<<<blocks, threads, 0, stream>>>(
             static_cast<float*>(output.raw_data()),
             static_cast<const float*>(bias.raw_data()),
-            output.numel(),
+            rows,
             columns);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -127,17 +136,18 @@ public:
         const PlanKey& key
     ) {
         const cudaDataType_t data_type = to_cuda_dtype(key.dtype);
-        // Tensor-Core paths need aligned matrix dimensions. For tiny or
-        // irregular F32 matrices, regular FP32 is both compatible and usually
-        // faster than forcing a TF32 descriptor that cuBLASLt cannot execute.
-        const bool tf32_eligible =
+        // Tensor Cores also accelerate irregular, model-sized matrices.
+        // Requiring every dimension to be divisible by eight unnecessarily
+        // sent M=15/31/127 to FP32. Very small matrices remain on FP32: they
+        // are bandwidth/launch-bound and TF32 can be slower there.
+        const bool use_tf32 =
             key.dtype == Dtype::F32 &&
             key.compute_type == ComputeType::TF32 &&
-            key.rows % 8 == 0 &&
-            key.input_dim % 8 == 0 &&
-            key.output_dim % 8 == 0;
+            key.rows >= 8 &&
+            key.input_dim >= 8 &&
+            key.output_dim >= 8;
         const cublasComputeType_t compute_type =
-            tf32_eligible ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+            use_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
         CUBLAS_CHECK(cublasLtMatmulDescCreate(
             &operation_, compute_type, CUDA_R_32F));
@@ -148,6 +158,21 @@ public:
             CUBLASLT_MATMUL_DESC_TRANSB,
             &transpose_weight,
             sizeof(transpose_weight)));
+
+        if (use_tf32) {
+            // Older cuBLASLt releases may reject TF32 for a few tiny or
+            // irregular shapes. Keep a descriptor-only FP32 fallback without
+            // penalizing the normal Tensor-Core path.
+            CUBLAS_CHECK(cublasLtMatmulDescCreate(
+                &fp32_fallback_operation_,
+                CUBLAS_COMPUTE_32F,
+                CUDA_R_32F));
+            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+                fp32_fallback_operation_,
+                CUBLASLT_MATMUL_DESC_TRANSB,
+                &transpose_weight,
+                sizeof(transpose_weight)));
+        }
 
         if (key.has_bias) {
             CUBLAS_CHECK(cublasLtMatmulDescCreate(
@@ -239,6 +264,9 @@ public:
         if (unfused_operation_ != nullptr) {
             cublasLtMatmulDescDestroy(unfused_operation_);
         }
+        if (fp32_fallback_operation_ != nullptr) {
+            cublasLtMatmulDescDestroy(fp32_fallback_operation_);
+        }
     }
 
     MatmulPlan(const MatmulPlan&) = delete;
@@ -317,6 +345,16 @@ public:
             status = launch(nullptr, unfused_operation_);
             needs_bias_fallback = true;
         }
+        if (status == CUBLAS_STATUS_NOT_SUPPORTED &&
+            fp32_fallback_operation_ != nullptr) {
+            // Preserve compatibility with CUDA versions that cannot execute
+            // an irregular TF32 operation. The fallback intentionally has no
+            // epilogue, so bias is added by the coalesced 2-D kernel.
+            has_selected_algorithm_ = false;
+            workspace_required_ = 0;
+            status = launch(nullptr, fp32_fallback_operation_);
+            needs_bias_fallback = bias != nullptr;
+        }
         CUBLAS_CHECK(status);
         if (needs_bias_fallback) {
             launch_bias_fallback(output, *bias, stream);
@@ -326,6 +364,7 @@ public:
 private:
     cublasLtMatmulDesc_t operation_ = nullptr;
     cublasLtMatmulDesc_t unfused_operation_ = nullptr;
+    cublasLtMatmulDesc_t fp32_fallback_operation_ = nullptr;
     cublasLtMatrixLayout_t input_layout_ = nullptr;
     cublasLtMatrixLayout_t weight_layout_ = nullptr;
     cublasLtMatrixLayout_t output_layout_ = nullptr;

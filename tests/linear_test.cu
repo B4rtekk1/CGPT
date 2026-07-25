@@ -94,6 +94,19 @@ void test_fused_bias_and_cached_plan() {
     expect_close(read_tensor(output), {7.5f, 7.0f, 3.5f, 2.0f});
 }
 
+void test_irregular_tf32_shape() {
+    Tensor input = Tensor::ones({9, 9});
+    Tensor weight = Tensor::ones({9, 9});
+    Tensor bias = Tensor::full({9}, 0.25f);
+    Tensor output({9, 9});
+
+    CublasLtContext context;
+    linear_forward(output, input, weight, bias, context);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    expect_close(read_tensor(output), std::vector<float>(81, 9.25f));
+}
+
 void test_reduced_precision(const Dtype dtype, const float tolerance) {
     Tensor input({2, 4}, dtype);
     Tensor weight({3, 4}, dtype);
@@ -166,6 +179,7 @@ int main() {
         test_matrix_multiplication();
         test_batched_input();
         test_fused_bias_and_cached_plan();
+        test_irregular_tf32_shape();
         test_reduced_precision(Dtype::F16, 2.0e-2f);
         test_reduced_precision(Dtype::BF16, 5.0e-2f);
         test_validation();

@@ -28,10 +28,12 @@ enum class Dtype: std::uint8_t {
 
 constexpr std::size_t dtype_size(Dtype dtype) {
     switch (dtype) {
-        case Dtype::F16: return 2;
-        case Dtype::BF16: return 2;
-        case Dtype::F32: return 4;
-        case Dtype::I32: return 4;
+        case Dtype::F16:
+        case Dtype::BF16:
+            return 2;
+        case Dtype::F32:
+        case Dtype::I32:
+            return 4;
     }
     throw std::invalid_argument("Dtype not supported");
 }

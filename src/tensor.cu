@@ -148,12 +148,12 @@ Tensor Tensor::empty(
 
 Tensor Tensor::zeros(
     std::vector<std::size_t> shape,
-    DeviceType device,
-    cudaStream_t stream,
-    Dtype dtype) {
-    Tensor result(std::move(shape), device, dtype);
+    const DeviceType device_type,
+    const cudaStream_t stream,
+    const Dtype dtype) {
+    Tensor result(std::move(shape), device_type, dtype);
 
-    if (device == DeviceType::CUDA) {
+    if (device_type == DeviceType::CUDA) {
         // cudaMemset is faster than a kernel for zeros.
         CUDA_CHECK(cudaMemsetAsync(
             result.raw_data(), 0, result.nbytes(), stream));
