@@ -125,6 +125,31 @@ int main() {
                     reference_encode_plain(sample, tokenizer.merges()),
                 "Short stack encoder differs from sequential BPE semantics");
         }
+        bpe::EncodeOptions uncached;
+        uncached.cache_entries = 0;
+        uncached.cache_max_input_bytes = 0;
+        for (std::size_t trial = 0; trial < 2'000; ++trial) {
+            random_state = random_state * 6'364'136'223'846'793'005ULL + 1;
+            const std::size_t length = 33 + (random_state >> 32U) % 224;
+            std::string sample(length, '\0');
+            for (char& character : sample) {
+                random_state = random_state * 6'364'136'223'846'793'005ULL + 1;
+                character = static_cast<char>('a' + (random_state >> 62U));
+            }
+            require(
+                tokenizer.encode(sample, uncached) ==
+                    reference_encode_plain(sample, tokenizer.merges()),
+                "Heap encoder differs from sequential BPE semantics");
+        }
+        std::string long_sample(8'192, '\0');
+        for (char& character : long_sample) {
+            random_state = random_state * 6'364'136'223'846'793'005ULL + 1;
+            character = static_cast<char>('a' + (random_state >> 62U));
+        }
+        require(
+            tokenizer.encode(long_sample, uncached) ==
+                reference_encode_plain(long_sample, tokenizer.merges()),
+            "Rank-bucket encoder differs from sequential BPE semantics");
 
         const std::vector<std::string_view> batch_input = {
             "Ala ma kota", "Zażółć gęślą jaźń", "<bos>abc<eos>", ""};

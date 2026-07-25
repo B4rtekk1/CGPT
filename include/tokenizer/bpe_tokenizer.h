@@ -84,14 +84,23 @@ namespace bpe {
         void rebuild_fast_merge_lookup();
         void rebuild_token_bytes();
         void rebuild_special_matcher();
+        [[nodiscard]] std::vector<TokenId> encode_with_dense_limit(
+            std::string_view text,
+            const EncodeOptions& options,
+            unsigned dense_limit_bits) const;
         void append_encoded_bytes(
             std::string_view text,
             std::vector<TokenId>& output,
-            const EncodeOptions& options) const;
+            const EncodeOptions& options,
+            unsigned dense_limit_bits) const;
         void append_encoded_bytes_uncached(
             std::string_view text,
-            std::vector<TokenId>& output) const;
-        [[nodiscard]] TokenId lookup_merge(TokenId left, TokenId right) const noexcept;
+            std::vector<TokenId>& output,
+            unsigned dense_limit_bits) const;
+        [[nodiscard]] TokenId lookup_merge(
+            TokenId left,
+            TokenId right,
+            unsigned dense_limit_bits) const noexcept;
         [[nodiscard]] bool is_special(TokenId id) const noexcept;
 
         struct SpecialMatcherNode {
@@ -111,9 +120,10 @@ namespace bpe {
         std::vector<std::vector<std::uint8_t>> token_bytes_;
         std::unordered_map<std::uint64_t, TokenId> merge_lookup_;
         // GigaToken-style two-level lookup used by the encoding hot path:
-        // byte pairs use a dense table, while the remaining pairs use a
-        // packed, immutable, open-addressed table.
-        std::vector<TokenId> byte_pair_merge_;
+        // early token IDs use an L3-resident dense table, while the remaining
+        // pairs use a packed, immutable, open-addressed table.
+        std::vector<TokenId> dense_merge_lookup_;
+        unsigned dense_merge_bits_ = 0;
         std::vector<std::uint64_t> packed_merge_lookup_;
         std::size_t packed_merge_mask_ = 0;
         unsigned packed_merge_shift_ = 0;

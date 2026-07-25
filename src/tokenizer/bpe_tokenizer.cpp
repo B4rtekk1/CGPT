@@ -24,10 +24,6 @@ namespace bpe {
             return next.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Keeping every historical count in a priority_queue makes training
-        // quadratic in practice: a frequent merge changes millions of pairs,
-        // and each change leaves a stale heap entry behind. This heap stores
-        // exactly one entry per live pair and updates it in place.
         class CandidateHeap {
         public:
             void reserve(const std::size_t count) {
@@ -133,10 +129,6 @@ namespace bpe {
             std::unordered_map<PairKey, std::size_t> indices_;
         };
 
-        // Initial corpus scans visit occurrences in document/position order.  Keep
-        // that sorted prefix instead of sorting the (often multi-million element)
-        // list again when the pair is first selected.  Incremental updates are
-        // appended as an unsorted suffix and normalized only if that pair wins.
         struct OccurrenceList {
             std::vector<Occurrence> values;
             std::size_t sorted_size = 0;
@@ -275,9 +267,10 @@ namespace bpe {
         for (std::size_t token_index = 0; token_index < special_tokens_.size(); ++token_index) {
             std::uint32_t state = 0;
             for (const unsigned char byte : special_tokens_[token_index]) {
-                std::uint32_t& transition = special_matcher_[state].transitions[byte];
+                std::uint32_t transition = special_matcher_[state].transitions[byte];
                 if (transition == SpecialMatcherNode::kMissing) {
                     transition = static_cast<std::uint32_t>(special_matcher_.size());
+                    special_matcher_[state].transitions[byte] = transition;
                     special_matcher_.emplace_back();
                 }
                 state = transition;
@@ -288,9 +281,11 @@ namespace bpe {
 
         std::queue<std::uint32_t> pending;
         for (std::size_t byte = 0; byte < 256; ++byte) {
-            const std::uint32_t next = special_matcher_[0].transitions[byte];
+            std::uint32_t& next = special_matcher_[0].transitions[byte];
             if (next != SpecialMatcherNode::kMissing) {
                 pending.push(next);
+            } else {
+                next = 0;
             }
         }
 
@@ -299,23 +294,16 @@ namespace bpe {
             pending.pop();
 
             for (std::size_t byte = 0; byte < 256; ++byte) {
-                const std::uint32_t next = special_matcher_[state].transitions[byte];
+                std::uint32_t& next = special_matcher_[state].transitions[byte];
                 if (next == SpecialMatcherNode::kMissing) {
+                    next = special_matcher_[special_matcher_[state].failure]
+                               .transitions[byte];
                     continue;
                 }
 
-                std::uint32_t failure = special_matcher_[state].failure;
-                while (failure != 0 &&
-                       special_matcher_[failure].transitions[byte] ==
-                           SpecialMatcherNode::kMissing) {
-                    failure = special_matcher_[failure].failure;
-                }
-
-                const std::uint32_t fallback =
-                    special_matcher_[failure].transitions[byte];
-                if (fallback != SpecialMatcherNode::kMissing && fallback != next) {
-                    special_matcher_[next].failure = fallback;
-                }
+                special_matcher_[next].failure =
+                    special_matcher_[special_matcher_[state].failure]
+                        .transitions[byte];
 
                 const auto& inherited =
                     special_matcher_[special_matcher_[next].failure].outputs;
@@ -372,8 +360,7 @@ namespace bpe {
         const std::size_t workers = worker_count_for(config.worker_count, corpus.size());
         PairCounts global_counts;
         std::unordered_map<PairKey, OccurrenceList> occurrences;
-        // Byte-level initialization contains at most 256^2 distinct pairs.
-        // Reserving them avoids several expensive rehashes on a large corpus.
+
         occurrences.reserve(65'536);
         std::size_t active_edges = 0;
         std::size_t occurrence_entries = 0;
@@ -435,12 +422,6 @@ namespace bpe {
             candidates.insert(pair, count);
         }
 
-        // Reused across merge iterations: per-occurrence updates are collected as
-        // flat (pair, delta) pairs and reduced by sort+accumulate instead of going
-        // through an unordered_map for every single occurrence. Keeping the buffers
-        // alive between iterations (clear() retains capacity) avoids repeated
-        // allocation/rehashing, which dominated the cost of the early, high-frequency
-        // merges on large corpora.
         struct MergeUpdates {
             std::vector<std::pair<PairKey, std::int64_t>> count_deltas;
             std::vector<std::pair<PairKey, Occurrence>> new_occurrences;
@@ -472,10 +453,6 @@ namespace bpe {
                 occurrence_entries -= positions.values.size();
                 positions.sort();
 
-                // A merge only changes links within its document.  Process document
-                // ranges in parallel and collect count/occurrence changes locally;
-                // mutating the global hash tables for every affected edge was the
-                // dominant cost for large corpora.
                 const std::size_t merge_workers = worker_count_for(
                     workers, std::min(corpus.size(), positions.values.size()));
                 for (std::size_t w = 0; w < merge_workers; ++w) {
@@ -602,11 +579,6 @@ namespace bpe {
                     }
                 }
 
-                // Rebuilding is O(active_edges), so on a multi-gigabyte corpus a fixed
-                // absolute slack triggers this on nearly every merge and a single-
-                // threaded scan of the whole corpus dominates training time. Scale the
-                // threshold with corpus size and do the rebuild in parallel, mirroring
-                // the initial occurrence-list construction above.
                 const std::size_t compact_slack =
                     std::max<std::size_t>(1'000'000, active_edges / 8);
                 if (occurrence_entries > active_edges + compact_slack) {
@@ -698,6 +670,13 @@ namespace bpe {
     std::vector<TokenId> BpeTokenizer::encode(
         const std::string_view text,
         const EncodeOptions& options) const {
+        return encode_with_dense_limit(text, options, dense_merge_bits_);
+    }
+
+    std::vector<TokenId> BpeTokenizer::encode_with_dense_limit(
+        const std::string_view text,
+        const EncodeOptions& options,
+        const unsigned dense_limit_bits) const {
         if (text.empty()) {
             return {};
         }
@@ -712,17 +691,7 @@ namespace bpe {
         std::uint32_t state = 0;
         for (std::size_t position = 0; position < text.size(); ++position) {
             const auto byte = static_cast<unsigned char>(text[position]);
-            while (state != 0 &&
-                   special_matcher_[state].transitions[byte] ==
-                       SpecialMatcherNode::kMissing) {
-                state = special_matcher_[state].failure;
-            }
-
-            const std::uint32_t transition =
-                special_matcher_[state].transitions[byte];
-            if (transition != SpecialMatcherNode::kMissing) {
-                state = transition;
-            }
+            state = special_matcher_[state].transitions[byte];
 
             for (const std::uint32_t token_index : special_matcher_[state].outputs) {
                 const std::size_t length = special_tokens_[token_index].size();
@@ -748,7 +717,11 @@ namespace bpe {
             if (match_index == matches.size()) break;
 
             const SpecialMatch selected = matches[match_index];
-            append_encoded_bytes(text.substr(cursor, selected.start - cursor), result, options);
+            append_encoded_bytes(
+                text.substr(cursor, selected.start - cursor),
+                result,
+                options,
+                dense_limit_bits);
             result.push_back(kByteVocabularySize + selected.token_index);
             cursor = selected.start + selected.length;
 
@@ -757,7 +730,8 @@ namespace bpe {
             }
         }
 
-        append_encoded_bytes(text.substr(cursor), result, options);
+        append_encoded_bytes(
+            text.substr(cursor), result, options, dense_limit_bits);
         return result;
     }
 
@@ -791,12 +765,17 @@ namespace bpe {
         std::atomic_size_t next_index{0};
         std::vector<std::thread> threads;
         threads.reserve(workers);
+        constexpr unsigned batch_dense_bits = 10;
+        const unsigned dense_limit_bits =
+            std::min(dense_merge_bits_, batch_dense_bits);
         for (std::size_t worker = 0; worker < workers; ++worker) {
-            threads.emplace_back([this, &texts, &result, &next_index, &options] {
+            threads.emplace_back(
+                [this, &texts, &result, &next_index, &options, dense_limit_bits] {
                 while (true) {
                     const std::size_t index = next_index.fetch_add(1, std::memory_order_relaxed);
                     if (index >= texts.size()) break;
-                    result[index] = encode(texts[index], options);
+                    result[index] = encode_with_dense_limit(
+                        texts[index], options, dense_limit_bits);
                 }
             });
         }
@@ -807,11 +786,12 @@ namespace bpe {
     void BpeTokenizer::append_encoded_bytes(
         const std::string_view text,
         std::vector<TokenId>& output,
-        const EncodeOptions& options) const {
+        const EncodeOptions& options,
+        const unsigned dense_limit_bits) const {
         if (text.empty()) return;
         if (options.cache_entries == 0 || options.cache_max_input_bytes == 0 ||
             text.size() > options.cache_max_input_bytes) {
-            append_encoded_bytes_uncached(text, output);
+            append_encoded_bytes_uncached(text, output, dense_limit_bits);
             return;
         }
 
@@ -856,7 +836,7 @@ namespace bpe {
 
         std::vector<TokenId> encoded;
         encoded.reserve(text.size());
-        append_encoded_bytes_uncached(text, encoded);
+        append_encoded_bytes_uncached(text, encoded, dense_limit_bits);
         output.insert(output.end(), encoded.begin(), encoded.end());
 
         if (cache.entries.size() >= options.cache_entries) {
@@ -868,10 +848,13 @@ namespace bpe {
 
     TokenId BpeTokenizer::lookup_merge(
         const TokenId left,
-        const TokenId right) const noexcept {
+        const TokenId right,
+        const unsigned dense_limit_bits) const noexcept {
         constexpr TokenId missing = std::numeric_limits<TokenId>::max();
-        if (left < 256 && right < 256) {
-            return byte_pair_merge_[(static_cast<std::size_t>(left) << 8U) | right];
+        if (!dense_merge_lookup_.empty() &&
+            ((left | right) >> dense_limit_bits) == 0) {
+            return dense_merge_lookup_[
+                (static_cast<std::size_t>(left) << dense_merge_bits_) | right];
         }
 
         if (!packed_merge_lookup_.empty()) {
@@ -901,28 +884,40 @@ namespace bpe {
 
     void BpeTokenizer::append_encoded_bytes_uncached(
         const std::string_view text,
-        std::vector<TokenId>& output) const {
+        std::vector<TokenId>& output,
+        const unsigned dense_limit_bits) const {
         if (text.empty()) return;
 
-        // GigaToken uses a separate stack-resident merge core for short
-        // pretokens: a linear minimum-rank scan beats heap/list machinery at
-        // this size and performs no allocations.
+        const auto find_merge = [this, dense_limit_bits](
+                                    const TokenId left,
+                                    const TokenId right) noexcept {
+            return lookup_merge(left, right, dense_limit_bits);
+        };
+
         constexpr std::size_t short_merge_max = 32;
         if (text.size() <= short_merge_max) {
             constexpr TokenId missing = std::numeric_limits<TokenId>::max();
             std::array<TokenId, short_merge_max> symbols{};
-            std::size_t size = text.size();
+            std::array<TokenId, short_merge_max> ranks{};
+            std::array<std::uint8_t, short_merge_max> next{};
+            std::array<std::uint8_t, short_merge_max> previous{};
+            const std::size_t size = text.size();
             for (std::size_t i = 0; i < size; ++i) {
                 symbols[i] = static_cast<unsigned char>(text[i]);
+                next[i] = static_cast<std::uint8_t>(i + 1);
+                previous[i] = static_cast<std::uint8_t>(i - 1);
+                ranks[i] = missing;
+            }
+            for (std::size_t i = 0; i + 1 < size; ++i) {
+                ranks[i] = find_merge(symbols[i], symbols[i + 1]);
             }
 
-            while (size > 1) {
+            while (true) {
                 TokenId best_merge = missing;
                 std::size_t best_position = 0;
                 for (std::size_t i = 0; i + 1 < size; ++i) {
-                    const TokenId merge = lookup_merge(symbols[i], symbols[i + 1]);
-                    if (merge < best_merge) {
-                        best_merge = merge;
+                    if (ranks[i] < best_merge) {
+                        best_merge = ranks[i];
                         best_position = i;
                     }
                 }
@@ -931,15 +926,28 @@ namespace bpe {
                 }
 
                 symbols[best_position] = best_merge;
-                std::move(
-                    symbols.begin() + static_cast<std::ptrdiff_t>(best_position + 2),
-                    symbols.begin() + static_cast<std::ptrdiff_t>(size),
-                    symbols.begin() + static_cast<std::ptrdiff_t>(best_position + 1));
-                --size;
+                const std::size_t removed = next[best_position];
+                const std::size_t new_right = next[removed];
+                next[best_position] = static_cast<std::uint8_t>(new_right);
+                ranks[removed] = missing;
+
+                if (new_right < size) {
+                    previous[new_right] = static_cast<std::uint8_t>(best_position);
+                    ranks[best_position] =
+                        find_merge(symbols[best_position], symbols[new_right]);
+                } else {
+                    ranks[best_position] = missing;
+                }
+
+                const std::size_t left = previous[best_position];
+                if (left < size) {
+                    ranks[left] = find_merge(symbols[left], symbols[best_position]);
+                }
             }
 
-            output.insert(output.end(), symbols.begin(),
-                          symbols.begin() + static_cast<std::ptrdiff_t>(size));
+            for (std::size_t index = 0; index < size; index = next[index]) {
+                output.push_back(symbols[index]);
+            }
             return;
         }
 
@@ -963,19 +971,123 @@ namespace bpe {
                 });
             }
 
-            const auto first_merged = static_cast<TokenId>(
-                kByteVocabularySize + special_tokens_.size());
+            constexpr std::size_t rank_bucket_min_size = 4'096;
+            if (text.size() >= rank_bucket_min_size) {
+                const auto first_merged = static_cast<TokenId>(
+                    kByteVocabularySize + special_tokens_.size());
+                struct RankBucket {
+                    std::vector<Link> values;
+                    std::size_t sorted_size = 0;
 
-            // Preserve the exact merge-order semantics used by tokenizer (7):
-            // process the lowest merge rank first and process candidates of the
-            // same rank in the order in which they were discovered.
-            thread_local std::vector<std::vector<Link>> positions;
-            if (positions.size() < merges_.size()) {
-                positions.resize(merges_.size());
+                    void normalize() {
+                        if (sorted_size == values.size()) {
+                            return;
+                        }
+                        auto middle = values.begin() +
+                            static_cast<std::ptrdiff_t>(sorted_size);
+                        std::ranges::sort(middle, values.end());
+                        if (sorted_size != 0) {
+                            std::inplace_merge(values.begin(), middle, values.end());
+                        }
+                        sorted_size = values.size();
+                    }
+
+                    void clear() {
+                        values.clear();
+                        sorted_size = 0;
+                    }
+                };
+                thread_local std::vector<RankBucket> positions;
+                if (positions.size() < merges_.size()) {
+                    positions.resize(merges_.size());
+                }
+
+                thread_local std::vector<std::size_t> rank_heap;
+                rank_heap.clear();
+                const auto add_rank_candidate = [&](const Link left) {
+                    if (left == end || nodes[left].next == end) {
+                        return;
+                    }
+
+                    constexpr TokenId missing = std::numeric_limits<TokenId>::max();
+                    const TokenId merge = find_merge(
+                        nodes[left].token, nodes[nodes[left].next].token);
+                    if (merge == missing) {
+                        return;
+                    }
+
+                    const std::size_t rank = merge - first_merged;
+                    auto& bucket = positions[rank];
+                    if (bucket.values.empty()) {
+                        rank_heap.push_back(rank);
+                        std::push_heap(
+                            rank_heap.begin(), rank_heap.end(), std::greater<>());
+                    }
+                    bucket.values.push_back(left);
+                };
+
+                for (Link left = 0; left + 1 < nodes.size(); ++left) {
+                    add_rank_candidate(left);
+                }
+                for (auto& bucket : positions) {
+                    bucket.sorted_size = bucket.values.size();
+                }
+
+                std::size_t token_count = nodes.size();
+                while (!rank_heap.empty()) {
+                    std::pop_heap(
+                        rank_heap.begin(), rank_heap.end(), std::greater<>());
+                    const std::size_t rank = rank_heap.back();
+                    rank_heap.pop_back();
+
+                    auto& bucket = positions[rank];
+                    bucket.normalize();
+                    bucket.values.erase(
+                        std::unique(bucket.values.begin(), bucket.values.end()),
+                        bucket.values.end());
+                    const MergeRule& rule = merges_[rank];
+                    for (const Link left_index : bucket.values) {
+                        Node& left = nodes[left_index];
+                        if (left.next == end) {
+                            continue;
+                        }
+
+                        const Link right_index = left.next;
+                        Node& right = nodes[right_index];
+                        if (left.token != rule.left || right.token != rule.right) {
+                            continue;
+                        }
+
+                        const Link before = left.previous;
+                        const Link after = right.next;
+                        left.token = rule.merged;
+                        left.next = after;
+                        if (after != end) {
+                            nodes[after].previous = left_index;
+                        }
+                        right.next = end;
+                        right.previous = end;
+                        --token_count;
+
+                        add_rank_candidate(before);
+                        add_rank_candidate(left_index);
+                    }
+                    bucket.clear();
+                }
+
+                output.reserve(output.size() + token_count);
+                for (Link index = 0; index != end; index = nodes[index].next) {
+                    output.push_back(nodes[index].token);
+                }
+                return;
             }
 
-            thread_local std::vector<std::size_t> rank_heap;
-            rank_heap.clear();
+            // A packed pair is 8 bytes for the common uint32_t-link path.
+            // Lexicographic ordering gives merge rank first and source
+            // position second, exactly matching sequential BPE semantics.
+            using Candidate = std::pair<TokenId, Link>;
+            thread_local std::vector<Candidate> candidate_heap;
+            candidate_heap.clear();
 
             const auto add_candidate = [&](const Link left) {
                 if (left == end || nodes[left].next == end) {
@@ -983,61 +1095,61 @@ namespace bpe {
                 }
 
                 constexpr TokenId missing = std::numeric_limits<TokenId>::max();
-                const TokenId merge = lookup_merge(
+                const TokenId merge = find_merge(
                     nodes[left].token, nodes[nodes[left].next].token);
                 if (merge == missing) {
                     return;
                 }
-
-                const std::size_t rank = merge - first_merged;
-                std::vector<Link>& bucket = positions[rank];
-                if (bucket.empty()) {
-                    rank_heap.push_back(rank);
-                    std::push_heap(rank_heap.begin(), rank_heap.end(), std::greater<>());
-                }
-                bucket.push_back(left);
+                candidate_heap.emplace_back(merge, left);
             };
 
             for (Link left = 0; left + 1 < nodes.size(); ++left) {
                 add_candidate(left);
             }
+            std::make_heap(
+                candidate_heap.begin(), candidate_heap.end(), std::greater<>());
 
             std::size_t token_count = nodes.size();
-            while (!rank_heap.empty()) {
-                std::pop_heap(rank_heap.begin(), rank_heap.end(), std::greater<>());
-                const std::size_t rank = rank_heap.back();
-                rank_heap.pop_back();
+            while (!candidate_heap.empty()) {
+                std::pop_heap(
+                    candidate_heap.begin(), candidate_heap.end(), std::greater<>());
+                const auto [expected_merge, left_index] = candidate_heap.back();
+                candidate_heap.pop_back();
 
-                const MergeRule& rule = merges_[rank];
-                std::vector<Link>& bucket = positions[rank];
-                for (std::size_t i = 0; i < bucket.size(); ++i) {
-                    const Link left_index = bucket[i];
-                    Node& left = nodes[left_index];
-                    if (left.next == end) {
-                        continue;
-                    }
-
-                    const Link right_index = left.next;
-                    Node& right = nodes[right_index];
-                    if (left.token != rule.left || right.token != rule.right) {
-                        continue;
-                    }
-
-                    const Link before = left.previous;
-                    const Link after = right.next;
-                    left.token = rule.merged;
-                    left.next = after;
-                    if (after != end) {
-                        nodes[after].previous = left_index;
-                    }
-                    right.next = end;
-                    right.previous = end;
-                    --token_count;
-
-                    add_candidate(before);
-                    add_candidate(left_index);
+                Node& left = nodes[left_index];
+                if (left.next == end) {
+                    continue;
                 }
-                bucket.clear();
+
+                const Link right_index = left.next;
+                Node& right = nodes[right_index];
+                if (find_merge(left.token, right.token) != expected_merge) {
+                    continue;
+                }
+
+                const Link before = left.previous;
+                const Link after = right.next;
+                left.token = expected_merge;
+                left.next = after;
+                if (after != end) {
+                    nodes[after].previous = left_index;
+                }
+                right.next = end;
+                right.previous = end;
+                --token_count;
+
+                const std::size_t old_heap_size = candidate_heap.size();
+                add_candidate(before);
+                if (candidate_heap.size() != old_heap_size) {
+                    std::push_heap(
+                        candidate_heap.begin(), candidate_heap.end(), std::greater<>());
+                }
+                const std::size_t after_left_size = candidate_heap.size();
+                add_candidate(left_index);
+                if (candidate_heap.size() != after_left_size) {
+                    std::push_heap(
+                        candidate_heap.begin(), candidate_heap.end(), std::greater<>());
+                }
             }
 
             output.reserve(output.size() + token_count);
@@ -1223,21 +1335,36 @@ void BpeTokenizer::add_merge(const TokenId left, const TokenId right) {
     merges_.push_back({left, right, merged});
     token_bytes_.push_back(std::move(bytes));
     merge_lookup_.emplace(key, merged);
-    if (left < 256 && right < 256) {
-        byte_pair_merge_[(static_cast<std::size_t>(left) << 8U) | right] = merged;
-    }
 }
 
 void BpeTokenizer::rebuild_fast_merge_lookup() {
     constexpr unsigned id_bits = 21;
     constexpr TokenId id_limit = TokenId{1} << id_bits;
+    constexpr TokenId missing = std::numeric_limits<TokenId>::max();
     constexpr std::uint64_t empty = std::numeric_limits<std::uint64_t>::max();
 
     packed_merge_lookup_.clear();
     packed_merge_mask_ = 0;
     packed_merge_shift_ = 0;
+    dense_merge_lookup_.clear();
+    dense_merge_bits_ = 0;
     if (merges_.empty() || token_bytes_.size() > id_limit) {
         return;
+    }
+
+    // As in GigaToken, cover IDs 0..2047 rather than only raw bytes. The
+    // 16 MiB table fits in modern last-level caches and turns most early and
+    // mid-merge hits/misses into a single indexed load.
+    constexpr unsigned dense_bits = 11;
+    constexpr std::size_t dense_side = std::size_t{1} << dense_bits;
+    dense_merge_lookup_.assign(dense_side * dense_side, missing);
+    dense_merge_bits_ = dense_bits;
+    for (const MergeRule& merge : merges_) {
+        if (((merge.left | merge.right) >> dense_bits) == 0) {
+            dense_merge_lookup_[
+                (static_cast<std::size_t>(merge.left) << dense_bits) |
+                merge.right] = merge.merged;
+        }
     }
 
     const std::size_t slot_count =
@@ -1249,6 +1376,8 @@ void BpeTokenizer::rebuild_fast_merge_lookup() {
     for (const MergeRule& merge : merges_) {
         if (merge.left >= id_limit || merge.right >= id_limit ||
             merge.merged >= id_limit) {
+            dense_merge_lookup_.clear();
+            dense_merge_bits_ = 0;
             packed_merge_lookup_.clear();
             packed_merge_mask_ = 0;
             packed_merge_shift_ = 0;
@@ -1259,15 +1388,21 @@ void BpeTokenizer::rebuild_fast_merge_lookup() {
             (static_cast<std::uint64_t>(merge.left) << id_bits) | merge.right;
         std::size_t index = static_cast<std::size_t>(
             key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_);
+        std::size_t displacement = 0;
         while (packed_merge_lookup_[index] != empty) {
             index = (index + 1) & packed_merge_mask_;
+            if (++displacement > 64) {
+                packed_merge_lookup_.clear();
+                packed_merge_mask_ = 0;
+                packed_merge_shift_ = 0;
+                return;
+            }
         }
         packed_merge_lookup_[index] = (key << id_bits) | merge.merged;
     }
 }
 
 void BpeTokenizer::rebuild_token_bytes() {
-    constexpr TokenId missing = std::numeric_limits<TokenId>::max();
     token_bytes_.clear();
     token_bytes_.reserve(kByteVocabularySize + special_tokens_.size() + merges_.size());
     for (TokenId byte = 0; byte < kByteVocabularySize; ++byte) {
@@ -1275,7 +1410,8 @@ void BpeTokenizer::rebuild_token_bytes() {
     }
     token_bytes_.resize(kByteVocabularySize + special_tokens_.size());
     merge_lookup_.clear();
-    byte_pair_merge_.assign(256 * 256, missing);
+    dense_merge_lookup_.clear();
+    dense_merge_bits_ = 0;
     packed_merge_lookup_.clear();
     packed_merge_mask_ = 0;
     packed_merge_shift_ = 0;
