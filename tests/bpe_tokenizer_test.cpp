@@ -1,34 +1,212 @@
 #include "tokenizer/bpe_tokenizer.h"
 
-#include <cassert>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+    void require(const bool condition, const char *message) {
+        if (!condition) {
+            throw std::runtime_error(message);
+        }
+    }
+
+    template<typename Function>
+    void expect_throw(Function &&function, const char *message) {
+        try {
+            function();
+        } catch (const std::exception &) {
+            return;
+        }
+        throw std::runtime_error(message);
+    }
+
+    bool same_merges(const std::vector<bpe::MergeRule> &left,
+                     const std::vector<bpe::MergeRule> &right) {
+        if (left.size() != right.size()) {
+            return false;
+        }
+        for (std::size_t index = 0; index < left.size(); ++index) {
+            if (left[index].left != right[index].left ||
+                left[index].right != right[index].right ||
+                left[index].merged != right[index].merged) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::vector<bpe::TokenId> reference_encode_plain(
+        const std::string_view text,
+        const std::vector<bpe::MergeRule>& merges
+    ) {
+        std::vector<bpe::TokenId> tokens;
+        tokens.reserve(text.size());
+        for (const unsigned char byte : text) {
+            tokens.push_back(byte);
+        }
+
+        for (const bpe::MergeRule& rule : merges) {
+            std::vector<bpe::TokenId> next;
+            next.reserve(tokens.size());
+            for (std::size_t index = 0; index < tokens.size();) {
+                if (index + 1 < tokens.size() &&
+                    tokens[index] == rule.left &&
+                    tokens[index + 1] == rule.right) {
+                    next.push_back(rule.merged);
+                    index += 2;
+                } else {
+                    next.push_back(tokens[index]);
+                    ++index;
+                }
+            }
+            tokens = std::move(next);
+        }
+        return tokens;
+    }
+}
 
 int main() {
-    const std::vector<std::string> corpus = {
-        "Ala ma kota. Ala ma psa.",
-        "kot kot kot pies pies",
-        "Zażółć gęślą jaźń 🦀",
-        "int main() { return 0; }"
-    };
+    try {
+        const std::vector<std::string> corpus = {
+            "Ala ma kota. Ala ma psa.",
+            "kot kot kot pies pies",
+            "Zażółć gęślą jaźń 🦀",
+            "int main() { return 0; }"
+        };
 
-    bpe::TrainerConfig config;
-    config.vocab_size = 300;
-    config.worker_count = 4;
+        bpe::TrainerConfig config;
+        config.vocab_size = 300;
+        config.worker_count = 4;
 
-    const bpe::BpeTokenizer tokenizer = bpe::BpeTokenizer::train(corpus, config);
-    const std::string text = "Zażółć kota 🦀";
-    const std::vector<bpe::TokenId> ids = tokenizer.encode(text);
+        const bpe::BpeTokenizer tokenizer = bpe::BpeTokenizer::train(corpus, config);
+        const std::string text = "<bos>Zażółć kota 🦀<eos>";
+        const std::vector<bpe::TokenId> ids = tokenizer.encode(text);
 
-    assert(tokenizer.decode(ids) == text);
-    assert(tokenizer.vocab_size() > bpe::BpeTokenizer::kByteVocabularySize);
+        require(tokenizer.decode(ids) == text, "BPE round-trip failed");
+        require(tokenizer.vocab_size() > bpe::BpeTokenizer::kByteVocabularySize,
+                "Training did not create any merge");
+        require(ids.size() < text.size(), "Special tokens or merges were not applied");
+        require(ids.size() >= 3 && ids.front() == bpe::BpeTokenizer::kByteVocabularySize + 1 &&
+                    ids.back() == bpe::BpeTokenizer::kByteVocabularySize + 2,
+                "Special tokens were not encoded as token IDs");
+        require(tokenizer.encode("").empty(), "Empty input did not produce empty output");
+        for (std::size_t encoded = 0; encoded < 19'683; ++encoded) {
+            std::size_t value = encoded;
+            std::string sample(9, 'a');
+            for (char& character : sample) {
+                character = static_cast<char>('a' + value % 3);
+                value /= 3;
+            }
+            require(
+                tokenizer.encode(sample) ==
+                    reference_encode_plain(sample, tokenizer.merges()),
+                "Optimized encoder differs from sequential BPE semantics");
+        }
 
-    const std::filesystem::path model_path = "bpe_tokenizer_test.bin";
-    tokenizer.save(model_path);
-    const bpe::BpeTokenizer loaded = bpe::BpeTokenizer::load(model_path);
+        std::istringstream stream(corpus[0] + corpus[1]);
+        bpe::TrainerConfig streaming_config = config;
+        streaming_config.worker_count = 1;
+        const bpe::BpeTokenizer streaming =
+            bpe::BpeTokenizer::train_streaming(stream, streaming_config, 7);
+        require(streaming.decode(streaming.encode(text)) == text,
+                "Streaming tokenizer round-trip failed");
+        require(streaming.vocab_size() > bpe::BpeTokenizer::kByteVocabularySize,
+                "Streaming training did not create any merge");
+        expect_throw([&] {
+            std::istringstream invalid_stream("text");
+            (void)bpe::BpeTokenizer::train_streaming(invalid_stream, config, 0);
+        }, "Zero streaming block size was accepted");
 
-    assert(loaded.decode(loaded.encode(text)) == text);
-    std::filesystem::remove(model_path);
+        bpe::TrainerConfig overlapping_config;
+        overlapping_config.vocab_size = 260;
+        overlapping_config.special_tokens = {"a", "ab", "abc", "bc"};
+        const bpe::BpeTokenizer overlapping =
+            bpe::BpeTokenizer::train({"ordinary training text"}, overlapping_config);
+        require(
+            overlapping.encode("abc") ==
+                std::vector<bpe::TokenId>{bpe::BpeTokenizer::kByteVocabularySize + 2},
+            "Longest overlapping special token was not selected");
 
-    std::cout << "BPE tokenizer test passed.\n";
+        bpe::TrainerConfig single_thread_config = config;
+        single_thread_config.worker_count = 1;
+        const bpe::BpeTokenizer single_thread =
+            bpe::BpeTokenizer::train(corpus, single_thread_config);
+        require(same_merges(tokenizer.merges(), single_thread.merges()),
+                "Training is not deterministic across worker counts");
+
+        const auto model_path = std::filesystem::temp_directory_path() /
+                                "cgpt_bpe_tokenizer_test.bin";
+        tokenizer.save(model_path);
+        const bpe::BpeTokenizer loaded = bpe::BpeTokenizer::load(model_path);
+        require(same_merges(loaded.merges(), tokenizer.merges()), "Loaded merges differ from saved merges");
+        require(loaded.special_tokens() == tokenizer.special_tokens(),
+                "Loaded special tokens differ from saved tokens");
+        require(loaded.encode(text) == ids, "Loaded tokenizer produced different IDs");
+        std::filesystem::remove(model_path);
+
+        expect_throw([] {
+            bpe::TrainerConfig invalid;
+            invalid.vocab_size = 259;
+            invalid.special_tokens = {""};
+            (void)bpe::BpeTokenizer::train({"text"}, invalid);
+        }, "Empty special token was accepted");
+        expect_throw([] {
+            bpe::TrainerConfig invalid;
+            invalid.vocab_size = 255;
+            (void)bpe::BpeTokenizer::train({"text"}, invalid);
+        }, "Too-small vocabulary was accepted");
+        expect_throw([] {
+            bpe::TrainerConfig invalid;
+            invalid.min_pair_frequency = 0;
+            (void)bpe::BpeTokenizer::train({"text"}, invalid);
+        }, "Zero pair frequency was accepted");
+        expect_throw([] {
+            (void)bpe::BpeTokenizer::train({"", ""});
+        }, "Empty corpus was accepted");
+        expect_throw([&] {
+            const std::vector<bpe::TokenId> invalid_ids = {
+                static_cast<bpe::TokenId>(tokenizer.vocab_size())};
+            (void)tokenizer.decode(invalid_ids);
+        }, "Invalid token ID was accepted");
+        expect_throw([] {
+            (void)bpe::BpeTokenizer::load("file-that-does-not-exist.bin");
+        }, "Missing model file was accepted");
+
+        const auto bad_magic_path = std::filesystem::temp_directory_path() /
+                                    "cgpt_bpe_bad_magic.bin";
+        {
+            std::ofstream output(bad_magic_path, std::ios::binary);
+            output << "not a tokenizer";
+        }
+        expect_throw([&] { (void)bpe::BpeTokenizer::load(bad_magic_path); },
+                     "Invalid model magic was accepted");
+        std::filesystem::remove(bad_magic_path);
+
+        const auto truncated_path = std::filesystem::temp_directory_path() /
+                                    "cgpt_bpe_truncated.bin";
+        tokenizer.save(truncated_path);
+        {
+            std::ifstream input(truncated_path, std::ios::binary);
+            std::string bytes((std::istreambuf_iterator<char>(input)), {});
+            bytes.resize(bytes.size() - 1);
+            std::ofstream output(truncated_path, std::ios::binary | std::ios::trunc);
+            output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        }
+        expect_throw([&] { (void)bpe::BpeTokenizer::load(truncated_path); },
+                     "Truncated model was accepted");
+        std::filesystem::remove(truncated_path);
+
+        std::cout << "BPE tokenizer tests passed.\n";
+        return 0;
+    } catch (const std::exception &error) {
+        std::cerr << "BPE tokenizer test failed: " << error.what() << '\n';
+        return 1;
+    }
 }

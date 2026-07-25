@@ -59,4 +59,5 @@ set_tests_properties(
 
 set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES
         TIMEOUT 900
+        SKIP_RETURN_CODE 77
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

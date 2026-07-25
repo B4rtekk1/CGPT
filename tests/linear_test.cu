@@ -72,6 +72,53 @@ void test_batched_input() {
     });
 }
 
+void test_fused_bias_and_cached_plan() {
+    Tensor input({2, 3});
+    Tensor weight({2, 3});
+    Tensor bias({2});
+    Tensor output({2, 2});
+
+    input.copy_from_host(std::vector<float>{
+        1.0f, 2.0f, 3.0f,
+        -1.0f, 0.0f, 2.0f});
+    weight.copy_from_host(std::vector<float>{
+        1.0f, 0.0f, 2.0f,
+        -1.0f, 3.0f, 1.0f});
+    bias.copy_from_host(std::vector<float>{0.5f, -1.0f});
+
+    CublasLtContext context;
+    linear_forward(output, input, weight, bias, context);
+    linear_forward(output, input, weight, bias, context);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    expect_close(read_tensor(output), {7.5f, 7.0f, 3.5f, 2.0f});
+}
+
+void test_reduced_precision(const Dtype dtype, const float tolerance) {
+    Tensor input({2, 4}, dtype);
+    Tensor weight({3, 4}, dtype);
+    Tensor bias({3}, dtype);
+    Tensor output({2, 3}, dtype);
+
+    input.copy_from_host(std::vector<float>{
+        1.0f, 2.0f, -1.0f, 0.5f,
+        -2.0f, 1.0f, 3.0f, -1.0f});
+    weight.copy_from_host(std::vector<float>{
+        1.0f, 0.0f, 2.0f, -1.0f,
+        0.5f, 1.0f, 0.0f, 2.0f,
+        -1.0f, 2.0f, 1.0f, 0.0f});
+    bias.copy_from_host(std::vector<float>{0.25f, -0.5f, 1.0f});
+
+    CublasLtContext context;
+    linear_forward(output, input, weight, bias, context);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    expect_close(
+        read_tensor(output),
+        {-1.25f, 3.0f, 3.0f, 5.25f, -2.5f, 8.0f},
+        tolerance);
+}
+
 template <typename Function>
 void expect_invalid_argument(Function&& function) {
     try {
@@ -118,6 +165,9 @@ int main() {
     try {
         test_matrix_multiplication();
         test_batched_input();
+        test_fused_bias_and_cached_plan();
+        test_reduced_precision(Dtype::F16, 2.0e-2f);
+        test_reduced_precision(Dtype::BF16, 5.0e-2f);
         test_validation();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -111,6 +111,11 @@ namespace bpe {
 
     BpeTokenizer::BpeTokenizer(std::vector<std::string> special_tokens)
         : special_tokens_(std::move(special_tokens)) {
+        for (const std::string &token : special_tokens_) {
+            if (token.empty()) {
+                throw std::invalid_argument("special tokens must not be empty");
+            }
+        }
         rebuild_token_bytes();
     }
 
@@ -127,11 +132,22 @@ namespace bpe {
         if (config.min_pair_frequency == 0) {
             throw std::invalid_argument("min_pair_frequency must be at least one");
         }
+        if (config.vocab_size > std::numeric_limits<TokenId>::max()) {
+            throw std::invalid_argument("vocab_size exceeds the TokenId limit");
+        }
+        for (const std::string &token : config.special_tokens) {
+            if (token.empty()) {
+                throw std::invalid_argument("special tokens must not be empty");
+            }
+        }
 
         const std::size_t requested_merges = config.vocab_size - minimum_vocab;
         ProgressBar progress(requested_merges, "BPE training");
 
         BpeTokenizer tokenizer(config.special_tokens);
+        tokenizer.merges_.reserve(requested_merges);
+        tokenizer.token_bytes_.reserve(config.vocab_size);
+        tokenizer.merge_lookup_.reserve(requested_merges);
         std::vector<std::vector<TokenId> > corpus;
         corpus.reserve(documents.size());
 
@@ -224,7 +240,8 @@ namespace bpe {
             while (!candidates.empty()) {
                 const auto [count, pair] = candidates.top();
                 candidates.pop();
-                if (global_counts.contains(pair) && global_counts[pair] == count) {
+                const auto current = global_counts.find(pair);
+                if (current != global_counts.end() && current->second == count) {
                     best_pair = pair;
                     best_count = count;
                     break;
@@ -240,11 +257,10 @@ namespace bpe {
             const auto merged = static_cast<TokenId>(tokenizer.vocab_size());
             tokenizer.add_merge(left, right);
 
-            auto found = occurrences.find(best_pair);
-            if (found != occurrences.end()) {
+            if (auto found = occurrences.find(best_pair); found != occurrences.end()) {
                 auto positions = std::move(found->second);
                 occurrence_entries -= positions.size();
-                std::sort(positions.begin(), positions.end());
+                std::ranges::sort(positions.begin(), positions.end());
 
                 for (const Occurrence occurrence: positions) {
                     const std::size_t document = occurrence_document(occurrence);
@@ -301,11 +317,6 @@ namespace bpe {
                     --active_edges;
                 }
 
-                // The occurrence lists use lazy deletion for speed. Compact
-                // them before stale entries can dominate memory. Rebuilding
-                // walks only the current linked streams, not the original
-                // byte corpus, and keeps the index within roughly 8 MiB of
-                // the number of active edges.
                 constexpr std::size_t compact_slack = 1'000'000;
                 if (occurrence_entries > active_edges + compact_slack) {
                     occurrences.clear();
@@ -332,83 +343,173 @@ namespace bpe {
         return tokenizer;
     }
 
+    BpeTokenizer BpeTokenizer::train_streaming(
+        std::istream &input,
+        const TrainerConfig &config,
+        const std::size_t block_size
+    ) {
+        if (block_size == 0) {
+            throw std::invalid_argument("streaming training block_size must be at least one");
+        }
+        if (block_size > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
+            throw std::invalid_argument("streaming training block_size exceeds stream limits");
+        }
+
+        std::vector<std::string> documents;
+        std::string block(block_size, '\0');
+        while (input.read(block.data(), static_cast<std::streamsize>(block.size())) ||
+               input.gcount() != 0) {
+            const auto bytes_read = input.gcount();
+            documents.emplace_back(block.data(), static_cast<std::size_t>(bytes_read));
+        }
+
+        if (input.fail() && !input.eof()) {
+            throw std::runtime_error("Failed while reading tokenizer training stream");
+        }
+        return train(documents, config);
+    }
+
+    BpeTokenizer BpeTokenizer::train(
+        std::istream &input,
+        const TrainerConfig &config,
+        const std::size_t block_size
+    ) {
+        return train_streaming(input, config, block_size);
+    }
+
     std::vector<TokenId> BpeTokenizer::encode(const std::string_view text) const {
         if (text.empty()) {
             return {};
         }
 
-        std::vector<TokenId> tokens = bytes_to_tokens(text);
-        const std::size_t size = tokens.size();
-        std::vector<std::size_t> next(size);
-        std::vector<std::size_t> previous(size);
-        constexpr std::size_t end = std::numeric_limits<std::size_t>::max();
-
-        for (std::size_t i = 0; i < size; ++i) {
-            next[i] = i + 1 < size ? i + 1 : end;
-            previous[i] = i == 0 ? end : i - 1;
+        std::vector<TokenId> result;
+        std::vector<std::size_t> next_special(special_tokens_.size());
+        for (std::size_t index = 0; index < special_tokens_.size(); ++index) {
+            next_special[index] = text.find(special_tokens_[index]);
         }
 
-        // Positions are append-only while a merge rule is being applied. The
-        // linked token stream below makes stale entries cheap to reject, so a
-        // tree is unnecessary here and would allocate one node per position.
-        using Positions = std::vector<std::size_t>;
-        std::unordered_map<PairKey, Positions> positions;
-        positions.reserve(std::min(size, merges_.size() * 2 + 1));
+        std::size_t cursor = 0;
+        while (cursor < text.size()) {
+            std::size_t matched_position = std::string_view::npos;
+            std::size_t matched_size = 0;
+            std::size_t matched_index = 0;
+            for (std::size_t index = 0; index < special_tokens_.size(); ++index) {
+                if (next_special[index] < cursor) {
+                    next_special[index] =
+                        text.find(special_tokens_[index], cursor);
+                }
+                if (next_special[index] < matched_position ||
+                    (next_special[index] == matched_position &&
+                     special_tokens_[index].size() > matched_size)) {
+                    matched_position = next_special[index];
+                    matched_size = special_tokens_[index].size();
+                    matched_index = index;
+                }
+            }
 
-        for (std::size_t i = 0; i + 1 < size; ++i) {
-            positions[pair_key(tokens[i], tokens[i + 1])].push_back(i);
+            if (matched_position == std::string_view::npos) {
+                append_encoded_bytes(text.substr(cursor), result);
+                break;
+            }
+
+            append_encoded_bytes(
+                text.substr(cursor, matched_position - cursor),
+                result);
+            result.push_back(kByteVocabularySize + static_cast<TokenId>(matched_index));
+            cursor = matched_position + matched_size;
+        }
+        return result;
+    }
+
+    void BpeTokenizer::append_encoded_bytes(
+        const std::string_view text,
+        std::vector<TokenId>& output
+    ) const {
+        if (text.empty()) {
+            return;
         }
 
-        const auto add_pair = [&positions, &tokens, &next](const std::size_t start) {
-            if (start != end && next[start] != end) {
-                positions[pair_key(tokens[start], tokens[next[start]])].push_back(start);
+        const auto encode_with_links = [&]<typename Link>() {
+            constexpr Link end = std::numeric_limits<Link>::max();
+            struct Node {
+            TokenId token;
+            Link next;
+            Link previous;
+            };
+            std::vector<Node> nodes;
+            nodes.reserve(text.size());
+            for (std::size_t index = 0; index < text.size(); ++index) {
+                nodes.push_back({
+                    static_cast<TokenId>(
+                        static_cast<unsigned char>(text[index])),
+                    index + 1 < text.size() ? static_cast<Link>(index + 1) : end,
+                    index == 0 ? end : static_cast<Link>(index - 1)
+                });
+            }
+
+            const auto first_merged = static_cast<TokenId>(
+                kByteVocabularySize + special_tokens_.size());
+            std::vector<std::vector<Link>> positions(merges_.size());
+
+            const auto add_candidate = [&](const Link left) {
+                if (left == end || nodes[left].next == end) {
+                    return;
+                }
+                const auto merge = merge_lookup_.find(
+                    pair_key(nodes[left].token, nodes[nodes[left].next].token));
+                if (merge != merge_lookup_.end()) {
+                    positions[merge->second - first_merged].push_back(left);
+                }
+            };
+
+            for (Link left = 0; left + 1 < nodes.size(); ++left) {
+                add_candidate(left);
+            }
+
+            std::size_t token_count = nodes.size();
+            for (std::size_t rank = 0; rank < merges_.size(); ++rank) {
+                const MergeRule& rule = merges_[rank];
+                // A pair can first appear only while its newest operand is being
+                // created. Since every earlier rule is applied left-to-right,
+                // these append-only position lists are already ordered.
+                for (const Link left_index : positions[rank]) {
+                    Node& left = nodes[left_index];
+                    if (left.next == end) {
+                        continue;
+                    }
+                    const Link right_index = left.next;
+                    Node& right = nodes[right_index];
+                    if (left.token != rule.left || right.token != rule.right) {
+                        continue;
+                    }
+
+                    const Link before = left.previous;
+                    const Link after = right.next;
+                    left.token = rule.merged;
+                    left.next = after;
+                    if (after != end) {
+                        nodes[after].previous = left_index;
+                    }
+                    right.next = end;
+                    right.previous = end;
+                    --token_count;
+
+                    add_candidate(before);
+                    add_candidate(left_index);
+                }
+            }
+
+            output.reserve(output.size() + token_count);
+            for (Link index = 0; index != end; index = nodes[index].next) {
+                output.push_back(nodes[index].token);
             }
         };
 
-        for (const MergeRule& rule : merges_) {
-            const PairKey key = pair_key(rule.left, rule.right);
-            auto found = positions.find(key);
-            if (found == positions.end()) {
-                continue;
-            }
-
-            auto candidates = std::move(found->second);
-            positions.erase(found);
-            // Initial positions are already ordered, but newly formed pairs
-            // are appended as merges progress. Sorting the compact snapshot
-            // preserves the left-to-right BPE rule without tree operations.
-            std::sort(candidates.begin(), candidates.end());
-            for (const std::size_t left : candidates) {
-                const std::size_t right = next[left];
-                if (right == end || tokens[left] != rule.left ||
-                    tokens[right] != rule.right) {
-                    continue;
-                }
-
-                const std::size_t before = previous[left];
-                const std::size_t after = next[right];
-
-                tokens[left] = rule.merged;
-                next[left] = after;
-                if (after != end) {
-                    previous[after] = left;
-                }
-                if (before != end) {
-                    next[before] = left;
-                }
-                next[right] = end;
-                previous[right] = end;
-                add_pair(before);
-                add_pair(left);
-            }
+        if (text.size() < std::numeric_limits<std::uint32_t>::max()) {
+            encode_with_links.template operator()<std::uint32_t>();
+        } else {
+            encode_with_links.template operator()<std::size_t>();
         }
-
-        std::vector<TokenId> result;
-        result.reserve(size);
-        for (std::size_t index = 0; index != end; index = next[index]) {
-            result.push_back(tokens[index]);
-        }
-        return result;
     }
 
 std::string BpeTokenizer::decode(const std::span<const TokenId> ids) const {
@@ -454,11 +555,18 @@ void BpeTokenizer::save(const std::filesystem::path& path) const {
     }
 
     constexpr std::array<char, 8> magic = {'B', 'P', 'E', 'T', 'O', 'K', '1', '\0'};
+    if (special_tokens_.size() > std::numeric_limits<std::uint32_t>::max() ||
+        merges_.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("Tokenizer is too large to serialize");
+    }
     output.write(magic.data(), static_cast<std::streamsize>(magic.size()));
     write_u32(output, static_cast<std::uint32_t>(special_tokens_.size()));
     write_u32(output, static_cast<std::uint32_t>(merges_.size()));
 
     for (const std::string& token : special_tokens_) {
+        if (token.size() > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::length_error("Tokenizer special token is too large to serialize");
+        }
         write_u32(output, static_cast<std::uint32_t>(token.size()));
         output.write(token.data(), static_cast<std::streamsize>(token.size()));
     }
@@ -494,6 +602,10 @@ BpeTokenizer BpeTokenizer::load(const std::filesystem::path& path) {
     if (special_count > 1'000'000 || merge_count > 10'000'000) {
         throw std::runtime_error("Tokenizer file declares unreasonable sizes");
     }
+    if (static_cast<std::uint64_t>(kByteVocabularySize) + special_count + merge_count >
+        std::numeric_limits<TokenId>::max()) {
+        throw std::runtime_error("Tokenizer file vocabulary exceeds TokenId limit");
+    }
 
     std::vector<std::string> special_tokens;
     special_tokens.reserve(special_count);
@@ -513,6 +625,10 @@ BpeTokenizer BpeTokenizer::load(const std::filesystem::path& path) {
     }
 
     BpeTokenizer tokenizer(std::move(special_tokens));
+    tokenizer.merges_.reserve(merge_count);
+    tokenizer.token_bytes_.reserve(
+        kByteVocabularySize + special_count + merge_count);
+    tokenizer.merge_lookup_.reserve(merge_count);
     for (std::uint32_t i = 0; i < merge_count; ++i) {
         const TokenId left = read_u32(input);
         const TokenId right = read_u32(input);
@@ -526,6 +642,12 @@ BpeTokenizer BpeTokenizer::load(const std::filesystem::path& path) {
         }
 
         tokenizer.add_merge(left, right);
+    }
+
+    char trailing = 0;
+    input.read(&trailing, 1);
+    if (input.gcount() != 0) {
+        throw std::runtime_error("Tokenizer file contains trailing data");
     }
 
     return tokenizer;
@@ -549,12 +671,17 @@ void BpeTokenizer::add_merge(const TokenId left, const TokenId right) {
     if (left >= merged || right >= merged) {
         throw std::invalid_argument("BPE merge references an unknown token");
     }
+    const PairKey key = pair_key(left, right);
+    if (merge_lookup_.contains(key)) {
+        throw std::invalid_argument("BPE merge pair is duplicated");
+    }
 
     std::vector<std::uint8_t> bytes = token_bytes_[left];
     bytes.insert(bytes.end(), token_bytes_[right].begin(), token_bytes_[right].end());
 
     merges_.push_back({left, right, merged});
     token_bytes_.push_back(std::move(bytes));
+    merge_lookup_.emplace(key, merged);
 }
 
 void BpeTokenizer::rebuild_token_bytes() {
@@ -567,6 +694,7 @@ void BpeTokenizer::rebuild_token_bytes() {
 
     // Special token IDs deliberately do not have byte payloads.
     token_bytes_.resize(kByteVocabularySize + special_tokens_.size());
+    merge_lookup_.clear();
 }
 
 bool BpeTokenizer::is_special(const TokenId id) const noexcept {

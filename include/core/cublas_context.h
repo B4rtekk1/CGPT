@@ -3,40 +3,7 @@
 #include "cuda_check.h"
 #include <cublas_v2.h>
 
-#include <cstdio>
-#include <cstdlib>
-
 #include "device_guard.h"
-
-inline void cublas_check_fail(
-    cublasStatus_t status,
-    const char* expression,
-    const char* file,
-    int line
-    ) {
-    std::fprintf(
-        stderr,
-        "cuBLASLt error %d\n"
-        "  expression: %s\n"
-        "  location:   %s:%d\n",
-        static_cast<int>(status),
-        expression,
-        file,
-        line
-    );
-
-    std::exit(EXIT_FAILURE);
-}
-
-#define CUBLAS_CHECK(expr)                                             \
-    do {                                                               \
-        const cublasStatus_t _cublas_status = (expr);                  \
-        if (_cublas_status != CUBLAS_STATUS_SUCCESS) {                 \
-            cublas_check_fail(                                         \
-                _cublas_status, #expr, __FILE__, __LINE__              \
-            );                                                         \
-        }                                                              \
-    } while (false)
 
 class CublasLtContext {
 public:

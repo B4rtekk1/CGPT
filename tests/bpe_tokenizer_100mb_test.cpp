@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -11,13 +12,13 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    constexpr const char* input_path = "data/tokenizer_100mb.txt";
+    constexpr auto input_path = "data/tokenizer_100mb.txt";
 
     std::ifstream input(input_path, std::ios::binary);
     if (!input) {
         std::cerr << "Cannot open " << input_path << '\n';
         std::cerr << "Generate it first with: python scripts/download_100mb.py\n";
-        return 1;
+        return 77;
     }
 
     const std::string text{
@@ -50,8 +51,6 @@ int main(int argc, char** argv) {
         1, std::thread::hardware_concurrency());
     config.worker_count = worker_count;
 
-    // Keep 100 independent blocks per worker. BpeTokenizer::train() processes
-    // these documents in parallel using config.worker_count workers.
     constexpr std::size_t blocks_per_worker = 100;
     const std::size_t block_count = std::min(
         training_size, worker_count * blocks_per_worker);
@@ -94,6 +93,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (tokenizer.vocab_size() <= bpe::BpeTokenizer::kByteVocabularySize ||
+        tokenizer.vocab_size() > config.vocab_size) {
+        std::cerr << "Unexpected vocabulary size: " << tokenizer.vocab_size() << '\n';
+        return 1;
+    }
+
+    const auto model_path = std::filesystem::temp_directory_path() /
+                            "cgpt_bpe_tokenizer_100mb_test.bin";
+    tokenizer.save(model_path);
+    const bpe::BpeTokenizer loaded = bpe::BpeTokenizer::load(model_path);
+    std::filesystem::remove(model_path);
+    if (loaded.decode(loaded.encode(text)) != text) {
+        std::cerr << "Serialized tokenizer round-trip failure\n";
+        return 1;
+    }
+
     const double train_seconds =
         std::chrono::duration<double>(train_end - train_start).count();
     const double encode_seconds =
@@ -101,6 +116,9 @@ int main(int argc, char** argv) {
 
     std::cout << "Vocabulary size: " << tokenizer.vocab_size() << '\n';
     std::cout << "Token count: " << ids.size() << '\n';
+    std::cout << "Compression ratio: "
+              << static_cast<double>(text.size()) / static_cast<double>(ids.size())
+              << " bytes/token\n";
     std::cout << "Training time: " << train_seconds << " s\n";
     std::cout << "Encoding time: " << encode_seconds << " s\n";
 

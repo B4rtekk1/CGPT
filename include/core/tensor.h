@@ -1,7 +1,7 @@
 #pragma once
 
-#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 
 #include "dtype.h"
-#include "gpu_buffer.h"
+#include "device_buffer.h"
 
 enum class DeviceType {
     CPU,
@@ -27,8 +27,13 @@ public:
         : shape_(std::move(shape)),
           device_type_(validate_device_type(device_type)),
           dtype_(validate_storage_dtype(dtype)),
-          storage_(device_type == DeviceType::CUDA ? element_count(shape_) : 0),
-          host_storage_(device_type == DeviceType::CPU ? element_count(shape_) : 0) {}
+          element_count_(element_count(shape_)),
+          storage_(device_type == DeviceType::CUDA
+                       ? dtype_bytes(element_count_, dtype_)
+                       : 0),
+          host_storage_(device_type == DeviceType::CPU
+                            ? dtype_bytes(element_count_, dtype_)
+                            : 0) {}
 
     explicit Tensor(
         std::vector<std::size_t> shape,
@@ -40,12 +45,13 @@ public:
         : shape_(other.shape_),
           device_type_(other.device_type_),
           dtype_(other.dtype_),
-          storage_(other.device_type_ == DeviceType::CUDA ? other.numel() : 0),
-          host_storage_(other.device_type_ == DeviceType::CPU ? other.numel() : 0) {
+          element_count_(other.element_count_),
+          storage_(other.device_type_ == DeviceType::CUDA ? other.nbytes() : 0),
+          host_storage_(other.device_type_ == DeviceType::CPU ? other.nbytes() : 0) {
         if (device_type_ == DeviceType::CUDA) {
             CUDA_CHECK(cudaMemcpy(
                 storage_.data(), other.storage_.data(),
-                other.numel() * sizeof(float), cudaMemcpyDeviceToDevice));
+                other.nbytes(), cudaMemcpyDeviceToDevice));
         } else {
             host_storage_ = other.host_storage_;
         }
@@ -61,19 +67,46 @@ public:
         return *this;
     }
 
-    Tensor(Tensor&&) noexcept = default;
-    Tensor& operator=(Tensor&&) noexcept = default;
+    Tensor(Tensor&& other) noexcept
+        : shape_(std::move(other.shape_)),
+          device_type_(other.device_type_),
+          dtype_(other.dtype_),
+          element_count_(std::exchange(other.element_count_, 0)),
+          storage_(std::move(other.storage_)),
+          host_storage_(std::move(other.host_storage_)) {}
 
-    [[nodiscard]] float* data() noexcept {
-        return device_type_ == DeviceType::CUDA
-            ? storage_.data()
-            : host_storage_.data();
+    Tensor& operator=(Tensor&& other) noexcept {
+        if (this != &other) {
+            shape_ = std::move(other.shape_);
+            device_type_ = other.device_type_;
+            dtype_ = other.dtype_;
+            element_count_ = std::exchange(other.element_count_, 0);
+            storage_ = std::move(other.storage_);
+            host_storage_ = std::move(other.host_storage_);
+        }
+        return *this;
     }
 
-    [[nodiscard]] const float* data() const noexcept {
+    [[nodiscard]] float* data() {
+        require_f32_data();
+        return static_cast<float*>(raw_data());
+    }
+
+    [[nodiscard]] const float* data() const {
+        require_f32_data();
+        return static_cast<const float*>(raw_data());
+    }
+
+    [[nodiscard]] void* raw_data() noexcept {
         return device_type_ == DeviceType::CUDA
             ? storage_.data()
-            : host_storage_.data();
+            : static_cast<void*>(host_storage_.data());
+    }
+
+    [[nodiscard]] const void* raw_data() const noexcept {
+        return device_type_ == DeviceType::CUDA
+            ? storage_.data()
+            : static_cast<const void*>(host_storage_.data());
     }
 
     [[nodiscard]] const std::vector<std::size_t>& shape() const noexcept {
@@ -81,9 +114,11 @@ public:
     }
 
     [[nodiscard]] std::size_t numel() const noexcept {
-        return device_type_ == DeviceType::CUDA
-            ? storage_.size()
-            : host_storage_.size();
+        return element_count_;
+    }
+
+    [[nodiscard]] std::size_t nbytes() const noexcept {
+        return element_count_ * dtype_size(dtype_);
     }
 
     [[nodiscard]] std::size_t dim() const noexcept {
@@ -145,29 +180,8 @@ public:
         Dtype dtype = Dtype::F32
         );
 
-    void copy_from_host(std::span<const float> source) {
-        if (source.size() != numel()) {
-            throw std::invalid_argument("Tensor: invalid input size");
-        }
-
-        if (device_type_ == DeviceType::CUDA) {
-            storage_.copy_from_host(source.data(), source.size());
-        } else {
-            std::copy(source.begin(), source.end(), host_storage_.begin());
-        }
-    }
-
-    void copy_to_host(std::span<float> destination) const {
-        if (destination.size() != numel()) {
-            throw std::invalid_argument("Tensor: invalid output size");
-        }
-
-        if (device_type_ == DeviceType::CUDA) {
-            storage_.copy_to_host(destination.data(), destination.size());
-        } else {
-            std::copy(host_storage_.begin(), host_storage_.end(), destination.begin());
-        }
-    }
+    void copy_from_host(std::span<const float> source);
+    void copy_to_host(std::span<float> destination) const;
 
 private:
     void swap(Tensor& other) noexcept {
@@ -175,6 +189,7 @@ private:
         swap(shape_, other.shape_);
         swap(device_type_, other.device_type_);
         swap(dtype_, other.dtype_);
+        swap(element_count_, other.element_count_);
         swap(storage_, other.storage_);
         swap(host_storage_, other.host_storage_);
     }
@@ -187,10 +202,16 @@ private:
     }
 
     static Dtype validate_storage_dtype(Dtype dtype) {
-        if (dtype != Dtype::F32) {
-            throw std::invalid_argument("Tensor currently supports only F32 storage");
+        if (dtype != Dtype::F16 && dtype != Dtype::BF16 && dtype != Dtype::F32) {
+            throw std::invalid_argument("Tensor storage supports only floating-point dtypes");
         }
         return dtype;
+    }
+
+    void require_f32_data() const {
+        if (dtype_ != Dtype::F32) {
+            throw std::logic_error("Tensor::data<float> requires F32; use raw_data for other dtypes");
+        }
     }
 
     static std::size_t element_count(const std::vector<std::size_t>& shape) {
@@ -217,6 +238,7 @@ private:
     std::vector<std::size_t> shape_;
     DeviceType device_type_;
     Dtype dtype_;
-    GpuBuffer<float> storage_;
-    std::vector<float> host_storage_;
+    std::size_t element_count_ = 0;
+    DeviceBuffer storage_;
+    std::vector<std::uint8_t> host_storage_;
 };

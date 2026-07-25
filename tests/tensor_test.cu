@@ -103,6 +103,23 @@ void test_cpu_gpu_copy_round_trip() {
     expect_values(actual, expected);
 }
 
+void test_reduced_precision_storage() {
+    const std::vector<float> values{1.0f, -2.5f, 3.25f, 0.125f};
+
+    for (const Dtype dtype : {Dtype::F16, Dtype::BF16}) {
+        Tensor gpu_tensor({2, 2}, dtype);
+        gpu_tensor.copy_from_host(values);
+        expect_values(read_values(gpu_tensor), values, 1.0e-2f);
+        if (gpu_tensor.nbytes() != values.size() * 2) {
+            throw std::runtime_error("Tensor test: reduced dtype uses invalid storage size");
+        }
+
+        Tensor cpu_tensor({2, 2}, DeviceType::CPU, dtype);
+        cpu_tensor.copy_from_host(values);
+        expect_values(read_values(cpu_tensor), values, 1.0e-2f);
+    }
+}
+
 void test_tensor_copy_and_move() {
     const std::vector<float> expected{1.0f, 2.0f, 3.0f, 4.0f};
     Tensor original({2, 2});
@@ -171,6 +188,7 @@ int main() {
         test_cuda_factories();
         test_copy_validation();
         test_cpu_gpu_copy_round_trip();
+        test_reduced_precision_storage();
         test_tensor_copy_and_move();
         test_invalid_shapes();
         test_self_assignment();
