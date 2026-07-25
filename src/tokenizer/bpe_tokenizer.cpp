@@ -234,6 +234,76 @@ namespace bpe {
             return result;
         }
 
+        enum class ByteClass : std::uint8_t {
+            Whitespace,
+            Letter,
+            Digit,
+            Punctuation
+        };
+
+        [[nodiscard]] ByteClass classify_byte(const unsigned char byte) noexcept {
+            if (byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r' ||
+                byte == '\f' || byte == '\v') {
+                return ByteClass::Whitespace;
+            }
+            if ((byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+                byte == '_' || byte >= 0x80) {
+                return ByteClass::Letter;
+            }
+            if (byte >= '0' && byte <= '9') {
+                return ByteClass::Digit;
+            }
+            return ByteClass::Punctuation;
+        }
+
+        template<typename Function>
+        void for_each_pretoken(
+            const std::string_view text,
+            const PretokenizerMode mode,
+            Function&& function) {
+            if (text.empty()) {
+                return;
+            }
+            if (mode == PretokenizerMode::None) {
+                function(text);
+                return;
+            }
+
+            std::size_t position = 0;
+            while (position < text.size()) {
+                std::size_t begin = position;
+                unsigned char byte = static_cast<unsigned char>(text[position]);
+                ByteClass kind = classify_byte(byte);
+
+                // GPT-style patterns usually attach one ordinary space to the
+                // following word/number/punctuation piece. This preserves the
+                // useful distinction between "word" and " word" tokens.
+                if (byte == ' ' && position + 1 < text.size() &&
+                    classify_byte(static_cast<unsigned char>(text[position + 1])) !=
+                        ByteClass::Whitespace) {
+                    ++position;
+                    kind = classify_byte(static_cast<unsigned char>(text[position]));
+                }
+
+                if (kind == ByteClass::Digit) {
+                    std::size_t digits = 0;
+                    while (position < text.size() && digits < 3 &&
+                           classify_byte(static_cast<unsigned char>(text[position])) ==
+                               ByteClass::Digit) {
+                        ++position;
+                        ++digits;
+                    }
+                } else {
+                    while (position < text.size() &&
+                           classify_byte(static_cast<unsigned char>(text[position])) == kind) {
+                        ++position;
+                    }
+                }
+
+                function(text.substr(begin, position - begin));
+            }
+        }
+
         void write_u32(std::ostream &output, const std::uint32_t value) {
             output.write(reinterpret_cast<const char *>(&value), sizeof(value));
         }
@@ -248,8 +318,11 @@ namespace bpe {
         }
     }
 
-    BpeTokenizer::BpeTokenizer(std::vector<std::string> special_tokens)
-        : special_tokens_(std::move(special_tokens)),
+    BpeTokenizer::BpeTokenizer(
+        std::vector<std::string> special_tokens,
+        const PretokenizerMode pretokenizer)
+        : pretokenizer_mode_(pretokenizer),
+          special_tokens_(std::move(special_tokens)),
           cache_identity_(next_cache_identity()) {
         for (const std::string &token : special_tokens_) {
             if (token.empty()) {
@@ -340,7 +413,7 @@ namespace bpe {
         const std::size_t requested_merges = config.vocab_size - minimum_vocab;
         ProgressBar progress(requested_merges, "BPE training");
 
-        BpeTokenizer tokenizer(config.special_tokens);
+        BpeTokenizer tokenizer(config.special_tokens, config.pretokenizer);
         tokenizer.merges_.reserve(requested_merges);
         tokenizer.token_bytes_.reserve(config.vocab_size);
         tokenizer.merge_lookup_.reserve(requested_merges);
@@ -348,9 +421,12 @@ namespace bpe {
         corpus.reserve(documents.size());
 
         for (const std::string &document: documents) {
-            if (!document.empty()) {
-                corpus.push_back(bytes_to_tokens(document));
-            }
+            for_each_pretoken(document, config.pretokenizer,
+                [&corpus](const std::string_view piece) {
+                    if (!piece.empty()) {
+                        corpus.push_back(bytes_to_tokens(piece));
+                    }
+                });
         }
 
         if (corpus.empty()) {
@@ -790,6 +866,65 @@ namespace bpe {
         const EncodeOptions& options,
         const unsigned dense_limit_bits) const {
         if (text.empty()) return;
+
+        if (pretokenizer_mode_ != PretokenizerMode::None) {
+            for_each_pretoken(text, pretokenizer_mode_,
+                [this, &output, &options, dense_limit_bits](const std::string_view piece) {
+                    if (piece.empty()) return;
+                    if (options.cache_entries == 0 ||
+                        options.cache_max_input_bytes == 0 ||
+                        piece.size() > options.cache_max_input_bytes) {
+                        append_encoded_bytes_uncached(piece, output, dense_limit_bits);
+                        return;
+                    }
+
+                    // Re-enter with pretokenization disabled through the local
+                    // cache path below by duplicating only the inexpensive cache
+                    // dispatch in append_encoded_pretoken.
+                    struct ThreadCache {
+                        struct StringHash {
+                            using is_transparent = void;
+                            [[nodiscard]] std::size_t operator()(
+                                const std::string_view value) const noexcept {
+                                return std::hash<std::string_view>{}(value);
+                            }
+                        };
+                        const BpeTokenizer* owner = nullptr;
+                        std::uint64_t identity = 0;
+                        std::size_t merge_count = 0;
+                        std::size_t capacity = 0;
+                        std::unordered_map<std::string, std::vector<TokenId>,
+                            StringHash, std::equal_to<>> entries;
+                    };
+                    thread_local ThreadCache cache;
+                    if (cache.owner != this || cache.identity != cache_identity_ ||
+                        cache.merge_count != merges_.size() ||
+                        cache.capacity != options.cache_entries) {
+                        cache.owner = this;
+                        cache.identity = cache_identity_;
+                        cache.merge_count = merges_.size();
+                        cache.capacity = options.cache_entries;
+                        cache.entries.clear();
+                        cache.entries.reserve(options.cache_entries);
+                    }
+                    const auto found = cache.entries.find(piece);
+                    if (found != cache.entries.end()) {
+                        output.insert(output.end(), found->second.begin(), found->second.end());
+                        return;
+                    }
+                    std::vector<TokenId> encoded;
+                    encoded.reserve(piece.size());
+                    append_encoded_bytes_uncached(piece, encoded, dense_limit_bits);
+                    output.insert(output.end(), encoded.begin(), encoded.end());
+                    if (cache.entries.size() >= options.cache_entries) {
+                        cache.entries.clear();
+                        cache.entries.reserve(options.cache_entries);
+                    }
+                    cache.entries.emplace(std::string(piece), std::move(encoded));
+                });
+            return;
+        }
+
         if (options.cache_entries == 0 || options.cache_max_input_bytes == 0 ||
             text.size() > options.cache_max_input_bytes) {
             append_encoded_bytes_uncached(text, output, dense_limit_bits);
@@ -1208,7 +1343,7 @@ void BpeTokenizer::save(const std::filesystem::path& path) const {
         throw std::runtime_error("Cannot open tokenizer output file");
     }
 
-    constexpr std::array<char, 8> magic = {'B', 'P', 'E', 'T', 'O', 'K', '1', '\0'};
+    constexpr std::array<char, 8> magic = {'B', 'P', 'E', 'T', 'O', 'K', '2', '\0'};
     if (special_tokens_.size() > std::numeric_limits<std::uint32_t>::max() ||
         merges_.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::length_error("Tokenizer is too large to serialize");
@@ -1216,6 +1351,7 @@ void BpeTokenizer::save(const std::filesystem::path& path) const {
     output.write(magic.data(), static_cast<std::streamsize>(magic.size()));
     write_u32(output, static_cast<std::uint32_t>(special_tokens_.size()));
     write_u32(output, static_cast<std::uint32_t>(merges_.size()));
+    write_u32(output, static_cast<std::uint32_t>(pretokenizer_mode_));
 
     for (const std::string& token : special_tokens_) {
         if (token.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -1242,16 +1378,25 @@ BpeTokenizer BpeTokenizer::load(const std::filesystem::path& path) {
         throw std::runtime_error("Cannot open tokenizer model file");
     }
 
-    constexpr std::array<char, 8> expected_magic = {'B', 'P', 'E', 'T', 'O', 'K', '1', '\0'};
+    constexpr std::array<char, 8> magic_v1 = {'B', 'P', 'E', 'T', 'O', 'K', '1', '\0'};
+    constexpr std::array<char, 8> magic_v2 = {'B', 'P', 'E', 'T', 'O', 'K', '2', '\0'};
     std::array<char, 8> actual_magic{};
     input.read(actual_magic.data(), static_cast<std::streamsize>(actual_magic.size()));
 
-    if (!input || actual_magic != expected_magic) {
+    if (!input || (actual_magic != magic_v1 && actual_magic != magic_v2)) {
         throw std::runtime_error("Invalid tokenizer file magic");
     }
 
     const std::uint32_t special_count = read_u32(input);
     const std::uint32_t merge_count = read_u32(input);
+    PretokenizerMode pretokenizer = PretokenizerMode::None;
+    if (actual_magic == magic_v2) {
+        const std::uint32_t raw_mode = read_u32(input);
+        if (raw_mode > static_cast<std::uint32_t>(PretokenizerMode::GptLike)) {
+            throw std::runtime_error("Tokenizer file declares an unknown pretokenizer");
+        }
+        pretokenizer = static_cast<PretokenizerMode>(raw_mode);
+    }
 
     if (special_count > 1'000'000 || merge_count > 10'000'000) {
         throw std::runtime_error("Tokenizer file declares unreasonable sizes");
@@ -1278,7 +1423,7 @@ BpeTokenizer BpeTokenizer::load(const std::filesystem::path& path) {
         special_tokens.push_back(std::move(token));
     }
 
-    BpeTokenizer tokenizer(std::move(special_tokens));
+    BpeTokenizer tokenizer(std::move(special_tokens), pretokenizer);
     tokenizer.merges_.reserve(merge_count);
     tokenizer.token_bytes_.reserve(
         kByteVocabularySize + special_count + merge_count);
@@ -1318,6 +1463,10 @@ const std::vector<MergeRule>& BpeTokenizer::merges() const noexcept {
 
 const std::vector<std::string>& BpeTokenizer::special_tokens() const noexcept {
     return special_tokens_;
+}
+
+PretokenizerMode BpeTokenizer::pretokenizer_mode() const noexcept {
+    return pretokenizer_mode_;
 }
 
 void BpeTokenizer::add_merge(const TokenId left, const TokenId right) {

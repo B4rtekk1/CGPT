@@ -15,10 +15,16 @@
 namespace bpe {
     using TokenId = std::uint32_t;
 
+    enum class PretokenizerMode : std::uint8_t {
+        None = 0,
+        GptLike = 1
+    };
+
     struct TrainerConfig {
         std::size_t vocab_size = 32'000;
         std::size_t min_pair_frequency = 2;
         std::size_t worker_count = 0;
+        PretokenizerMode pretokenizer = PretokenizerMode::GptLike;
         std::vector<std::string> special_tokens = {
             "<unk>", "<bos>", "<eos>", "<pad>"
         };
@@ -76,9 +82,12 @@ namespace bpe {
         [[nodiscard]] std::size_t vocab_size() const noexcept;
         [[nodiscard]] const std::vector<MergeRule>& merges() const noexcept;
         [[nodiscard]] const std::vector<std::string>& special_tokens() const noexcept;
+        [[nodiscard]] PretokenizerMode pretokenizer_mode() const noexcept;
 
     private:
-        explicit BpeTokenizer(std::vector<std::string> special_tokens);
+        explicit BpeTokenizer(
+            std::vector<std::string> special_tokens,
+            PretokenizerMode pretokenizer = PretokenizerMode::GptLike);
 
         void add_merge(TokenId left, TokenId right);
         void rebuild_fast_merge_lookup();
@@ -114,6 +123,7 @@ namespace bpe {
             SpecialMatcherNode() { transitions.fill(kMissing); }
         };
 
+        PretokenizerMode pretokenizer_mode_ = PretokenizerMode::GptLike;
         std::vector<std::string> special_tokens_;
         std::vector<SpecialMatcherNode> special_matcher_;
         std::vector<MergeRule> merges_;
