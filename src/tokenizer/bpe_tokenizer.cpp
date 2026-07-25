@@ -670,7 +670,12 @@ namespace bpe {
     std::vector<TokenId> BpeTokenizer::encode(
         const std::string_view text,
         const EncodeOptions& options) const {
-        return encode_with_dense_limit(text, options, dense_merge_bits_);
+        // A 1024x1024 working window occupies 4 MiB and is substantially more
+        // cache-friendly on mainstream desktop CPUs than the full 16 MiB table.
+        // The packed fallback still handles every other pair exactly.
+        constexpr unsigned single_dense_bits = 10;
+        return encode_with_dense_limit(
+            text, options, std::min(dense_merge_bits_, single_dense_bits));
     }
 
     std::vector<TokenId> BpeTokenizer::encode_with_dense_limit(
@@ -681,57 +686,50 @@ namespace bpe {
             return {};
         }
 
-        struct SpecialMatch {
-            std::size_t start;
-            std::size_t length;
-            std::uint32_t token_index;
-        };
-
-        std::vector<SpecialMatch> matches;
-        std::uint32_t state = 0;
-        for (std::size_t position = 0; position < text.size(); ++position) {
-            const auto byte = static_cast<unsigned char>(text[position]);
-            state = special_matcher_[state].transitions[byte];
-
-            for (const std::uint32_t token_index : special_matcher_[state].outputs) {
-                const std::size_t length = special_tokens_[token_index].size();
-                matches.push_back({position + 1 - length, length, token_index});
-            }
-        }
-
-        std::ranges::sort(matches, [](const SpecialMatch& left, const SpecialMatch& right) {
-            if (left.start != right.start) return left.start < right.start;
-            if (left.length != right.length) return left.length > right.length;
-            return left.token_index < right.token_index;
-        });
-
+        // Special tokens are very rare in ordinary corpora. Walking the
+        // Aho-Corasick DFA for every byte adds a dependent table load to the
+        // entire input. A small number of std::string_view::find calls is much
+        // faster in the common no-match case because the CRT implementation is
+        // vectorized. We repeat the search only after an actual special token.
         std::vector<TokenId> result;
         result.reserve(text.size());
+
         std::size_t cursor = 0;
-        std::size_t match_index = 0;
+        while (cursor < text.size()) {
+            std::size_t best_start = std::string_view::npos;
+            std::size_t best_length = 0;
+            std::size_t best_index = 0;
 
-        while (match_index < matches.size()) {
-            while (match_index < matches.size() && matches[match_index].start < cursor) {
-                ++match_index;
+            for (std::size_t token_index = 0;
+                 token_index < special_tokens_.size(); ++token_index) {
+                const std::string& token = special_tokens_[token_index];
+                const std::size_t found = text.find(token, cursor);
+                if (found < best_start ||
+                    (found == best_start && token.size() > best_length) ||
+                    (found == best_start && token.size() == best_length &&
+                     token_index < best_index)) {
+                    best_start = found;
+                    best_length = token.size();
+                    best_index = token_index;
+                }
             }
-            if (match_index == matches.size()) break;
 
-            const SpecialMatch selected = matches[match_index];
+            if (best_start == std::string_view::npos) {
+                append_encoded_bytes(
+                    text.substr(cursor), result, options, dense_limit_bits);
+                break;
+            }
+
             append_encoded_bytes(
-                text.substr(cursor, selected.start - cursor),
+                text.substr(cursor, best_start - cursor),
                 result,
                 options,
                 dense_limit_bits);
-            result.push_back(kByteVocabularySize + selected.token_index);
-            cursor = selected.start + selected.length;
-
-            while (match_index < matches.size() && matches[match_index].start < cursor) {
-                ++match_index;
-            }
+            result.push_back(
+                kByteVocabularySize + static_cast<TokenId>(best_index));
+            cursor = best_start + best_length;
         }
 
-        append_encoded_bytes(
-            text.substr(cursor), result, options, dense_limit_bits);
         return result;
     }
 
@@ -762,22 +760,25 @@ namespace bpe {
             return result;
         }
 
-        std::atomic_size_t next_index{0};
         std::vector<std::thread> threads;
         threads.reserve(workers);
         constexpr unsigned batch_dense_bits = 10;
         const unsigned dense_limit_bits =
             std::min(dense_merge_bits_, batch_dense_bits);
+
+        // Contiguous static ranges avoid one atomic RMW per document and keep
+        // writes to the result vector local to each worker. This is ideal for
+        // the equally-sized blocks used by the training/benchmark pipeline.
         for (std::size_t worker = 0; worker < workers; ++worker) {
+            const std::size_t begin = texts.size() * worker / workers;
+            const std::size_t end = texts.size() * (worker + 1) / workers;
             threads.emplace_back(
-                [this, &texts, &result, &next_index, &options, dense_limit_bits] {
-                while (true) {
-                    const std::size_t index = next_index.fetch_add(1, std::memory_order_relaxed);
-                    if (index >= texts.size()) break;
-                    result[index] = encode_with_dense_limit(
-                        texts[index], options, dense_limit_bits);
-                }
-            });
+                [this, &texts, &result, &options, dense_limit_bits, begin, end] {
+                    for (std::size_t index = begin; index < end; ++index) {
+                        result[index] = encode_with_dense_limit(
+                            texts[index], options, dense_limit_bits);
+                    }
+                });
         }
         for (auto& thread : threads) thread.join();
         return result;
