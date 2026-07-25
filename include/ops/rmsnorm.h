@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cuda_runtime.h>
-
 #include "../core/tensor.h"
 
 void rmsnorm_forward(

@@ -3,8 +3,6 @@
 #include "core/cublas_context.h"
 #include "core/tensor.h"
 
-#include <cuda_runtime.h>
-
 struct LinearOptions {
     ComputeType compute_type = ComputeType::TF32;
     std::size_t workspace_bytes = 4U * 1024U * 1024U;

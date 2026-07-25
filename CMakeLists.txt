@@ -16,7 +16,9 @@ set(CGPT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_library(cgpt_core STATIC
         src/ops/linear.cu
         src/ops/rmsnorm.cu
-        src/tensor.cu)
+        src/ops/swiglu.cu
+        src/tensor.cu
+        include/ops/swiglu.h)
 
 target_include_directories(cgpt_core PUBLIC
         ${CGPT_INCLUDE_DIR}

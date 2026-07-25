@@ -11,9 +11,9 @@
 namespace {
 
 __inline__ __device__ float warp_reduce_sum(float value) {
-    constexpr unsigned mask = 0xffffffffu;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
+        constexpr unsigned mask = 0xffffffffu;
         value += __shfl_down_sync(mask, value, offset);
     }
     return value;
@@ -218,7 +218,7 @@ __global__ void rmsnorm_scalar_streaming_kernel(
 
     float sum_squares = 0.0f;
     for (int index = tid; index < hidden; index += block_size) {
-        const float value = static_cast<float>(row_input[index]);
+        const auto value = static_cast<float>(row_input[index]);
         sum_squares = fmaf(value, value, sum_squares);
     }
 
