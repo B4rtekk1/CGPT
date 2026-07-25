@@ -74,6 +74,8 @@ namespace {
 
 int main() {
     try {
+        static_assert(sizeof(bpe::BpeTokenizer) < 4'096,
+                      "BpeTokenizer must keep large lookup tables off the stack");
         const std::vector<std::string> corpus = {
             "Ala ma kota. Ala ma psa.",
             "kot kot kot pies pies",
@@ -108,6 +110,29 @@ int main() {
                 tokenizer.encode(sample) ==
                     reference_encode_plain(sample, tokenizer.merges()),
                 "Optimized encoder differs from sequential BPE semantics");
+        }
+        std::uint64_t random_state = 0x9E37'79B9'7F4A'7C15ULL;
+        for (std::size_t trial = 0; trial < 10'000; ++trial) {
+            random_state = random_state * 6'364'136'223'846'793'005ULL + 1;
+            const std::size_t length = 1 + (random_state >> 32U) % 32;
+            std::string sample(length, '\0');
+            for (char& character : sample) {
+                random_state = random_state * 6'364'136'223'846'793'005ULL + 1;
+                character = static_cast<char>(random_state >> 56U);
+            }
+            require(
+                tokenizer.encode(sample) ==
+                    reference_encode_plain(sample, tokenizer.merges()),
+                "Short stack encoder differs from sequential BPE semantics");
+        }
+
+        const std::vector<std::string_view> batch_input = {
+            "Ala ma kota", "Zażółć gęślą jaźń", "<bos>abc<eos>", ""};
+        const auto batch = tokenizer.encode_batch(batch_input, 4);
+        require(batch.size() == batch_input.size(), "Batch encoder changed item count");
+        for (std::size_t i = 0; i < batch.size(); ++i) {
+            require(batch[i] == tokenizer.encode(batch_input[i]),
+                    "Batch encoder differs from scalar encoding");
         }
 
         std::istringstream stream(corpus[0] + corpus[1]);

@@ -93,6 +93,32 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // GigaToken gets its file-scale throughput by handing independent
+    // documents to per-thread workers and keeping the input as borrowed
+    // slices. Exercise the equivalent zero-copy batch API separately from
+    // the exact single-sequence benchmark above.
+    const std::size_t encode_block_count = std::min(
+        text.size(), worker_count * blocks_per_worker);
+    std::vector<std::string_view> encode_blocks;
+    encode_blocks.reserve(encode_block_count);
+    for (std::size_t block = 0; block < encode_block_count; ++block) {
+        const std::size_t begin = text.size() * block / encode_block_count;
+        const std::size_t end = text.size() * (block + 1) / encode_block_count;
+        encode_blocks.emplace_back(text.data() + begin, end - begin);
+    }
+
+    const auto batch_encode_start = std::chrono::steady_clock::now();
+    const auto batch_ids = tokenizer.encode_batch(encode_blocks, worker_count);
+    const auto batch_encode_end = std::chrono::steady_clock::now();
+    std::size_t batch_token_count = 0;
+    for (std::size_t block = 0; block < batch_ids.size(); ++block) {
+        batch_token_count += batch_ids[block].size();
+        if (tokenizer.decode(batch_ids[block]) != encode_blocks[block]) {
+            std::cerr << "Batch round-trip failure in block " << block << '\n';
+            return 1;
+        }
+    }
+
     if (tokenizer.vocab_size() <= bpe::BpeTokenizer::kByteVocabularySize ||
         tokenizer.vocab_size() > config.vocab_size) {
         std::cerr << "Unexpected vocabulary size: " << tokenizer.vocab_size() << '\n';
@@ -113,6 +139,9 @@ int main(int argc, char** argv) {
         std::chrono::duration<double>(train_end - train_start).count();
     const double encode_seconds =
         std::chrono::duration<double>(encode_end - encode_start).count();
+    const double batch_encode_seconds =
+        std::chrono::duration<double>(
+            batch_encode_end - batch_encode_start).count();
 
     std::cout << "Vocabulary size: " << tokenizer.vocab_size() << '\n';
     std::cout << "Token count: " << ids.size() << '\n';
@@ -121,10 +150,17 @@ int main(int argc, char** argv) {
               << " bytes/token\n";
     std::cout << "Training time: " << train_seconds << " s\n";
     std::cout << "Encoding time: " << encode_seconds << " s\n";
+    std::cout << "Batch token count: " << batch_token_count << '\n';
+    std::cout << "Batch encoding time: " << batch_encode_seconds << " s\n";
 
     if (encode_seconds > 0.0) {
         std::cout << "Encoding throughput: "
                   << text.size() / encode_seconds / (1024.0 * 1024.0)
+                  << " MiB/s\n";
+    }
+    if (batch_encode_seconds > 0.0) {
+        std::cout << "Batch encoding throughput: "
+                  << text.size() / batch_encode_seconds / (1024.0 * 1024.0)
                   << " MiB/s\n";
     }
 

@@ -34,6 +34,14 @@ add_library(cgpt_tokenizer STATIC
         src/utils/progress_bar.cpp)
 target_include_directories(cgpt_tokenizer PUBLIC ${CGPT_INCLUDE_DIR})
 
+# The tokenizer has a guarded AVX2 path for byte scanning and widening.  Keep
+# this local to the tokenizer so CUDA and the remaining C++ targets retain
+# their existing instruction-set baseline.
+if (MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set_source_files_properties(src/tokenizer/bpe_tokenizer.cpp PROPERTIES
+            COMPILE_OPTIONS "/arch:AVX2")
+endif()
+
 add_executable(CGPT src/main.cu)
 target_link_libraries(CGPT PRIVATE cgpt_core cgpt_tokenizer)
 

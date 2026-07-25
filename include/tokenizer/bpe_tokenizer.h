@@ -1,9 +1,11 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -16,10 +18,16 @@ namespace bpe {
     struct TrainerConfig {
         std::size_t vocab_size = 32'000;
         std::size_t min_pair_frequency = 2;
-        std::size_t worker_count = 0; // 0 = std::thread::hardware_concurrency()
+        std::size_t worker_count = 0;
         std::vector<std::string> special_tokens = {
             "<unk>", "<bos>", "<eos>", "<pad>"
         };
+    };
+
+    struct EncodeOptions {
+        // Per-thread bounded cache. Set either value to zero to disable it.
+        std::size_t cache_entries = 4'096;
+        std::size_t cache_max_input_bytes = 256;
     };
 
     struct MergeRule {
@@ -41,15 +49,25 @@ namespace bpe {
             const TrainerConfig& config,
             std::size_t block_size = 1 << 20);
 
-        // Trains from a byte stream by reading bounded-size input blocks. Each
-        // block is treated as one training document, just like an element of
-        // the vector overload.
         [[nodiscard]] static BpeTokenizer train_streaming(
             std::istream& input,
             const TrainerConfig& config = {},
             std::size_t block_size = 1 << 20);
 
         [[nodiscard]] std::vector<TokenId> encode(std::string_view text) const;
+        [[nodiscard]] std::vector<TokenId> encode(
+            std::string_view text,
+            const EncodeOptions& options) const;
+
+        [[nodiscard]] std::vector<std::vector<TokenId>> encode_batch(
+            const std::vector<std::string>& texts,
+            std::size_t worker_count = 0,
+            const EncodeOptions& options = {}) const;
+        [[nodiscard]] std::vector<std::vector<TokenId>> encode_batch(
+            std::span<const std::string_view> texts,
+            std::size_t worker_count = 0,
+            const EncodeOptions& options = {}) const;
+
         [[nodiscard]] std::string decode(std::span<const TokenId> ids) const;
 
         void save(const std::filesystem::path& path) const;
@@ -63,16 +81,42 @@ namespace bpe {
         explicit BpeTokenizer(std::vector<std::string> special_tokens);
 
         void add_merge(TokenId left, TokenId right);
+        void rebuild_fast_merge_lookup();
         void rebuild_token_bytes();
+        void rebuild_special_matcher();
         void append_encoded_bytes(
             std::string_view text,
+            std::vector<TokenId>& output,
+            const EncodeOptions& options) const;
+        void append_encoded_bytes_uncached(
+            std::string_view text,
             std::vector<TokenId>& output) const;
+        [[nodiscard]] TokenId lookup_merge(TokenId left, TokenId right) const noexcept;
         [[nodiscard]] bool is_special(TokenId id) const noexcept;
 
+        struct SpecialMatcherNode {
+            static constexpr std::uint32_t kMissing =
+                std::numeric_limits<std::uint32_t>::max();
+
+            std::array<std::uint32_t, 256> transitions{};
+            std::vector<std::uint32_t> outputs;
+            std::uint32_t failure = 0;
+
+            SpecialMatcherNode() { transitions.fill(kMissing); }
+        };
+
         std::vector<std::string> special_tokens_;
+        std::vector<SpecialMatcherNode> special_matcher_;
         std::vector<MergeRule> merges_;
         std::vector<std::vector<std::uint8_t>> token_bytes_;
         std::unordered_map<std::uint64_t, TokenId> merge_lookup_;
+        // GigaToken-style two-level lookup used by the encoding hot path:
+        // byte pairs use a dense table, while the remaining pairs use a
+        // packed, immutable, open-addressed table.
+        std::vector<TokenId> byte_pair_merge_;
+        std::vector<std::uint64_t> packed_merge_lookup_;
+        std::size_t packed_merge_mask_ = 0;
+        unsigned packed_merge_shift_ = 0;
+        std::uint64_t cache_identity_ = 0;
     };
-
 }

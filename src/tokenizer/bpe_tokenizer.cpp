@@ -3,18 +3,165 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <fstream>
 #include <limits>
 #include <queue>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 namespace bpe {
     namespace {
         using PairKey = std::uint64_t;
         using PairCounts = std::unordered_map<PairKey, std::uint64_t>;
         using Occurrence = std::uint64_t;
+
+        [[nodiscard]] std::uint64_t next_cache_identity() noexcept {
+            static std::atomic_uint64_t next{1};
+            return next.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Keeping every historical count in a priority_queue makes training
+        // quadratic in practice: a frequent merge changes millions of pairs,
+        // and each change leaves a stale heap entry behind. This heap stores
+        // exactly one entry per live pair and updates it in place.
+        class CandidateHeap {
+        public:
+            void reserve(const std::size_t count) {
+                entries_.reserve(count);
+                indices_.reserve(count);
+            }
+
+            void insert(const PairKey pair, const std::uint64_t count) {
+                indices_.emplace(pair, entries_.size());
+                entries_.push_back({count, pair});
+                sift_up(entries_.size() - 1);
+            }
+
+            void set(const PairKey pair, const std::uint64_t count) {
+                const auto found = indices_.find(pair);
+                if (found == indices_.end()) {
+                    insert(pair, count);
+                    return;
+                }
+
+                const std::size_t index = found->second;
+                entries_[index].count = count;
+                if (index != 0 && better(entries_[index], entries_[parent(index)])) {
+                    sift_up(index);
+                } else {
+                    sift_down(index);
+                }
+            }
+
+            void erase(const PairKey pair) {
+                const auto found = indices_.find(pair);
+                if (found == indices_.end()) {
+                    return;
+                }
+
+                const std::size_t index = found->second;
+                const std::size_t last = entries_.size() - 1;
+                indices_.erase(found);
+                if (index == last) {
+                    entries_.pop_back();
+                    return;
+                }
+
+                entries_[index] = entries_.back();
+                entries_.pop_back();
+                indices_[entries_[index].pair] = index;
+                if (index != 0 && better(entries_[index], entries_[parent(index)])) {
+                    sift_up(index);
+                } else {
+                    sift_down(index);
+                }
+            }
+
+            [[nodiscard]] bool empty() const noexcept { return entries_.empty(); }
+            [[nodiscard]] PairKey top_pair() const noexcept { return entries_.front().pair; }
+            [[nodiscard]] std::uint64_t top_count() const noexcept { return entries_.front().count; }
+
+        private:
+            struct Entry {
+                std::uint64_t count;
+                PairKey pair;
+            };
+
+            [[nodiscard]] static bool better(const Entry &left, const Entry &right) noexcept {
+                return left.count != right.count ? left.count > right.count : left.pair < right.pair;
+            }
+            [[nodiscard]] static std::size_t parent(const std::size_t index) noexcept {
+                return (index - 1) / 2;
+            }
+
+            void swap_entries(const std::size_t left, const std::size_t right) {
+                std::swap(entries_[left], entries_[right]);
+                indices_[entries_[left].pair] = left;
+                indices_[entries_[right].pair] = right;
+            }
+            void sift_up(std::size_t index) {
+                while (index != 0 && better(entries_[index], entries_[parent(index)])) {
+                    const std::size_t next = parent(index);
+                    swap_entries(index, next);
+                    index = next;
+                }
+            }
+            void sift_down(std::size_t index) {
+                while (true) {
+                    const std::size_t left = index * 2 + 1;
+                    if (left >= entries_.size()) {
+                        return;
+                    }
+                    const std::size_t right = left + 1;
+                    std::size_t best = left;
+                    if (right < entries_.size() && better(entries_[right], entries_[left])) {
+                        best = right;
+                    }
+                    if (!better(entries_[best], entries_[index])) {
+                        return;
+                    }
+                    swap_entries(index, best);
+                    index = best;
+                }
+            }
+
+            std::vector<Entry> entries_;
+            std::unordered_map<PairKey, std::size_t> indices_;
+        };
+
+        // Initial corpus scans visit occurrences in document/position order.  Keep
+        // that sorted prefix instead of sorting the (often multi-million element)
+        // list again when the pair is first selected.  Incremental updates are
+        // appended as an unsorted suffix and normalized only if that pair wins.
+        struct OccurrenceList {
+            std::vector<Occurrence> values;
+            std::size_t sorted_size = 0;
+
+            void append(const Occurrence occurrence) {
+                values.push_back(occurrence);
+            }
+
+            void mark_sorted() noexcept {
+                sorted_size = values.size();
+            }
+
+            void sort() {
+                if (sorted_size == values.size()) {
+                    return;
+                }
+
+                auto middle = values.begin() + static_cast<std::ptrdiff_t>(sorted_size);
+                std::ranges::sort(middle, values.end());
+                if (sorted_size != 0) {
+                    std::inplace_merge(values.begin(), middle, values.end());
+                }
+                mark_sorted();
+            }
+        };
 
         [[nodiscard]] Occurrence occurrence_key(
             const std::size_t document, const std::size_t position) {
@@ -110,13 +257,74 @@ namespace bpe {
     }
 
     BpeTokenizer::BpeTokenizer(std::vector<std::string> special_tokens)
-        : special_tokens_(std::move(special_tokens)) {
+        : special_tokens_(std::move(special_tokens)),
+          cache_identity_(next_cache_identity()) {
         for (const std::string &token : special_tokens_) {
             if (token.empty()) {
                 throw std::invalid_argument("special tokens must not be empty");
             }
         }
+        rebuild_special_matcher();
         rebuild_token_bytes();
+    }
+
+    void BpeTokenizer::rebuild_special_matcher() {
+        special_matcher_.clear();
+        special_matcher_.emplace_back();
+
+        for (std::size_t token_index = 0; token_index < special_tokens_.size(); ++token_index) {
+            std::uint32_t state = 0;
+            for (const unsigned char byte : special_tokens_[token_index]) {
+                std::uint32_t& transition = special_matcher_[state].transitions[byte];
+                if (transition == SpecialMatcherNode::kMissing) {
+                    transition = static_cast<std::uint32_t>(special_matcher_.size());
+                    special_matcher_.emplace_back();
+                }
+                state = transition;
+            }
+            special_matcher_[state].outputs.push_back(
+                static_cast<std::uint32_t>(token_index));
+        }
+
+        std::queue<std::uint32_t> pending;
+        for (std::size_t byte = 0; byte < 256; ++byte) {
+            const std::uint32_t next = special_matcher_[0].transitions[byte];
+            if (next != SpecialMatcherNode::kMissing) {
+                pending.push(next);
+            }
+        }
+
+        while (!pending.empty()) {
+            const std::uint32_t state = pending.front();
+            pending.pop();
+
+            for (std::size_t byte = 0; byte < 256; ++byte) {
+                const std::uint32_t next = special_matcher_[state].transitions[byte];
+                if (next == SpecialMatcherNode::kMissing) {
+                    continue;
+                }
+
+                std::uint32_t failure = special_matcher_[state].failure;
+                while (failure != 0 &&
+                       special_matcher_[failure].transitions[byte] ==
+                           SpecialMatcherNode::kMissing) {
+                    failure = special_matcher_[failure].failure;
+                }
+
+                const std::uint32_t fallback =
+                    special_matcher_[failure].transitions[byte];
+                if (fallback != SpecialMatcherNode::kMissing && fallback != next) {
+                    special_matcher_[next].failure = fallback;
+                }
+
+                const auto& inherited =
+                    special_matcher_[special_matcher_[next].failure].outputs;
+                special_matcher_[next].outputs.insert(
+                    special_matcher_[next].outputs.end(),
+                    inherited.begin(), inherited.end());
+                pending.push(next);
+            }
+        }
     }
 
     BpeTokenizer BpeTokenizer::train(
@@ -163,8 +371,10 @@ namespace bpe {
 
         const std::size_t workers = worker_count_for(config.worker_count, corpus.size());
         PairCounts global_counts;
-        std::unordered_map<PairKey, std::vector<Occurrence>> occurrences;
-        occurrences.reserve(4096);
+        std::unordered_map<PairKey, OccurrenceList> occurrences;
+        // Byte-level initialization contains at most 256^2 distinct pairs.
+        // Reserving them avoids several expensive rehashes on a large corpus.
+        occurrences.reserve(65'536);
         std::size_t active_edges = 0;
         std::size_t occurrence_entries = 0;
 
@@ -209,43 +419,42 @@ namespace bpe {
         for (std::size_t document = 0; document < corpus.size(); ++document) {
             const auto &sequence = corpus[document];
             for (std::size_t i = 1; i < sequence.size(); ++i) {
-                occurrences[pair_key(sequence[i - 1], sequence[i])].push_back(
+                occurrences[pair_key(sequence[i - 1], sequence[i])].append(
                     occurrence_key(document, i - 1));
                 ++occurrence_entries;
             }
         }
+        for (auto& [pair, list] : occurrences) {
+            list.mark_sorted();
+        }
 
-        struct CandidateCompare {
-            bool operator()(const std::pair<std::uint64_t, PairKey> &left,
-                            const std::pair<std::uint64_t, PairKey> &right) const noexcept {
-                if (left.first != right.first) {
-                    return left.first < right.first;
-                }
-                return left.second > right.second;
-            }
-        };
-        std::priority_queue<
-            std::pair<std::uint64_t, PairKey>,
-            std::vector<std::pair<std::uint64_t, PairKey>>,
-            CandidateCompare> candidates;
+        CandidateHeap candidates;
+        candidates.reserve(global_counts.size());
 
         for (const auto &[pair, count]: global_counts) {
-            candidates.emplace(count, pair);
+            candidates.insert(pair, count);
         }
+
+        // Reused across merge iterations: per-occurrence updates are collected as
+        // flat (pair, delta) pairs and reduced by sort+accumulate instead of going
+        // through an unordered_map for every single occurrence. Keeping the buffers
+        // alive between iterations (clear() retains capacity) avoids repeated
+        // allocation/rehashing, which dominated the cost of the early, high-frequency
+        // merges on large corpora.
+        struct MergeUpdates {
+            std::vector<std::pair<PairKey, std::int64_t>> count_deltas;
+            std::vector<std::pair<PairKey, Occurrence>> new_occurrences;
+            std::size_t merged_edges = 0;
+        };
+        std::vector<MergeUpdates> updates(workers);
 
         while (tokenizer.vocab_size() < config.vocab_size) {
             PairKey best_pair = 0;
             std::uint64_t best_count = 0;
 
-            while (!candidates.empty()) {
-                const auto [count, pair] = candidates.top();
-                candidates.pop();
-                const auto current = global_counts.find(pair);
-                if (current != global_counts.end() && current->second == count) {
-                    best_pair = pair;
-                    best_count = count;
-                    break;
-                }
+            if (!candidates.empty()) {
+                best_pair = candidates.top_pair();
+                best_count = candidates.top_count();
             }
 
             if (best_count < config.min_pair_frequency) {
@@ -258,80 +467,184 @@ namespace bpe {
             tokenizer.add_merge(left, right);
 
             if (auto found = occurrences.find(best_pair); found != occurrences.end()) {
-                auto positions = std::move(found->second);
-                occurrence_entries -= positions.size();
-                std::ranges::sort(positions.begin(), positions.end());
+                OccurrenceList positions = std::move(found->second);
+                occurrences.erase(found);
+                occurrence_entries -= positions.values.size();
+                positions.sort();
 
-                for (const Occurrence occurrence: positions) {
-                    const std::size_t document = occurrence_document(occurrence);
-                    const std::size_t position = occurrence_position(occurrence);
-                    auto &sequence = corpus[document];
-                    auto &next = next_positions[document];
-                    auto &previous = previous_positions[document];
+                // A merge only changes links within its document.  Process document
+                // ranges in parallel and collect count/occurrence changes locally;
+                // mutating the global hash tables for every affected edge was the
+                // dominant cost for large corpora.
+                const std::size_t merge_workers = worker_count_for(
+                    workers, std::min(corpus.size(), positions.values.size()));
+                for (std::size_t w = 0; w < merge_workers; ++w) {
+                    updates[w].count_deltas.clear();
+                    updates[w].new_occurrences.clear();
+                    updates[w].merged_edges = 0;
+                }
+                parallel_for_ranges(corpus.size(), merge_workers,
+                    [&corpus, &next_positions, &previous_positions, &positions,
+                     &updates, left, right, merged](const std::size_t worker,
+                                                      const std::size_t begin,
+                                                      const std::size_t finish) {
+                        MergeUpdates& local = updates[worker];
+                        const auto first = std::lower_bound(
+                            positions.values.begin(), positions.values.end(),
+                            occurrence_key(begin, 0));
+                        const auto last = finish == corpus.size()
+                            ? positions.values.end()
+                            : std::lower_bound(
+                                positions.values.begin(), positions.values.end(),
+                                occurrence_key(finish, 0));
 
-                    if (position >= sequence.size() || sequence[position] != left ||
-                        next[position] == end || sequence[next[position]] != right) {
+                        for (auto current = first; current != last; ++current) {
+                            const Occurrence occurrence = *current;
+                            const std::size_t document = occurrence_document(occurrence);
+                            const std::size_t position = occurrence_position(occurrence);
+                            auto& sequence = corpus[document];
+                            auto& next = next_positions[document];
+                            auto& previous = previous_positions[document];
+
+                            if (position >= sequence.size() || sequence[position] != left ||
+                                next[position] == end || sequence[next[position]] != right) {
+                                continue;
+                            }
+
+                            const std::size_t right_position = next[position];
+                            const std::size_t before = previous[position];
+                            const std::size_t after = next[right_position];
+                            const auto remove_pair = [&](const std::size_t start) {
+                                if (start != end && next[start] != end) {
+                                    local.count_deltas.emplace_back(
+                                        pair_key(sequence[start], sequence[next[start]]), -1);
+                                }
+                            };
+                            const auto add_pair = [&](const std::size_t start) {
+                                if (start != end && next[start] != end) {
+                                    const PairKey pair = pair_key(
+                                        sequence[start], sequence[next[start]]);
+                                    local.count_deltas.emplace_back(pair, 1);
+                                    local.new_occurrences.emplace_back(
+                                        pair, occurrence_key(document, start));
+                                }
+                            };
+
+                            remove_pair(before);
+                            remove_pair(position);
+                            remove_pair(right_position);
+
+                            sequence[position] = merged;
+                            next[position] = after;
+                            if (after != end) {
+                                previous[after] = position;
+                            }
+                            if (before != end) {
+                                next[before] = position;
+                            }
+                            next[right_position] = end;
+                            previous[right_position] = end;
+
+                            add_pair(before);
+                            add_pair(position);
+                            ++local.merged_edges;
+                        }
+                    });
+
+                std::unordered_map<PairKey, std::int64_t> total_deltas;
+                for (std::size_t w = 0; w < merge_workers; ++w) {
+                    MergeUpdates& local = updates[w];
+                    active_edges -= local.merged_edges;
+
+                    std::ranges::sort(local.count_deltas,
+                        [](const auto& a, const auto& b) { return a.first < b.first; });
+
+                    for (std::size_t i = 0; i < local.count_deltas.size();) {
+                        const PairKey pair = local.count_deltas[i].first;
+                        std::int64_t sum = 0;
+                        std::size_t j = i;
+                        while (j < local.count_deltas.size() && local.count_deltas[j].first == pair) {
+                            sum += local.count_deltas[j].second;
+                            ++j;
+                        }
+                        total_deltas[pair] += sum;
+                        i = j;
+                    }
+                }
+                for (const auto& [pair, delta] : total_deltas) {
+                    if (delta == 0) {
                         continue;
                     }
-
-                    const std::size_t right_position = next[position];
-                    const std::size_t before = previous[position];
-                    const std::size_t after = next[right_position];
-
-                    const auto remove_pair = [&](const std::size_t start) {
-                        if (start != end && next[start] != end) {
-                            const PairKey pair = pair_key(sequence[start], sequence[next[start]]);
-                            const auto count = --global_counts[pair];
-                            if (count != 0) {
-                                candidates.emplace(count, pair);
-                            }
+                    auto found = global_counts.find(pair);
+                    const std::int64_t previous = found == global_counts.end()
+                        ? 0
+                        : static_cast<std::int64_t>(found->second);
+                    const std::int64_t updated = previous + delta;
+                    if (updated == 0) {
+                        if (found != global_counts.end()) {
+                            global_counts.erase(found);
                         }
-                    };
-                    const auto add_pair = [&](const std::size_t start) {
-                        if (start != end && next[start] != end) {
-                            const PairKey pair = pair_key(sequence[start], sequence[next[start]]);
-                            const auto count = ++global_counts[pair];
-                            occurrences[pair].push_back(occurrence_key(document, start));
-                            ++occurrence_entries;
-                            candidates.emplace(count, pair);
+                        candidates.erase(pair);
+                    } else {
+                        const auto count = static_cast<std::uint64_t>(updated);
+                        if (found == global_counts.end()) {
+                            global_counts.emplace(pair, count);
+                        } else {
+                            found->second = count;
                         }
-                    };
-
-                    remove_pair(before);
-                    remove_pair(position);
-                    remove_pair(right_position);
-
-                    sequence[position] = merged;
-                    next[position] = after;
-                    if (after != end) {
-                        previous[after] = position;
+                        candidates.set(pair, count);
                     }
-                    if (before != end) {
-                        next[before] = position;
+                }
+                for (std::size_t w = 0; w < merge_workers; ++w) {
+                    for (const auto& [pair, occurrence] : updates[w].new_occurrences) {
+                        occurrences[pair].append(occurrence);
+                        ++occurrence_entries;
                     }
-                    next[right_position] = end;
-                    previous[right_position] = end;
-
-                    add_pair(before);
-                    add_pair(position);
-                    --active_edges;
                 }
 
-                constexpr std::size_t compact_slack = 1'000'000;
+                // Rebuilding is O(active_edges), so on a multi-gigabyte corpus a fixed
+                // absolute slack triggers this on nearly every merge and a single-
+                // threaded scan of the whole corpus dominates training time. Scale the
+                // threshold with corpus size and do the rebuild in parallel, mirroring
+                // the initial occurrence-list construction above.
+                const std::size_t compact_slack =
+                    std::max<std::size_t>(1'000'000, active_edges / 8);
                 if (occurrence_entries > active_edges + compact_slack) {
+                    const std::size_t rebuild_workers = worker_count_for(workers, corpus.size());
+                    std::vector<std::unordered_map<PairKey, std::vector<Occurrence>>>
+                        local_occurrences(rebuild_workers);
+                    parallel_for_ranges(corpus.size(), rebuild_workers,
+                        [&corpus, &next_positions, &local_occurrences](
+                            const std::size_t worker,
+                            const std::size_t begin,
+                            const std::size_t finish) {
+                            auto& local = local_occurrences[worker];
+                            for (std::size_t document = begin; document < finish; ++document) {
+                                const auto &sequence = corpus[document];
+                                const auto &next = next_positions[document];
+                                for (std::size_t start = 0; start < sequence.size(); ++start) {
+                                    if (next[start] != end) {
+                                        local[pair_key(sequence[start], sequence[next[start]])]
+                                            .push_back(occurrence_key(document, start));
+                                    }
+                                }
+                            }
+                        });
+
                     occurrences.clear();
                     occurrences.reserve(global_counts.size());
                     occurrence_entries = 0;
-                    for (std::size_t document = 0; document < corpus.size(); ++document) {
-                        const auto &sequence = corpus[document];
-                        const auto &next = next_positions[document];
-                        for (std::size_t start = 0; start < sequence.size(); ++start) {
-                            if (next[start] != end) {
-                                occurrences[pair_key(sequence[start], sequence[next[start]])].push_back(
-                                    occurrence_key(document, start));
-                                ++occurrence_entries;
+                    for (auto& local : local_occurrences) {
+                        for (auto& [pair, values] : local) {
+                            OccurrenceList& list = occurrences[pair];
+                            occurrence_entries += values.size();
+                            for (const Occurrence value : values) {
+                                list.append(value);
                             }
                         }
+                    }
+                    for (auto& [pair, list] : occurrences) {
+                        list.mark_sorted();
                     }
                 }
             }
@@ -340,6 +653,7 @@ namespace bpe {
                             config.special_tokens.size());
         }
         progress.finish();
+        tokenizer.rebuild_fast_merge_lookup();
         return tokenizer;
     }
 
@@ -378,70 +692,272 @@ namespace bpe {
     }
 
     std::vector<TokenId> BpeTokenizer::encode(const std::string_view text) const {
+        return encode(text, EncodeOptions{});
+    }
+
+    std::vector<TokenId> BpeTokenizer::encode(
+        const std::string_view text,
+        const EncodeOptions& options) const {
         if (text.empty()) {
             return {};
         }
 
+        struct SpecialMatch {
+            std::size_t start;
+            std::size_t length;
+            std::uint32_t token_index;
+        };
+
+        std::vector<SpecialMatch> matches;
+        std::uint32_t state = 0;
+        for (std::size_t position = 0; position < text.size(); ++position) {
+            const auto byte = static_cast<unsigned char>(text[position]);
+            while (state != 0 &&
+                   special_matcher_[state].transitions[byte] ==
+                       SpecialMatcherNode::kMissing) {
+                state = special_matcher_[state].failure;
+            }
+
+            const std::uint32_t transition =
+                special_matcher_[state].transitions[byte];
+            if (transition != SpecialMatcherNode::kMissing) {
+                state = transition;
+            }
+
+            for (const std::uint32_t token_index : special_matcher_[state].outputs) {
+                const std::size_t length = special_tokens_[token_index].size();
+                matches.push_back({position + 1 - length, length, token_index});
+            }
+        }
+
+        std::ranges::sort(matches, [](const SpecialMatch& left, const SpecialMatch& right) {
+            if (left.start != right.start) return left.start < right.start;
+            if (left.length != right.length) return left.length > right.length;
+            return left.token_index < right.token_index;
+        });
+
         std::vector<TokenId> result;
-        std::vector<std::size_t> next_special(special_tokens_.size());
-        for (std::size_t index = 0; index < special_tokens_.size(); ++index) {
-            next_special[index] = text.find(special_tokens_[index]);
-        }
-
+        result.reserve(text.size());
         std::size_t cursor = 0;
-        while (cursor < text.size()) {
-            std::size_t matched_position = std::string_view::npos;
-            std::size_t matched_size = 0;
-            std::size_t matched_index = 0;
-            for (std::size_t index = 0; index < special_tokens_.size(); ++index) {
-                if (next_special[index] < cursor) {
-                    next_special[index] =
-                        text.find(special_tokens_[index], cursor);
-                }
-                if (next_special[index] < matched_position ||
-                    (next_special[index] == matched_position &&
-                     special_tokens_[index].size() > matched_size)) {
-                    matched_position = next_special[index];
-                    matched_size = special_tokens_[index].size();
-                    matched_index = index;
-                }
-            }
+        std::size_t match_index = 0;
 
-            if (matched_position == std::string_view::npos) {
-                append_encoded_bytes(text.substr(cursor), result);
-                break;
+        while (match_index < matches.size()) {
+            while (match_index < matches.size() && matches[match_index].start < cursor) {
+                ++match_index;
             }
+            if (match_index == matches.size()) break;
 
-            append_encoded_bytes(
-                text.substr(cursor, matched_position - cursor),
-                result);
-            result.push_back(kByteVocabularySize + static_cast<TokenId>(matched_index));
-            cursor = matched_position + matched_size;
+            const SpecialMatch selected = matches[match_index];
+            append_encoded_bytes(text.substr(cursor, selected.start - cursor), result, options);
+            result.push_back(kByteVocabularySize + selected.token_index);
+            cursor = selected.start + selected.length;
+
+            while (match_index < matches.size() && matches[match_index].start < cursor) {
+                ++match_index;
+            }
         }
+
+        append_encoded_bytes(text.substr(cursor), result, options);
+        return result;
+    }
+
+    std::vector<std::vector<TokenId>> BpeTokenizer::encode_batch(
+        const std::vector<std::string>& texts,
+        const std::size_t worker_count,
+        const EncodeOptions& options) const {
+        std::vector<std::string_view> views;
+        views.reserve(texts.size());
+        for (const std::string& text : texts) {
+            views.emplace_back(text);
+        }
+        return encode_batch(views, worker_count, options);
+    }
+
+    std::vector<std::vector<TokenId>> BpeTokenizer::encode_batch(
+        const std::span<const std::string_view> texts,
+        const std::size_t worker_count,
+        const EncodeOptions& options) const {
+        std::vector<std::vector<TokenId>> result(texts.size());
+        if (texts.empty()) return result;
+
+        const std::size_t workers = worker_count_for(worker_count, texts.size());
+        if (workers == 1) {
+            for (std::size_t index = 0; index < texts.size(); ++index) {
+                result[index] = encode(texts[index], options);
+            }
+            return result;
+        }
+
+        std::atomic_size_t next_index{0};
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+        for (std::size_t worker = 0; worker < workers; ++worker) {
+            threads.emplace_back([this, &texts, &result, &next_index, &options] {
+                while (true) {
+                    const std::size_t index = next_index.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= texts.size()) break;
+                    result[index] = encode(texts[index], options);
+                }
+            });
+        }
+        for (auto& thread : threads) thread.join();
         return result;
     }
 
     void BpeTokenizer::append_encoded_bytes(
         const std::string_view text,
-        std::vector<TokenId>& output
-    ) const {
-        if (text.empty()) {
+        std::vector<TokenId>& output,
+        const EncodeOptions& options) const {
+        if (text.empty()) return;
+        if (options.cache_entries == 0 || options.cache_max_input_bytes == 0 ||
+            text.size() > options.cache_max_input_bytes) {
+            append_encoded_bytes_uncached(text, output);
+            return;
+        }
+
+        struct ThreadCache {
+            struct StringHash {
+                using is_transparent = void;
+
+                [[nodiscard]] std::size_t operator()(
+                    const std::string_view value) const noexcept {
+                    return std::hash<std::string_view>{}(value);
+                }
+            };
+
+            const BpeTokenizer* owner = nullptr;
+            std::uint64_t identity = 0;
+            std::size_t merge_count = 0;
+            std::size_t capacity = 0;
+            std::unordered_map<
+                std::string,
+                std::vector<TokenId>,
+                StringHash,
+                std::equal_to<>> entries;
+        };
+        thread_local ThreadCache cache;
+
+        if (cache.owner != this || cache.identity != cache_identity_ ||
+            cache.merge_count != merges_.size() ||
+            cache.capacity != options.cache_entries) {
+            cache.owner = this;
+            cache.identity = cache_identity_;
+            cache.merge_count = merges_.size();
+            cache.capacity = options.cache_entries;
+            cache.entries.clear();
+            cache.entries.reserve(options.cache_entries);
+        }
+
+        const auto found = cache.entries.find(text);
+        if (found != cache.entries.end()) {
+            output.insert(output.end(), found->second.begin(), found->second.end());
+            return;
+        }
+
+        std::vector<TokenId> encoded;
+        encoded.reserve(text.size());
+        append_encoded_bytes_uncached(text, encoded);
+        output.insert(output.end(), encoded.begin(), encoded.end());
+
+        if (cache.entries.size() >= options.cache_entries) {
+            cache.entries.clear();
+            cache.entries.reserve(options.cache_entries);
+        }
+        cache.entries.emplace(std::string(text), std::move(encoded));
+    }
+
+    TokenId BpeTokenizer::lookup_merge(
+        const TokenId left,
+        const TokenId right) const noexcept {
+        constexpr TokenId missing = std::numeric_limits<TokenId>::max();
+        if (left < 256 && right < 256) {
+            return byte_pair_merge_[(static_cast<std::size_t>(left) << 8U) | right];
+        }
+
+        if (!packed_merge_lookup_.empty()) {
+            constexpr unsigned id_bits = 21;
+            constexpr std::uint64_t id_mask = (std::uint64_t{1} << id_bits) - 1;
+            if ((left | right) <= id_mask) {
+                const std::uint64_t key =
+                    (static_cast<std::uint64_t>(left) << id_bits) | right;
+                std::size_t index = static_cast<std::size_t>(
+                    key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_);
+                while (true) {
+                    const std::uint64_t slot = packed_merge_lookup_[index];
+                    if (slot >> id_bits == key) {
+                        return static_cast<TokenId>(slot & id_mask);
+                    }
+                    if (slot == std::numeric_limits<std::uint64_t>::max()) {
+                        return missing;
+                    }
+                    index = (index + 1) & packed_merge_mask_;
+                }
+            }
+        }
+
+        const auto found = merge_lookup_.find(pair_key(left, right));
+        return found == merge_lookup_.end() ? missing : found->second;
+    }
+
+    void BpeTokenizer::append_encoded_bytes_uncached(
+        const std::string_view text,
+        std::vector<TokenId>& output) const {
+        if (text.empty()) return;
+
+        // GigaToken uses a separate stack-resident merge core for short
+        // pretokens: a linear minimum-rank scan beats heap/list machinery at
+        // this size and performs no allocations.
+        constexpr std::size_t short_merge_max = 32;
+        if (text.size() <= short_merge_max) {
+            constexpr TokenId missing = std::numeric_limits<TokenId>::max();
+            std::array<TokenId, short_merge_max> symbols{};
+            std::size_t size = text.size();
+            for (std::size_t i = 0; i < size; ++i) {
+                symbols[i] = static_cast<unsigned char>(text[i]);
+            }
+
+            while (size > 1) {
+                TokenId best_merge = missing;
+                std::size_t best_position = 0;
+                for (std::size_t i = 0; i + 1 < size; ++i) {
+                    const TokenId merge = lookup_merge(symbols[i], symbols[i + 1]);
+                    if (merge < best_merge) {
+                        best_merge = merge;
+                        best_position = i;
+                    }
+                }
+                if (best_merge == missing) {
+                    break;
+                }
+
+                symbols[best_position] = best_merge;
+                std::move(
+                    symbols.begin() + static_cast<std::ptrdiff_t>(best_position + 2),
+                    symbols.begin() + static_cast<std::ptrdiff_t>(size),
+                    symbols.begin() + static_cast<std::ptrdiff_t>(best_position + 1));
+                --size;
+            }
+
+            output.insert(output.end(), symbols.begin(),
+                          symbols.begin() + static_cast<std::ptrdiff_t>(size));
             return;
         }
 
         const auto encode_with_links = [&]<typename Link>() {
             constexpr Link end = std::numeric_limits<Link>::max();
+
             struct Node {
-            TokenId token;
-            Link next;
-            Link previous;
+                TokenId token;
+                Link next;
+                Link previous;
             };
-            std::vector<Node> nodes;
+
+            thread_local std::vector<Node> nodes;
+            nodes.clear();
             nodes.reserve(text.size());
             for (std::size_t index = 0; index < text.size(); ++index) {
                 nodes.push_back({
-                    static_cast<TokenId>(
-                        static_cast<unsigned char>(text[index])),
+                    static_cast<TokenId>(static_cast<unsigned char>(text[index])),
                     index + 1 < text.size() ? static_cast<Link>(index + 1) : end,
                     index == 0 ? end : static_cast<Link>(index - 1)
                 });
@@ -449,17 +965,37 @@ namespace bpe {
 
             const auto first_merged = static_cast<TokenId>(
                 kByteVocabularySize + special_tokens_.size());
-            std::vector<std::vector<Link>> positions(merges_.size());
+
+            // Preserve the exact merge-order semantics used by tokenizer (7):
+            // process the lowest merge rank first and process candidates of the
+            // same rank in the order in which they were discovered.
+            thread_local std::vector<std::vector<Link>> positions;
+            if (positions.size() < merges_.size()) {
+                positions.resize(merges_.size());
+            }
+
+            thread_local std::vector<std::size_t> rank_heap;
+            rank_heap.clear();
 
             const auto add_candidate = [&](const Link left) {
                 if (left == end || nodes[left].next == end) {
                     return;
                 }
-                const auto merge = merge_lookup_.find(
-                    pair_key(nodes[left].token, nodes[nodes[left].next].token));
-                if (merge != merge_lookup_.end()) {
-                    positions[merge->second - first_merged].push_back(left);
+
+                constexpr TokenId missing = std::numeric_limits<TokenId>::max();
+                const TokenId merge = lookup_merge(
+                    nodes[left].token, nodes[nodes[left].next].token);
+                if (merge == missing) {
+                    return;
                 }
+
+                const std::size_t rank = merge - first_merged;
+                std::vector<Link>& bucket = positions[rank];
+                if (bucket.empty()) {
+                    rank_heap.push_back(rank);
+                    std::push_heap(rank_heap.begin(), rank_heap.end(), std::greater<>());
+                }
+                bucket.push_back(left);
             };
 
             for (Link left = 0; left + 1 < nodes.size(); ++left) {
@@ -467,13 +1003,20 @@ namespace bpe {
             }
 
             std::size_t token_count = nodes.size();
-            for (std::size_t rank = 0; rank < merges_.size(); ++rank) {
+            while (!rank_heap.empty()) {
+                std::pop_heap(rank_heap.begin(), rank_heap.end(), std::greater<>());
+                const std::size_t rank = rank_heap.back();
+                rank_heap.pop_back();
+
                 const MergeRule& rule = merges_[rank];
-                for (const Link left_index : positions[rank]) {
+                std::vector<Link>& bucket = positions[rank];
+                for (std::size_t i = 0; i < bucket.size(); ++i) {
+                    const Link left_index = bucket[i];
                     Node& left = nodes[left_index];
                     if (left.next == end) {
                         continue;
                     }
+
                     const Link right_index = left.next;
                     Node& right = nodes[right_index];
                     if (left.token != rule.left || right.token != rule.right) {
@@ -494,6 +1037,7 @@ namespace bpe {
                     add_candidate(before);
                     add_candidate(left_index);
                 }
+                bucket.clear();
             }
 
             output.reserve(output.size() + token_count);
@@ -640,6 +1184,7 @@ BpeTokenizer BpeTokenizer::load(const std::filesystem::path& path) {
 
         tokenizer.add_merge(left, right);
     }
+    tokenizer.rebuild_fast_merge_lookup();
 
     char trailing = 0;
     input.read(&trailing, 1);
@@ -664,10 +1209,10 @@ const std::vector<std::string>& BpeTokenizer::special_tokens() const noexcept {
 
 void BpeTokenizer::add_merge(const TokenId left, const TokenId right) {
     const auto merged = static_cast<TokenId>(token_bytes_.size());
-
     if (left >= merged || right >= merged) {
         throw std::invalid_argument("BPE merge references an unknown token");
     }
+
     const PairKey key = pair_key(left, right);
     if (merge_lookup_.contains(key)) {
         throw std::invalid_argument("BPE merge pair is duplicated");
@@ -675,23 +1220,65 @@ void BpeTokenizer::add_merge(const TokenId left, const TokenId right) {
 
     std::vector<std::uint8_t> bytes = token_bytes_[left];
     bytes.insert(bytes.end(), token_bytes_[right].begin(), token_bytes_[right].end());
-
     merges_.push_back({left, right, merged});
     token_bytes_.push_back(std::move(bytes));
     merge_lookup_.emplace(key, merged);
+    if (left < 256 && right < 256) {
+        byte_pair_merge_[(static_cast<std::size_t>(left) << 8U) | right] = merged;
+    }
+}
+
+void BpeTokenizer::rebuild_fast_merge_lookup() {
+    constexpr unsigned id_bits = 21;
+    constexpr TokenId id_limit = TokenId{1} << id_bits;
+    constexpr std::uint64_t empty = std::numeric_limits<std::uint64_t>::max();
+
+    packed_merge_lookup_.clear();
+    packed_merge_mask_ = 0;
+    packed_merge_shift_ = 0;
+    if (merges_.empty() || token_bytes_.size() > id_limit) {
+        return;
+    }
+
+    const std::size_t slot_count =
+        std::max<std::size_t>(64, std::bit_ceil(merges_.size() * 2));
+    packed_merge_lookup_.assign(slot_count, empty);
+    packed_merge_mask_ = slot_count - 1;
+    packed_merge_shift_ = 64U - std::countr_zero(slot_count);
+
+    for (const MergeRule& merge : merges_) {
+        if (merge.left >= id_limit || merge.right >= id_limit ||
+            merge.merged >= id_limit) {
+            packed_merge_lookup_.clear();
+            packed_merge_mask_ = 0;
+            packed_merge_shift_ = 0;
+            return;
+        }
+
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(merge.left) << id_bits) | merge.right;
+        std::size_t index = static_cast<std::size_t>(
+            key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_);
+        while (packed_merge_lookup_[index] != empty) {
+            index = (index + 1) & packed_merge_mask_;
+        }
+        packed_merge_lookup_[index] = (key << id_bits) | merge.merged;
+    }
 }
 
 void BpeTokenizer::rebuild_token_bytes() {
+    constexpr TokenId missing = std::numeric_limits<TokenId>::max();
     token_bytes_.clear();
     token_bytes_.reserve(kByteVocabularySize + special_tokens_.size() + merges_.size());
-
     for (TokenId byte = 0; byte < kByteVocabularySize; ++byte) {
         token_bytes_.push_back({static_cast<std::uint8_t>(byte)});
     }
-
-    // Special token IDs deliberately do not have byte payloads.
     token_bytes_.resize(kByteVocabularySize + special_tokens_.size());
     merge_lookup_.clear();
+    byte_pair_merge_.assign(256 * 256, missing);
+    packed_merge_lookup_.clear();
+    packed_merge_mask_ = 0;
+    packed_merge_shift_ = 0;
 }
 
 bool BpeTokenizer::is_special(const TokenId id) const noexcept {
