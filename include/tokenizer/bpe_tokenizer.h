@@ -20,11 +20,25 @@ namespace bpe {
         GptLike = 1
     };
 
+    enum class TrainerMode : std::uint8_t {
+        ExactInMemory = 0,
+        LowMemoryStreaming = 1
+    };
+
     struct TrainerConfig {
         std::size_t vocab_size = 32'000;
         std::size_t min_pair_frequency = 2;
         std::size_t worker_count = 0;
         PretokenizerMode pretokenizer = PretokenizerMode::GptLike;
+        TrainerMode mode = TrainerMode::ExactInMemory;
+        // LowMemoryStreaming keeps only one input block, its encoded symbols,
+        // and pair counters in RAM. More merges per pass reduce I/O but make
+        // training an approximation of strictly sequential BPE. Set to 1 for
+        // exact merge selection at the cost of one corpus pass per merge.
+        std::size_t low_memory_merges_per_pass = 8;
+        // Dense pair counters are used while vocab_size <= this value.
+        // 2048 consumes 32 MiB with uint64 counters.
+        std::size_t low_memory_dense_vocab_limit = 2'048;
         std::vector<std::string> special_tokens = {
             "<unk>", "<bos>", "<eos>", "<pad>"
         };
@@ -59,6 +73,11 @@ namespace bpe {
             std::istream& input,
             const TrainerConfig& config = {},
             std::size_t block_size = 1 << 20);
+
+        [[nodiscard]] static BpeTokenizer train_low_memory(
+            std::istream& input,
+            const TrainerConfig& config = {},
+            std::size_t block_size = 32U << 20);
 
         [[nodiscard]] std::vector<TokenId> encode(std::string_view text) const;
         [[nodiscard]] std::vector<TokenId> encode(

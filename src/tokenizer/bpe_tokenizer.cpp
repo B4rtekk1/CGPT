@@ -722,11 +722,176 @@ namespace bpe {
         return tokenizer;
     }
 
+    BpeTokenizer BpeTokenizer::train_low_memory(
+        std::istream& input,
+        const TrainerConfig& config,
+        const std::size_t block_size
+    ) {
+        if (block_size == 0) {
+            throw std::invalid_argument("low-memory block_size must be at least one");
+        }
+        if (block_size > static_cast<std::size_t>(
+                std::numeric_limits<std::streamsize>::max())) {
+            throw std::invalid_argument("low-memory block_size exceeds stream limits");
+        }
+        if (config.low_memory_merges_per_pass == 0) {
+            throw std::invalid_argument(
+                "low_memory_merges_per_pass must be at least one");
+        }
+
+        const std::size_t minimum_vocab =
+            kByteVocabularySize + config.special_tokens.size();
+        if (config.vocab_size < minimum_vocab) {
+            throw std::invalid_argument(
+                "vocab_size is smaller than byte and special-token vocabulary");
+        }
+
+        const std::streampos origin = input.tellg();
+        if (origin == std::streampos(-1)) {
+            throw std::invalid_argument(
+                "LowMemoryStreaming requires a seekable input stream");
+        }
+
+        BpeTokenizer tokenizer(config.special_tokens, config.pretokenizer);
+        tokenizer.merges_.reserve(config.vocab_size - minimum_vocab);
+        tokenizer.token_bytes_.reserve(config.vocab_size);
+        tokenizer.merge_lookup_.reserve(config.vocab_size - minimum_vocab);
+
+        ProgressBar progress(
+            config.vocab_size - minimum_vocab, "Low-memory BPE training");
+        std::string block(block_size, '\0');
+        std::vector<TokenId> encoded;
+        encoded.reserve(block_size / 2 + 64);
+
+        while (tokenizer.vocab_size() < config.vocab_size) {
+            input.clear();
+            input.seekg(origin);
+            if (!input) {
+                throw std::runtime_error("Cannot rewind tokenizer training stream");
+            }
+
+            const std::size_t current_vocab = tokenizer.vocab_size();
+            const bool use_dense =
+                current_vocab <= config.low_memory_dense_vocab_limit &&
+                current_vocab <= 4'096;
+            std::vector<std::uint64_t> dense_counts;
+            PairCounts sparse_counts;
+            if (use_dense) {
+                dense_counts.assign(current_vocab * current_vocab, 0);
+            } else {
+                sparse_counts.reserve(std::min<std::size_t>(
+                    current_vocab * 32, 2'000'000));
+            }
+
+            std::uint64_t observed_pairs = 0;
+            while (input.read(block.data(), static_cast<std::streamsize>(block.size())) ||
+                   input.gcount() != 0) {
+                const std::size_t bytes_read =
+                    static_cast<std::size_t>(input.gcount());
+                const std::string_view view(block.data(), bytes_read);
+
+                for_each_pretoken(view, config.pretokenizer,
+                    [&](const std::string_view piece) {
+                        if (piece.empty()) return;
+                        encoded.clear();
+                        tokenizer.append_encoded_bytes_uncached(piece, encoded, 10);
+                        for (std::size_t i = 1; i < encoded.size(); ++i) {
+                            const TokenId left = encoded[i - 1];
+                            const TokenId right = encoded[i];
+                            if (use_dense && left < current_vocab && right < current_vocab) {
+                                ++dense_counts[
+                                    static_cast<std::size_t>(left) * current_vocab + right];
+                            } else {
+                                ++sparse_counts[pair_key(left, right)];
+                            }
+                            ++observed_pairs;
+                        }
+                    });
+            }
+            if (input.fail() && !input.eof()) {
+                throw std::runtime_error(
+                    "Failed while reading low-memory tokenizer training stream");
+            }
+            if (observed_pairs == 0) break;
+
+            struct RankedPair {
+                std::uint64_t count;
+                PairKey pair;
+            };
+            const auto worse = [](const RankedPair& a, const RankedPair& b) {
+                return a.count > b.count ||
+                    (a.count == b.count && a.pair < b.pair);
+            };
+            std::vector<RankedPair> best;
+            const std::size_t remaining = config.vocab_size - tokenizer.vocab_size();
+            const std::size_t wanted = std::min(
+                config.low_memory_merges_per_pass, remaining);
+            best.reserve(wanted);
+
+            const auto consider = [&](const PairKey pair, const std::uint64_t count) {
+                if (count < config.min_pair_frequency ||
+                    tokenizer.merge_lookup_.contains(pair)) {
+                    return;
+                }
+                if (best.size() < wanted) {
+                    best.push_back({count, pair});
+                    std::push_heap(best.begin(), best.end(), worse);
+                    return;
+                }
+                const RankedPair candidate{count, pair};
+                const RankedPair& minimum = best.front();
+                if (candidate.count > minimum.count ||
+                    (candidate.count == minimum.count && candidate.pair < minimum.pair)) {
+                    std::pop_heap(best.begin(), best.end(), worse);
+                    best.back() = candidate;
+                    std::push_heap(best.begin(), best.end(), worse);
+                }
+            };
+
+            if (use_dense) {
+                for (TokenId left = 0; left < current_vocab; ++left) {
+                    const std::size_t row =
+                        static_cast<std::size_t>(left) * current_vocab;
+                    for (TokenId right = 0; right < current_vocab; ++right) {
+                        const std::uint64_t count = dense_counts[row + right];
+                        if (count != 0) consider(pair_key(left, right), count);
+                    }
+                }
+            }
+            for (const auto& [pair, count] : sparse_counts) {
+                consider(pair, count);
+            }
+            if (best.empty()) break;
+
+            std::ranges::sort(best, [](const RankedPair& a, const RankedPair& b) {
+                return a.count != b.count ? a.count > b.count : a.pair < b.pair;
+            });
+            std::size_t added = 0;
+            for (const RankedPair& candidate : best) {
+                if (tokenizer.vocab_size() >= config.vocab_size) break;
+                if (tokenizer.merge_lookup_.contains(candidate.pair)) continue;
+                tokenizer.add_merge(
+                    pair_left(candidate.pair), pair_right(candidate.pair));
+                ++added;
+                progress.update(tokenizer.vocab_size() - minimum_vocab);
+            }
+            if (added == 0) break;
+            tokenizer.rebuild_fast_merge_lookup();
+        }
+
+        progress.finish();
+        tokenizer.rebuild_fast_merge_lookup();
+        return tokenizer;
+    }
+
     BpeTokenizer BpeTokenizer::train_streaming(
         std::istream &input,
         const TrainerConfig &config,
         const std::size_t block_size
     ) {
+        if (config.mode == TrainerMode::LowMemoryStreaming) {
+            return train_low_memory(input, config, block_size);
+        }
         if (block_size == 0) {
             throw std::invalid_argument("streaming training block_size must be at least one");
         }
