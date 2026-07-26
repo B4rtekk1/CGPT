@@ -1,3 +1,13 @@
+/**
+* @file linear.cu
+ * @brief CUDA and cuBLASLt implementation of the linear transformation.
+ *
+ * This translation unit implements row-major matrix multiplication in the
+ * form `output = input * weight^T + bias`. It caches cuBLASLt plans for
+ * repeated shapes and falls back to a dedicated CUDA bias kernel when the
+ * selected cuBLASLt epilogue cannot fuse the bias addition.
+ */
+
 #include "ops/linear.h"
 #include "core/device_buffer.h"
 #include "core/device_guard.h"
@@ -14,6 +24,7 @@
 
 namespace {
 
+/** @brief Returns a human-readable name for a tensor device type*/
 const char* device_type_name(const DeviceType device_type) {
     switch (device_type) {
     case DeviceType::CPU:
@@ -24,6 +35,12 @@ const char* device_type_name(const DeviceType device_type) {
     return "unknown";
 }
 
+/**
+ * @brief Verifies that two tensors reside on the same device type.
+ * @param a Tensor a
+ * @param b Tensor b
+ * @throws std::invalid_argument When the device types differ.
+ */
 void require_same_device(const Tensor& a, const Tensor& b) {
     if (a.device_type() != b.device_type()) {
         throw std::invalid_argument(
@@ -33,12 +50,24 @@ void require_same_device(const Tensor& a, const Tensor& b) {
     }
 }
 
+/**
+ * @brief Configures a cuBLASLt matrix layout to use row-major ordering.
+ * @param layout Matrix layout descriptor to configure.
+ */
 void set_row_major(cublasLtMatrixLayout_t layout) {
     const cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
     CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
         layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
 }
 
+/**
+ * @brief Adds a one-dimensional bias vector to every row of a matrix.
+ * @tparam T Tensor element type.
+ * @param output Row-major output matrix modified in place.
+ * @param bias Bias vector whose length equals `columns`.
+ * @param rows Number of matrix rows.
+ * @param columns Number of matrix columns.
+*/
 template <typename T>
 __global__ void add_bias_kernel(
     T* output,
@@ -52,7 +81,6 @@ __global__ void add_bias_kernel(
         return;
     }
 
-    // A 2-D mapping avoids an integer modulo for every output element.
     for (std::size_t row = blockIdx.y; row < rows; row += gridDim.y) {
         const std::size_t index = row * columns + column;
         output[index] = static_cast<T>(
@@ -61,6 +89,12 @@ __global__ void add_bias_kernel(
     }
 }
 
+/**
+ * @brief Launches the standalone bias-addition kernel.
+ * @param output Output tensor modified in place.
+ * @param bias One-dimensional bias Tensor.
+ * @param stream CUDA stream used for asynchronous execution.
+ */
 void launch_bias_fallback(
     Tensor& output,
     const Tensor& bias,
@@ -96,6 +130,12 @@ void launch_bias_fallback(
     CUDA_CHECK(cudaGetLastError());
 }
 
+/**
+ * @brief Uniquely identifies a cached cuBLASLt matmul plan.
+ *
+ * The key contains all properties that can affect descriptor creation,
+ * algorithm selection or workspace requirements.
+ */
 struct PlanKey {
     std::uintptr_t handle;
     std::uintptr_t stream;
@@ -110,6 +150,7 @@ struct PlanKey {
     bool operator==(const PlanKey&) const = default;
 };
 
+/** @brief Hash functor used by the cuBLASLt plan cache. */
 struct PlanKeyHash {
     std::size_t operator()(const PlanKey& key) const noexcept {
         std::size_t seed = 0;
@@ -129,17 +170,24 @@ struct PlanKeyHash {
     }
 };
 
+/**
+ * @brief Owns cuBLASLt descriptors, an optional selected algorithm and workspace.
+ *
+ * A plan is immutable after construction and can be reused for calls sharing
+ * the same dimensions, stream, dtype, compute mode and bias configuration.
+ */
 class MatmulPlan {
 public:
+    /**
+     * @brief Creates descriptions and queries a suitable cuBLASLt algorithm.
+     * @param handle cuBLASLt handle used for heuristic selection.
+     * @param key Complete plan configuration.
+     */
     MatmulPlan(
         cublasLtHandle_t handle,
         const PlanKey& key
     ) {
         const cudaDataType_t data_type = to_cuda_dtype(key.dtype);
-        // Tensor Cores also accelerate irregular, model-sized matrices.
-        // Requiring every dimension to be divisible by eight unnecessarily
-        // sent M=15/31/127 to FP32. Very small matrices remain on FP32: they
-        // are bandwidth/launch-bound and TF32 can be slower there.
         const bool use_tf32 =
             key.dtype == Dtype::F32 &&
             key.compute_type == ComputeType::TF32 &&
@@ -160,9 +208,6 @@ public:
             sizeof(transpose_weight)));
 
         if (use_tf32) {
-            // Older cuBLASLt releases may reject TF32 for a few tiny or
-            // irregular shapes. Keep a descriptor-only FP32 fallback without
-            // penalizing the normal Tensor-Core path.
             CUBLAS_CHECK(cublasLtMatmulDescCreate(
                 &fp32_fallback_operation_,
                 CUBLAS_COMPUTE_32F,
@@ -231,10 +276,6 @@ public:
             &returned_results);
         CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
 
-        // Some cuBLASLt versions do not expose heuristic algorithms for very
-        // small or unusual shapes even though the library's default algorithm
-        // supports them. Keep that compatibility path; normal model-sized
-        // GEMMs retain the explicitly selected and cached algorithm.
         if (heuristic_status == CUBLAS_STATUS_SUCCESS &&
             returned_results > 0 &&
             heuristic.state == CUBLAS_STATUS_SUCCESS) {
@@ -248,6 +289,7 @@ public:
         }
     }
 
+    /** @brief Releases all owned cuBLASLt descriptors. */
     ~MatmulPlan() {
         if (input_layout_ != nullptr) {
             cublasLtMatrixLayoutDestroy(input_layout_);
@@ -272,6 +314,15 @@ public:
     MatmulPlan(const MatmulPlan&) = delete;
     MatmulPlan& operator=(const MatmulPlan&) = delete;
 
+    /**
+     * @brief Executes the configured matrix multiplication.
+     * @param handle cuBLASLt handle.
+     * @param input Input matrix.
+     * @param weight Weight matrix stored as `[output_dim, input_dim]`.
+     * @param bias Optional bias vector; may be null.
+     * @param output Destination matrix.
+     * @param stream CUDA stream used for execution.
+     */
     void execute(
         cublasLtHandle_t handle,
         Tensor& output,
@@ -333,9 +384,6 @@ public:
         if (status == CUBLAS_STATUS_NOT_SUPPORTED &&
             bias != nullptr &&
             fused_bias_supported_) {
-            // Some small/irregular shapes have no cuBLASLt kernel supporting
-            // the bias epilogue. Preserve correctness with a separate kernel;
-            // model-sized compatible shapes remain fused.
             fused_bias_supported_ = false;
             has_selected_algorithm_ = false;
             workspace_required_ = 0;
@@ -344,9 +392,6 @@ public:
         }
         if (status == CUBLAS_STATUS_NOT_SUPPORTED &&
             fp32_fallback_operation_ != nullptr) {
-            // Preserve compatibility with CUDA versions that cannot execute
-            // an irregular TF32 operation. The fallback intentionally has no
-            // epilogue, so bias is added by the coalesced 2-D kernel.
             has_selected_algorithm_ = false;
             workspace_required_ = 0;
             status = launch(nullptr, fp32_fallback_operation_);
@@ -385,7 +430,6 @@ MatmulPlan& cached_plan(
         return *found->second;
     }
 
-    // Bound memory retained by workloads with highly dynamic shapes.
     constexpr std::size_t max_cached_plans = 64;
     if (plans.size() >= max_cached_plans) {
         plans.clear();
@@ -397,6 +441,10 @@ MatmulPlan& cached_plan(
     return result;
 }
 
+/**
+ * @brief Validates shapes, devices, dtypes and optional bias for linear call.
+ * @throws std::invalid_argument When any contract required by the operation is violated
+ */
 void validate_linear(
     const Tensor& output,
     const Tensor& input,
@@ -459,6 +507,7 @@ void validate_linear(
     }
 }
 
+/** @brief Shared implementation for linear forward passes with optional bias.*/
 void linear_forward_impl(
     Tensor& output,
     const Tensor& input,
@@ -496,6 +545,15 @@ void linear_forward_impl(
 
 } // namespace
 
+/**
+* @brief Computes `output = input * weight^T`.
+* @param output Destination tensor.
+* @param input Input tensor whose last dimension is the input feature size.
+* @param weight Row-major weight tensor `[output_features, input_features]`.
+* @param cublas_context cuBLASLt execution context.
+* @param stream CUDA stream used for execution.
+* @param options Optional configuration for workspace and compute type.
+*/
 void linear_forward(
     Tensor& output,
     const Tensor& input,
@@ -508,6 +566,16 @@ void linear_forward(
         output, input, weight, nullptr, cublas_context, stream, options);
 }
 
+/**
+ * @brief Computes `output = input * weight^T + bias`.
+ * @param output Destination tensor.
+ * @param input Input tensor whose last dimension is the input feature size.
+ * @param weight Row-major weight tensor `[output_features, input_features]`.
+ * @param bias One-dimensional bias tensor with `output_features` elements.
+ * @param cublas_context cuBLASLt execution context.
+ * @param stream CUDA stream used for execution.
+ * @param options Compute mode and workspace configuration.
+ */
 void linear_forward(
     Tensor& output,
     const Tensor& input,
