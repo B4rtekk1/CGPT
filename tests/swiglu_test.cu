@@ -49,8 +49,11 @@ std::vector<float> reference(
     return expected;
 }
 
-void test_separate(const Dtype dtype, const float tolerance) {
-    constexpr std::size_t elements = 513; // Crosses a CUDA block boundary.
+void test_separate(
+    const Dtype dtype,
+    const float tolerance,
+    const std::size_t elements
+) {
     std::vector<float> gate(elements);
     std::vector<float> up(elements);
     for (std::size_t index = 0; index < elements; ++index) {
@@ -58,9 +61,9 @@ void test_separate(const Dtype dtype, const float tolerance) {
         up[index] = 0.25f * static_cast<float>(static_cast<int>(index % 11) - 5);
     }
 
-    Tensor gate_tensor({3, 171}, dtype);
-    Tensor up_tensor({3, 171}, dtype);
-    Tensor output({3, 171}, dtype);
+    Tensor gate_tensor({3, elements / 3}, dtype);
+    Tensor up_tensor({3, elements / 3}, dtype);
+    Tensor output({3, elements / 3}, dtype);
     gate_tensor.copy_from_host(gate);
     up_tensor.copy_from_host(up);
 
@@ -69,15 +72,21 @@ void test_separate(const Dtype dtype, const float tolerance) {
     expect_close(read_tensor(output), reference(gate, up), tolerance);
 }
 
-void test_fused() {
-    const std::vector<float> gate_up{
-        -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 3.0f,
-         4.0f, -2.0f, 0.5f, 1.5f, -3.0f, 2.0f,
-        -0.5f, 0.25f, 3.0f, -4.0f, 2.0f, 1.0f,
-         1.0f, 2.0f, -1.0f, 0.5f, 3.0f, -2.0f
-    };
-    Tensor input({2, 2, 6});
-    Tensor output({2, 2, 3});
+void test_fused(
+    const Dtype dtype,
+    const float tolerance,
+    const std::size_t intermediate_size
+) {
+    constexpr std::size_t rows = 6;
+    std::vector<float> gate_up(rows * 2 * intermediate_size);
+    for (std::size_t index = 0; index < gate_up.size(); ++index) {
+        gate_up[index] = 0.125f * static_cast<float>(
+            static_cast<int>(index % 29) - 14
+        );
+    }
+
+    Tensor input({2, 3, 2 * intermediate_size}, dtype);
+    Tensor output({2, 3, intermediate_size}, dtype);
     input.copy_from_host(gate_up);
 
     swiglu_forward(output, input);
@@ -85,12 +94,20 @@ void test_fused() {
 
     std::vector<float> gate;
     std::vector<float> up;
-    for (std::size_t row = 0; row < 4; ++row) {
-        const auto offset = row * 6;
-        gate.insert(gate.end(), gate_up.begin() + offset, gate_up.begin() + offset + 3);
-        up.insert(up.end(), gate_up.begin() + offset + 3, gate_up.begin() + offset + 6);
+    for (std::size_t row = 0; row < rows; ++row) {
+        const auto offset = row * 2 * intermediate_size;
+        gate.insert(
+            gate.end(),
+            gate_up.begin() + offset,
+            gate_up.begin() + offset + intermediate_size
+        );
+        up.insert(
+            up.end(),
+            gate_up.begin() + offset + intermediate_size,
+            gate_up.begin() + offset + 2 * intermediate_size
+        );
     }
-    expect_close(read_tensor(output), reference(gate, up), 1.0e-5f);
+    expect_close(read_tensor(output), reference(gate, up), tolerance);
 }
 
 template <typename Function>
@@ -144,6 +161,16 @@ void test_validation() {
         Tensor cpu_input({2, 6}, DeviceType::CPU);
         swiglu_forward(cpu_output, cpu_input);
     });
+    expect_invalid_argument([&] {
+        Tensor f16_output({2, 3}, Dtype::F16);
+        Tensor f32_input({2, 6});
+        swiglu_forward(f16_output, f32_input);
+    });
+    expect_invalid_argument([&] {
+        Tensor output({65536, 1});
+        Tensor input({65536, 2});
+        swiglu_forward(output, input);
+    });
 }
 
 void test_custom_stream() {
@@ -169,10 +196,18 @@ void test_custom_stream() {
 
 int main() {
     try {
-        test_separate(Dtype::F32, 1.0e-5f);
-        test_separate(Dtype::F16, 3.0e-3f);
-        test_separate(Dtype::BF16, 2.0e-2f);
-        test_fused();
+        // Odd sizes use scalar kernels; even sizes use packed half2/BF16x2 kernels.
+        test_separate(Dtype::F32, 1.0e-5f, 513);
+        test_separate(Dtype::F16, 3.0e-3f, 513);
+        test_separate(Dtype::F16, 3.0e-3f, 516);
+        test_separate(Dtype::BF16, 2.0e-2f, 513);
+        test_separate(Dtype::BF16, 2.0e-2f, 516);
+
+        test_fused(Dtype::F32, 1.0e-5f, 513);
+        test_fused(Dtype::F16, 3.0e-3f, 513);
+        test_fused(Dtype::F16, 3.0e-3f, 514);
+        test_fused(Dtype::BF16, 2.0e-2f, 513);
+        test_fused(Dtype::BF16, 2.0e-2f, 514);
         test_validation();
         test_custom_stream();
     } catch (const std::exception& error) {
