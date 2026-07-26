@@ -3,7 +3,9 @@
 #include "core/tensor.h"
 
 struct RopeOptions {
+    /// Uses the full head dimension when set to zero
     std::size_t rotary_dim = 0;
+    /// First position represented by query/key sequence index zero.
     std::size_t position_offset = 0;
 };
 
@@ -11,13 +13,14 @@ struct RopeOptions {
  * @brief Applies rotary positional embeddings.
  *
  * Expected tensor layouts:
- *
  * @code
  * query      [batch, sequence, query_heads, head_dim]
  * key        [batch, sequence, kv_heads,    head_dim]
  * cos_cache  [max_sequence, rotary_dim / 2]
  * sin_cache  [max_sequence, rotary_dim / 2]
  * @endcode
+ *
+ * Supported dtypes: F32, F16 and BF16. All four tensors must use the same dtype
  */
 void rope_forward(
     Tensor& query,

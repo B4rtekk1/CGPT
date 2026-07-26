@@ -166,8 +166,7 @@ namespace bpe {
                 auto unsorted_values = values | std::views::drop(sorted_size);
                 std::ranges::sort(unsorted_values);
                 if (sorted_size != 0) {
-                    std::ranges::inplace_merge(
-                        values | std::views::take(sorted_size), unsorted_values);
+                    std::ranges::inplace_merge(values, values.begin() + sorted_size);
                 }
                 mark_sorted();
             }
