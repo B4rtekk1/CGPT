@@ -2,10 +2,6 @@
 
 #include "core/tensor.h"
 
-#include <cstddef>
-
-#include "core/cuda_check.h"
-
 struct RopeOptions {
     std::size_t rotary_dim = 0;
     std::size_t position_offset = 0;

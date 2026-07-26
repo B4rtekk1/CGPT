@@ -17,8 +17,8 @@ add_library(cgpt_core STATIC
         src/ops/linear.cu
         src/ops/rmsnorm.cu
         src/ops/swiglu.cu
-        src/tensor.cu
-        include/ops/swiglu.h)
+        src/ops/rope.cu
+        src/tensor.cu)
 
 target_include_directories(cgpt_core PUBLIC
         ${CGPT_INCLUDE_DIR}
