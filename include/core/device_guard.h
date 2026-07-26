@@ -5,7 +5,7 @@
 
 class DeviceGuard {
 public:
-    explicit DeviceGuard(int target_device) {
+    explicit DeviceGuard(const int target_device) {
         if (target_device < 0) {
             throw std::invalid_argument("target_device must be non-negative");
         }

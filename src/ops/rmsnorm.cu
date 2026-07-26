@@ -3,8 +3,6 @@
 #include "device_guard.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cmath>
-#include <cstdint>
 #include <limits>
 #include <stdexcept>
 

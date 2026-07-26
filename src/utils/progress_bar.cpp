@@ -39,7 +39,7 @@ void ProgressBar::draw(const std::chrono::steady_clock::time_point now) const {
     constexpr int width = 40;
     const double progress = total_ == 0
                                  ? 1.0
-                                 : static_cast<double>(current_) / total_;
+                                 : static_cast<double>(current_) / static_cast<double>(total_);
     const int filled = static_cast<int>(progress * width);
     const double elapsed = std::chrono::duration<double>(now - start_).count();
     const double speed = elapsed > 0.0 ? static_cast<double>(current_) / elapsed : 0.0;

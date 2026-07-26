@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cuda_runtime_api.h>
-#include <cublasLt.h>
 #include <cstdio>
 #include <cstdlib>
 
@@ -10,7 +9,7 @@
     cudaError_t error,
     const char* expression,
     const char* file,
-    int line
+    const int line
     ) {
     std::fprintf(
         stderr,

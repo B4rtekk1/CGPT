@@ -12,7 +12,7 @@ class GpuBuffer {
 public:
     GpuBuffer() = default;
 
-    explicit GpuBuffer(std::size_t count) {
+    explicit GpuBuffer(const std::size_t count) {
         allocate(count);
     }
 

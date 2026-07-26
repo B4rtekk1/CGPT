@@ -2,8 +2,6 @@
 
 #include <cublasLt.h>
 
-#include <cstddef>
-#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -26,7 +24,7 @@ enum class Dtype: std::uint8_t {
     return false;
 }
 
-constexpr std::size_t dtype_size(Dtype dtype) {
+constexpr std::size_t dtype_size(const Dtype dtype) {
     switch (dtype) {
         case Dtype::F16:
         case Dtype::BF16:

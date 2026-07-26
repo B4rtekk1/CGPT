@@ -5,7 +5,6 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
-#include <cstring>
 #include <vector>
 
 namespace {
@@ -141,15 +140,15 @@ void Tensor::copy_to_host(const std::span<float> destination) const {
 
 Tensor Tensor::empty(
     std::vector<std::size_t> shape,
-    DeviceType device,
-    Dtype dtype) {
-    return Tensor(std::move(shape), device, dtype);
+    const DeviceType device_type,
+    const Dtype dtype) {
+    return Tensor(std::move(shape), device_type, dtype);
 }
 
 Tensor Tensor::zeros(
     std::vector<std::size_t> shape,
     const DeviceType device_type,
-    const cudaStream_t stream,
+    cudaStream_t stream,
     const Dtype dtype) {
     Tensor result(std::move(shape), device_type, dtype);
 
@@ -164,21 +163,21 @@ Tensor Tensor::zeros(
 
 Tensor Tensor::ones(
     std::vector<std::size_t> shape,
-    DeviceType device,
+    const DeviceType device_type,
     cudaStream_t stream,
-    Dtype dtype) {
-    Tensor result(std::move(shape), device, dtype);
+    const Dtype dtype) {
+    Tensor result(std::move(shape), device_type, dtype);
     fill(result, 1.0f, stream);
     return result;
 }
 
 Tensor Tensor::full(
     std::vector<std::size_t> shape,
-    float value,
-    DeviceType device,
+    const float value,
+    const DeviceType device_type,
     cudaStream_t stream,
-    Dtype dtype) {
-    Tensor result(std::move(shape), device, dtype);
+    const Dtype dtype) {
+    Tensor result(std::move(shape), device_type, dtype);
     fill(result, value, stream);
     return result;
 }
@@ -186,15 +185,15 @@ Tensor Tensor::full(
 Tensor Tensor::eye(
     std::size_t rows,
     std::size_t columns,
-    DeviceType device,
+    const DeviceType device_type,
     cudaStream_t stream,
-    Dtype dtype
+    const Dtype dtype
 ) {
-    Tensor result(std::vector<std::size_t>{rows, columns}, device, dtype);
+    Tensor result(std::vector<std::size_t>{rows, columns}, device_type, dtype);
 
     const std::size_t count = rows * columns;
 
-    if (device != DeviceType::CUDA) {
+    if (device_type != DeviceType::CUDA) {
         std::vector<float> values(count, 0.0f);
         for (std::size_t diagonal = 0;
              diagonal < std::min(rows, columns);

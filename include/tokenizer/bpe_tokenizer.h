@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
@@ -35,13 +34,7 @@ namespace bpe {
         std::size_t worker_count = 0;
         PretokenizerMode pretokenizer = PretokenizerMode::GptLike;
         TrainerMode mode = TrainerMode::ExactInMemory;
-        // LowMemoryStreaming keeps only one input block, its encoded symbols,
-        // and pair counters in RAM. More merges per pass reduce I/O but make
-        // training an approximation of strictly sequential BPE. Set to 1 for
-        // exact merge selection at the cost of one corpus pass per merge.
         std::size_t low_memory_merges_per_pass = 8;
-        // Dense pair counters are used while vocab_size <= this value.
-        // 2048 consumes 32 MiB with uint64 counters.
         std::size_t low_memory_dense_vocab_limit = 2'048;
         std::vector<std::string> special_tokens = {
             "<unk>", "<bos>", "<eos>", "<pad>"
@@ -49,7 +42,6 @@ namespace bpe {
     };
 
     struct EncodeOptions {
-        // Per-thread bounded cache. Set either value to zero to disable it.
         std::size_t cache_entries = 65'536;
         std::size_t cache_max_input_bytes = 256;
     };
@@ -109,15 +101,10 @@ namespace bpe {
 
         [[nodiscard]] std::string decode(std::span<const TokenId> ids) const;
 
-        // HuggingFaceJson is the default so save() produces a portable
-        // tokenizer.json. Binary remains available for legacy CGPT models.
         void save(
             const std::filesystem::path& path,
             TokenizerFormat format = TokenizerFormat::HuggingFaceJson) const;
-        // Export the same IDs and merge ranks in Hugging Face tokenizer.json
-        // form so external ByteLevel-BPE runtimes such as GigaToken can load it.
         void save_huggingface_json(const std::filesystem::path& path) const;
-        // Auto detects tokenizer.json and the legacy BPETOK binary format.
         [[nodiscard]] static BpeTokenizer load(
             const std::filesystem::path& path,
             TokenizerFormat format = TokenizerFormat::Auto);
@@ -148,8 +135,6 @@ namespace bpe {
             std::string_view text,
             std::vector<TokenId>& output,
             unsigned dense_limit_bits) const;
-        // Shared two-tier cache lookup (hot direct-mapped tier + bounded
-        // hash-map tier) used for every cacheable pretoken/text piece.
         void encode_piece_cached(
             std::string_view piece,
             std::vector<TokenId>& output,
@@ -171,9 +156,6 @@ namespace bpe {
         std::vector<MergeRule> merges_;
         std::vector<std::vector<std::uint8_t>> token_bytes_;
         std::unordered_map<std::uint64_t, TokenId> merge_lookup_;
-        // GigaToken-style two-level lookup used by the encoding hot path:
-        // early token IDs use an L3-resident dense table, while the remaining
-        // pairs use a packed, immutable, open-addressed table.
         std::vector<TokenId> dense_merge_lookup_;
         unsigned dense_merge_bits_ = 0;
         std::vector<std::uint64_t> packed_merge_lookup_;

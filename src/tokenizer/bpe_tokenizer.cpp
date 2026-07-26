@@ -5,7 +5,6 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <cstring>
 #include <fstream>
 #include <ranges>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -51,7 +50,7 @@ namespace bpe {
 
             void insert(const PairKey pair, const std::uint64_t count) {
                 indices_.emplace(pair, entries_.size());
-                entries_.push_back({count, pair});
+                entries_.push_back({.count = count, .pair = pair});
                 sift_up(entries_.size() - 1);
             }
 
@@ -164,10 +163,11 @@ namespace bpe {
                     return;
                 }
 
-                auto middle = values.begin() + static_cast<std::ptrdiff_t>(sorted_size);
-                std::ranges::sort(middle, values.end());
+                auto unsorted_values = values | std::views::drop(sorted_size);
+                std::ranges::sort(unsorted_values);
                 if (sorted_size != 0) {
-                    std::ranges::inplace_merge(values.begin(), middle, values.end());
+                    std::ranges::inplace_merge(
+                        values | std::views::take(sorted_size), unsorted_values);
                 }
                 mark_sorted();
             }
@@ -229,7 +229,7 @@ namespace bpe {
             result.reserve(text.size());
 
             for (const unsigned char byte: text) {
-                result.push_back(static_cast<TokenId>(byte));
+                result.push_back(byte);
             }
 
             return result;
@@ -270,7 +270,7 @@ namespace bpe {
 
         alignas(64) constexpr auto kByteClasses = make_byte_classes();
 
-        [[nodiscard]] inline ByteClass classify_byte(const unsigned char byte) noexcept {
+        [[nodiscard]] ByteClass classify_byte(const unsigned char byte) noexcept {
             return kByteClasses[byte];
         }
 
@@ -318,7 +318,7 @@ namespace bpe {
 #endif
 
 #ifdef BPE_HAVE_SSE2
-        [[nodiscard]] inline __m128i classify_vector_sse2(const __m128i bytes) noexcept {
+        [[nodiscard]] __m128i classify_vector_sse2(const __m128i bytes) noexcept {
             const __m128i zero = _mm_setzero_si128();
             const __m128i high_bit = _mm_cmplt_epi8(bytes, zero); // unsigned >= 0x80
 
@@ -352,7 +352,7 @@ namespace bpe {
         }
 #endif
 
-        [[nodiscard]] inline std::size_t scan_class_run(
+        [[nodiscard]] std::size_t scan_class_run(
             const std::string_view text,
             std::size_t position,
             const ByteClass byte_class) noexcept {
@@ -476,7 +476,7 @@ namespace bpe {
 
         class JsonParser {
         public:
-            explicit JsonParser(std::string_view input) : input_(input) {}
+            explicit JsonParser(const std::string_view input) : input_(input) {}
 
             [[nodiscard]] JsonValue parse() {
                 JsonValue value = parse_value();
@@ -770,7 +770,7 @@ namespace bpe {
                             "ExactInMemory corpus exceeds 32-bit position space");
                     }
                     for (const unsigned char byte : piece) {
-                        corpus.push_back(static_cast<TokenId>(byte));
+                        corpus.push_back(byte);
                     }
                     piece_offsets.push_back(static_cast<Occurrence>(corpus.size()));
                 });
@@ -832,7 +832,7 @@ namespace bpe {
         for (const auto& [pair, count] : global_counts) {
             auto [entry, inserted] = occurrences.try_emplace(pair);
             (void)inserted;
-            entry->second.values.reserve(static_cast<std::size_t>(count));
+            entry->second.values.reserve(count);
         }
         std::size_t occurrence_entries = 0;
         for (std::size_t piece = 0; piece < piece_count; ++piece) {
@@ -1162,11 +1162,11 @@ namespace bpe {
                     return;
                 }
                 if (best.size() < wanted) {
-                    best.push_back({count, pair});
+                    best.push_back({.count = count, .pair = pair});
                     std::ranges::push_heap(best.begin(), best.end(), worse);
                     return;
                 }
-                const RankedPair candidate{count, pair};
+                const RankedPair candidate{.count = count, .pair = pair};
                 const RankedPair& minimum = best.front();
                 if (candidate.count > minimum.count ||
                     (candidate.count == minimum.count && candidate.pair < minimum.pair)) {
@@ -1532,13 +1532,13 @@ namespace bpe {
                 std::memcpy(
                     &short_key_high, piece.data() + 8, piece.size() - 8);
             }
-            short_key_high |= static_cast<std::uint64_t>(piece.size()) << 56U;
+            short_key_high |= piece.size() << 56U;
 
             std::uint64_t packed_hash =
                 short_key_low ^ std::rotl(short_key_high, 23);
             packed_hash *= 0x9E37'79B9'7F4A'7C15ULL;
             std::size_t short_index =
-                static_cast<std::size_t>(packed_hash) & cache.short_mask;
+                packed_hash & cache.short_mask;
             constexpr std::uint64_t key_mask = (std::uint64_t{1} << 60U) - 1;
             constexpr std::size_t short_max_probe = 8;
             for (std::size_t probe = 0; probe < short_max_probe; ++probe) {
@@ -1568,11 +1568,11 @@ namespace bpe {
                 hash ^= byte;
                 hash *= 1099511628211ULL;
             }
-            hash ^= static_cast<std::uint64_t>(piece.size()) *
+            hash ^= piece.size() *
                 0x9E3779B97F4A7C15ULL;
         }
 
-        std::size_t index = static_cast<std::size_t>(hash) & cache.long_mask;
+        std::size_t index = hash & cache.long_mask;
         Entry* victim = nullptr;
         if (piece.size() > 15) {
             for (std::size_t probe = 0; probe < 8; ++probe) {
@@ -1600,7 +1600,7 @@ namespace bpe {
             short_victim->key_low = short_key_low;
             short_victim->key_high_and_count =
                 short_key_high |
-                (static_cast<std::uint64_t>(encoded.size()) << 60U);
+                (encoded.size() << 60U);
             std::ranges::copy(
                 encoded.begin(), encoded.end(), short_victim->tokens.begin());
         } else if (victim != nullptr) {
@@ -1625,8 +1625,7 @@ namespace bpe {
             if ((left | right) <= id_mask) {
                 const std::uint64_t key =
                     (static_cast<std::uint64_t>(left) << id_bits) | right;
-                auto index = static_cast<std::size_t>(
-                    key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_);
+                auto index = key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_;
                 while (true) {
                     const std::uint64_t slot = packed_merge_lookup_[index];
                     if (slot >> id_bits == key) {
@@ -1918,9 +1917,9 @@ namespace bpe {
         };
 
         if (text.size() < std::numeric_limits<std::uint32_t>::max()) {
-            encode_with_links.template operator()<std::uint32_t>();
+            encode_with_links.operator()<std::uint32_t>();
         } else {
-            encode_with_links.template operator()<std::size_t>();
+            encode_with_links.operator()<std::size_t>();
         }
     }
 
@@ -1988,7 +1987,7 @@ void BpeTokenizer::save_binary(const std::filesystem::path& path) const {
         merges_.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::length_error("Tokenizer is too large to serialize");
     }
-    output.write(magic.data(), static_cast<std::streamsize>(magic.size()));
+    output.write(magic.data(), magic.size());
     write_u32(output, static_cast<std::uint32_t>(special_tokens_.size()));
     write_u32(output, static_cast<std::uint32_t>(merges_.size()));
     write_u32(output, static_cast<std::uint32_t>(pretokenizer_mode_));
@@ -2001,10 +2000,10 @@ void BpeTokenizer::save_binary(const std::filesystem::path& path) const {
         output.write(token.data(), static_cast<std::streamsize>(token.size()));
     }
 
-    for (const MergeRule& merge : merges_) {
-        write_u32(output, merge.left);
-        write_u32(output, merge.right);
-        write_u32(output, merge.merged);
+    for (const auto&[left, right, merged] : merges_) {
+        write_u32(output, left);
+        write_u32(output, right);
+        write_u32(output, merged);
     }
 
     if (!output) {
@@ -2204,7 +2203,7 @@ BpeTokenizer BpeTokenizer::load_binary(const std::filesystem::path& path) {
 
     const std::uint32_t special_count = read_u32(input);
     const std::uint32_t merge_count = read_u32(input);
-    PretokenizerMode pretokenizer = PretokenizerMode::None;
+    auto pretokenizer = PretokenizerMode::None;
     if (actual_magic == magic_v2) {
         const std::uint32_t raw_mode = read_u32(input);
         if (raw_mode > static_cast<std::uint32_t>(PretokenizerMode::GptLike)) {
@@ -2231,7 +2230,7 @@ BpeTokenizer BpeTokenizer::load_binary(const std::filesystem::path& path) {
         }
 
         std::string token(size, '\0');
-        input.read(token.data(), static_cast<std::streamsize>(size));
+        input.read(token.data(), size);
         if (!input) {
             throw std::runtime_error("Unexpected end of tokenizer special token");
         }
@@ -2399,7 +2398,7 @@ void BpeTokenizer::add_merge(const TokenId left, const TokenId right) {
 
     std::vector<std::uint8_t> bytes = token_bytes_[left];
     bytes.insert(bytes.end(), token_bytes_[right].begin(), token_bytes_[right].end());
-    merges_.push_back({left, right, merged});
+    merges_.push_back({.left = left, .right = right, .merged = merged});
     token_bytes_.push_back(std::move(bytes));
     merge_lookup_.emplace(key, merged);
 }
@@ -2462,8 +2461,7 @@ void BpeTokenizer::rebuild_fast_merge_lookup() {
 
         const std::uint64_t key =
             (static_cast<std::uint64_t>(merge.left) << id_bits) | merge.right;
-        auto index = static_cast<std::size_t>(
-            key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_);
+        auto index = key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_;
         std::size_t displacement = 0;
         while (packed_merge_lookup_[index] != empty) {
             index = (index + 1) & packed_merge_mask_;

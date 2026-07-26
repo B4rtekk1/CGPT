@@ -316,7 +316,7 @@ public:
                 stream);
         };
 
-        cublasLtMatmulDesc_t active_operation =
+        const cublasLtMatmulDesc_t active_operation =
             bias != nullptr && !fused_bias_supported_
                 ? unfused_operation_
                 : operation_;
@@ -325,9 +325,6 @@ public:
                 has_selected_algorithm_ ? &algorithm_ : nullptr,
                 active_operation);
         if (status == CUBLAS_STATUS_NOT_SUPPORTED && has_selected_algorithm_) {
-            // A few CUDA/cuBLASLt releases report a successful heuristic for
-            // tiny shapes but reject that algorithm at launch. Remember the
-            // result so subsequent calls for this cached plan skip it.
             has_selected_algorithm_ = false;
             workspace_required_ = 0;
             status = launch(nullptr, active_operation);

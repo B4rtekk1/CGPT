@@ -53,7 +53,7 @@ void test_zero_allocation_releases_buffer() {
 
 void test_move_operations() {
     DeviceBuffer source(sizeof(float));
-    void* source_data = source.data();
+    const void* source_data = source.data();
 
     DeviceBuffer moved(std::move(source));
     expect(moved.data() == source_data, "Move construction lost the allocation");

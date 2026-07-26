@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -21,8 +19,8 @@ class Tensor {
 public:
     explicit Tensor(
         std::vector<std::size_t> shape,
-        DeviceType device_type = DeviceType::CUDA,
-        Dtype dtype = Dtype::F32
+        const DeviceType device_type = DeviceType::CUDA,
+        const Dtype dtype = Dtype::F32
     )
         : shape_(std::move(shape)),
           device_type_(validate_device_type(device_type)),

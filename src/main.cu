@@ -4,10 +4,9 @@
 
 #include "../include/core/cuda_check.h"
 
-__global__ void add_one(float* values, int count) {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index < count) {
+__global__ static void add_one(float* values, int count) {
+    if (const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+        index < static_cast<unsigned int>(count)) {
         values[index] += 1.0f;
     }
 }
@@ -28,7 +27,7 @@ int main() {
     ));
 
     constexpr int threads_per_block = 256;
-    const int blocks =
+    constexpr int blocks =
         (count + threads_per_block - 1) / threads_per_block;
 
     add_one<<<blocks, threads_per_block>>>(device_values, count);

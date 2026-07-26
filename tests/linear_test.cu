@@ -40,7 +40,7 @@ void test_matrix_multiplication() {
     input.copy_from_host(std::vector<float>{1.0f, 2.0f, 3.0f, -1.0f, 0.0f, 2.0f});
     weight.copy_from_host(std::vector<float>{1.0f, 0.0f, 2.0f, -1.0f, 3.0f, 1.0f});
 
-    CublasLtContext context;
+    const CublasLtContext context;
     linear_forward(output, input, weight, context);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -60,7 +60,7 @@ void test_batched_input() {
     });
     weight.copy_from_host(std::vector<float>{1.0f, 2.0f, 0.0f, -1.0f, 0.0f, 1.0f});
 
-    CublasLtContext context;
+    const CublasLtContext context;
     linear_forward(output, input, weight, context);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -86,7 +86,7 @@ void test_fused_bias_and_cached_plan() {
         -1.0f, 3.0f, 1.0f});
     bias.copy_from_host(std::vector<float>{0.5f, -1.0f});
 
-    CublasLtContext context;
+    const CublasLtContext context;
     linear_forward(output, input, weight, bias, context);
     linear_forward(output, input, weight, bias, context);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -95,12 +95,12 @@ void test_fused_bias_and_cached_plan() {
 }
 
 void test_irregular_tf32_shape() {
-    Tensor input = Tensor::ones({9, 9});
-    Tensor weight = Tensor::ones({9, 9});
-    Tensor bias = Tensor::full({9}, 0.25f);
+    const Tensor input = Tensor::ones({9, 9});
+    const Tensor weight = Tensor::ones({9, 9});
+    const Tensor bias = Tensor::full({9}, 0.25f);
     Tensor output({9, 9});
 
-    CublasLtContext context;
+    const CublasLtContext context;
     linear_forward(output, input, weight, bias, context);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -122,7 +122,7 @@ void test_reduced_precision(const Dtype dtype, const float tolerance) {
         -1.0f, 2.0f, 1.0f, 0.0f});
     bias.copy_from_host(std::vector<float>{0.25f, -0.5f, 1.0f});
 
-    CublasLtContext context;
+    const CublasLtContext context;
     linear_forward(output, input, weight, bias, context);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -143,8 +143,8 @@ void expect_invalid_argument(Function&& function) {
 }
 
 void test_validation() {
-    CublasLtContext context;
-    Tensor valid_input({2, 3});
+    const CublasLtContext context;
+    const Tensor valid_input({2, 3});
     Tensor valid_weight({2, 3});
     Tensor valid_output({2, 2});
 

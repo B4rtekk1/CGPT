@@ -2,7 +2,6 @@
 
 #include "cuda_check.h"
 
-#include <cstddef>
 #include <utility>
 
 class DeviceBuffer {
