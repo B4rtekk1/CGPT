@@ -236,6 +236,14 @@ __global__ void rope_qk_kernel(
     }
 }
 
+/**
+ * @brief Converts a size value to @c uint32_t with overflow checking.
+ *
+ * @param value Value to convert
+ * @param description Human-readable name included in an exception message.
+ * @return Converted value
+ * @throws std::overflow_error If @p value exceeds the @c uint32_t range.
+ */
 [[nodiscard]] std::uint32_t checked_u32(
     const std::size_t value,
     const char* const description
@@ -249,6 +257,15 @@ __global__ void rope_qk_kernel(
     return static_cast<std::uint32_t>(value);
 }
 
+/**
+ * @brief Multiplies two @c size_t values with overflow checking
+ *
+ * @param left Left operand.
+ * @param right Right operand.
+ * @param description Human-readable operation name used in an exception.
+ * @return Product of @p left and @p right.
+ * @throws std::overflow_error If the multiplication overflows
+ */
 [[nodiscard]] std::size_t checked_product(
     const std::size_t left,
     const std::size_t right,
@@ -263,6 +280,13 @@ __global__ void rope_qk_kernel(
     return left * right;
 }
 
+/**
+ * @brief Validates the common device and rank requirements of Q/K tensors.
+ *
+ * @param tensor Tensor to validate
+ * @param name Tensor name used in diagnostic messages.
+ * @throws std::invalid_argument If the tensor is not CUDA-resident or does not have rank four.
+ */
 void validate_tensor_layout(const Tensor& tensor, const char* const name) {
     if (tensor.device_type() != DeviceType::CUDA) {
         throw std::invalid_argument(
@@ -278,6 +302,22 @@ void validate_tensor_layout(const Tensor& tensor, const char* const name) {
     }
 }
 
+/**
+ * @brief Validates all public RoPE inputs before launching CUDA work.
+ *
+ * Checks device placement, ranks, dtypes, compatible dimensions, vectorization
+ * requirements, cache shape and cache position range. It also verifies
+ * that all dimensions passed to the kernel fit in 32-bit unsigned integers.
+ *
+ * @param query Query tensor.
+ * @param key Key tensor.
+ * @param cos_cache Cosine cache
+ * @param sin_cache Sine cache
+ * @param options RoPE options
+ *
+ * @throws std::invalid_argument For incompatible tensors or unsupported shapes.
+ * @throws std::overflow_error For dimensions or index ranges overflow.
+ */
 void validate_inputs(
     const Tensor& query,
     const Tensor& key,
@@ -372,6 +412,14 @@ void validate_inputs(
     ));
 }
 
+/**
+ * @brief Chooses a block size based on the number of rotary pairs.
+ *
+ * The result is always a whole number of warps. Small rotary dimensions avoid launching inactive warps, while ;arger dimensions are capped at 256 threads.
+ *
+ * @param rotary_pair_count Number of independent rotary pairs per head
+ * @return CUDA threads per block: 32, 64, 128 or 256
+ */
 [[nodiscard]] std::uint32_t select_block_size(
     const std::uint32_t rotary_pair_count
 ) {
@@ -387,6 +435,21 @@ void validate_inputs(
     return MAX_THREADS_PER_BLOCK;
 }
 
+/**
+ * @brief Configures and launches the fused query/key RoPE kernel.
+ *
+ * @tparam T CUDA storage type corresponding to the runtime tensor dtype.
+ * @param query Mutable query tensor.
+ * @param key Mutable key tensor.
+ * @param cos_cache Cosine lookup table.
+ * @param sin_cache Sine lookup table.
+ * @param token_count Flattened batch-by-sequence size.
+ * @param sequence_length Number of tokens per sequence.
+ * @param head_dim Attention head width.
+ * @param rotary_pair_count Number of element pairs to rotate.
+ * @param position_offset Starting position in the RoPE caches.
+ * @param stream CUDA stream receiving the kernel launch.
+ */
 template<typename T>
 void launch_rope(
     Tensor& query,
@@ -426,6 +489,34 @@ void launch_rope(
 }
 } // namespace
 
+/**
+* @brief Applies rotary positional embeddings to query and key tensors.
+*
+* The operation is performed in place and asynchronously on @p stream. Query
+* and key are fused into one CUDA launch. A zero @c rotary_dim means that the
+* complete head dimension is rotated.
+*
+* Supported dtypes are FP32, FP16 and BF16. Query, key and both caches must use
+* the same dtype and reside on a CUDA device.
+*
+* @param query Query tensor with shape
+*        `[batch, sequence, query_heads, head_dim]`.
+* @param key Key tensor with shape
+*        `[batch, sequence, key_heads, head_dim]`.
+* @param cos_cache Cosine cache with shape
+*        `[max_sequence, rotary_dim / 2]`.
+* @param sin_cache Sine cache with shape
+*        `[max_sequence, rotary_dim / 2]`.
+* @param stream CUDA stream used for execution.
+* @param options Rotary dimension and cache position offset.
+*
+* @throws std::invalid_argument If tensor layouts, dtypes or dimensions are
+*         incompatible, or if the dtype is unsupported.
+* @throws std::overflow_error If a dimension or computed index range overflows.
+*
+* @note The function checks launch errors with @c cudaGetLastError(), but does
+*       not synchronize the stream.
+*/
 void rope_forward(
     Tensor& query,
     Tensor& key,
