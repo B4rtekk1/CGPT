@@ -1,11 +1,9 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
-#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,8 +44,13 @@ namespace bpe {
 
     struct EncodeOptions {
         // Per-thread bounded cache. Set either value to zero to disable it.
-        std::size_t cache_entries = 4'096;
+        std::size_t cache_entries = 65'536;
         std::size_t cache_max_input_bytes = 256;
+    };
+
+    struct EncodedBatch {
+        std::vector<TokenId> tokens;
+        std::vector<std::size_t> offsets;
     };
 
     struct MergeRule {
@@ -93,9 +96,17 @@ namespace bpe {
             std::size_t worker_count = 0,
             const EncodeOptions& options = {}) const;
 
+        [[nodiscard]] EncodedBatch encode_batch_flat(
+            std::span<const std::string_view> texts,
+            std::size_t worker_count = 0,
+            const EncodeOptions& options = {}) const;
+
         [[nodiscard]] std::string decode(std::span<const TokenId> ids) const;
 
         void save(const std::filesystem::path& path) const;
+        // Export the same IDs and merge ranks in Hugging Face tokenizer.json
+        // form so external ByteLevel-BPE runtimes such as GigaToken can load it.
+        void save_huggingface_json(const std::filesystem::path& path) const;
         [[nodiscard]] static BpeTokenizer load(const std::filesystem::path& path);
 
         [[nodiscard]] std::size_t vocab_size() const noexcept;
@@ -111,7 +122,6 @@ namespace bpe {
         void add_merge(TokenId left, TokenId right);
         void rebuild_fast_merge_lookup();
         void rebuild_token_bytes();
-        void rebuild_special_matcher();
         [[nodiscard]] std::vector<TokenId> encode_with_dense_limit(
             std::string_view text,
             const EncodeOptions& options,
@@ -125,26 +135,21 @@ namespace bpe {
             std::string_view text,
             std::vector<TokenId>& output,
             unsigned dense_limit_bits) const;
+        // Shared two-tier cache lookup (hot direct-mapped tier + bounded
+        // hash-map tier) used for every cacheable pretoken/text piece.
+        void encode_piece_cached(
+            std::string_view piece,
+            std::vector<TokenId>& output,
+            const EncodeOptions& options,
+            unsigned dense_limit_bits) const;
         [[nodiscard]] TokenId lookup_merge(
             TokenId left,
             TokenId right,
             unsigned dense_limit_bits) const noexcept;
         [[nodiscard]] bool is_special(TokenId id) const noexcept;
 
-        struct SpecialMatcherNode {
-            static constexpr std::uint32_t kMissing =
-                std::numeric_limits<std::uint32_t>::max();
-
-            std::array<std::uint32_t, 256> transitions{};
-            std::vector<std::uint32_t> outputs;
-            std::uint32_t failure = 0;
-
-            SpecialMatcherNode() { transitions.fill(kMissing); }
-        };
-
         PretokenizerMode pretokenizer_mode_ = PretokenizerMode::GptLike;
         std::vector<std::string> special_tokens_;
-        std::vector<SpecialMatcherNode> special_matcher_;
         std::vector<MergeRule> merges_;
         std::vector<std::vector<std::uint8_t>> token_bytes_;
         std::unordered_map<std::uint64_t, TokenId> merge_lookup_;
