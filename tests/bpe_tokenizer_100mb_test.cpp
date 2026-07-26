@@ -6,6 +6,8 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -13,6 +15,24 @@
 
 int main(int argc, char** argv) {
     constexpr auto input_path = "data/tokenizer_100mb.txt";
+    bool full_training = false;
+    std::optional<std::filesystem::path> load_path;
+    std::optional<std::filesystem::path> save_path;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument = argv[index];
+        if (argument == "--full-training") {
+            full_training = true;
+        } else if (argument == "--load" && index + 1 < argc) {
+            load_path = argv[++index];
+        } else if (argument == "--save" && index + 1 < argc) {
+            save_path = argv[++index];
+        } else {
+            std::cerr << "Usage: " << argv[0]
+                      << " [--full-training] [--load tokenizer.json]"
+                         " [--save tokenizer.json]\n";
+            return 2;
+        }
+    }
 
     std::ifstream input(input_path, std::ios::binary);
     if (!input) {
@@ -35,8 +55,6 @@ int main(int argc, char** argv) {
               << " MiB\n";
 
     constexpr std::size_t default_training_size = 8 * 1024 * 1024;
-    const bool full_training = argc > 1 &&
-                                std::string_view(argv[1]) == "--full-training";
     const std::size_t training_size = full_training
                                           ? text.size()
                                           : std::min(text.size(), default_training_size);
@@ -79,8 +97,19 @@ int main(int argc, char** argv) {
               << " (" << blocks_per_worker << " per worker)\n";
 
     const auto train_start = std::chrono::steady_clock::now();
-    const bpe::BpeTokenizer tokenizer = bpe::BpeTokenizer::train(corpus, config);
+    const bpe::BpeTokenizer tokenizer = load_path
+        ? bpe::BpeTokenizer::load(*load_path)
+        : bpe::BpeTokenizer::train(corpus, config);
     const auto train_end = std::chrono::steady_clock::now();
+    if (load_path) {
+        std::cout << "Loaded Hugging Face tokenizer: "
+                  << load_path->string() << '\n';
+    }
+    if (save_path) {
+        tokenizer.save(*save_path);
+        std::cout << "Saved Hugging Face tokenizer: "
+                  << save_path->string() << '\n';
+    }
 
     const auto encode_start = std::chrono::steady_clock::now();
     const std::vector<bpe::TokenId> ids = tokenizer.encode(text);
@@ -126,7 +155,7 @@ int main(int argc, char** argv) {
     }
 
     const auto model_path = std::filesystem::temp_directory_path() /
-                            "cgpt_bpe_tokenizer_100mb_test.bin";
+                            "cgpt_bpe_tokenizer_100mb_test.json";
     tokenizer.save(model_path);
     const bpe::BpeTokenizer loaded = bpe::BpeTokenizer::load(model_path);
     std::filesystem::remove(model_path);

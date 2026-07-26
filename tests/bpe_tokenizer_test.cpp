@@ -193,13 +193,26 @@ int main() {
 
         const auto model_path = std::filesystem::temp_directory_path() /
                                 "cgpt_bpe_tokenizer_test.bin";
-        tokenizer.save(model_path);
+        tokenizer.save(model_path, bpe::TokenizerFormat::Binary);
         const bpe::BpeTokenizer loaded = bpe::BpeTokenizer::load(model_path);
         require(same_merges(loaded.merges(), tokenizer.merges()), "Loaded merges differ from saved merges");
         require(loaded.special_tokens() == tokenizer.special_tokens(),
                 "Loaded special tokens differ from saved tokens");
         require(loaded.encode(text) == ids, "Loaded tokenizer produced different IDs");
         std::filesystem::remove(model_path);
+
+        const auto huggingface_path = std::filesystem::temp_directory_path() /
+                                      "cgpt_bpe_tokenizer_test.json";
+        tokenizer.save(huggingface_path);
+        const bpe::BpeTokenizer huggingface =
+            bpe::BpeTokenizer::load(huggingface_path);
+        require(same_merges(huggingface.merges(), tokenizer.merges()),
+                "Hugging Face loaded merges differ from saved merges");
+        require(huggingface.special_tokens() == tokenizer.special_tokens(),
+                "Hugging Face loaded special tokens differ from saved tokens");
+        require(huggingface.encode(text) == ids,
+                "Hugging Face loaded tokenizer produced different IDs");
+        std::filesystem::remove(huggingface_path);
 
         expect_throw([] {
             bpe::TrainerConfig invalid;
@@ -241,7 +254,7 @@ int main() {
 
         const auto truncated_path = std::filesystem::temp_directory_path() /
                                     "cgpt_bpe_truncated.bin";
-        tokenizer.save(truncated_path);
+        tokenizer.save(truncated_path, bpe::TokenizerFormat::Binary);
         {
             std::ifstream input(truncated_path, std::ios::binary);
             std::string bytes((std::istreambuf_iterator<char>(input)), {});

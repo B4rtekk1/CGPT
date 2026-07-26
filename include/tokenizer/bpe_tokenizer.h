@@ -23,6 +23,12 @@ namespace bpe {
         LowMemoryStreaming = 1
     };
 
+    enum class TokenizerFormat : std::uint8_t {
+        Auto = 0,
+        HuggingFaceJson = 1,
+        Binary = 2
+    };
+
     struct TrainerConfig {
         std::size_t vocab_size = 32'000;
         std::size_t min_pair_frequency = 2;
@@ -103,11 +109,18 @@ namespace bpe {
 
         [[nodiscard]] std::string decode(std::span<const TokenId> ids) const;
 
-        void save(const std::filesystem::path& path) const;
+        // HuggingFaceJson is the default so save() produces a portable
+        // tokenizer.json. Binary remains available for legacy CGPT models.
+        void save(
+            const std::filesystem::path& path,
+            TokenizerFormat format = TokenizerFormat::HuggingFaceJson) const;
         // Export the same IDs and merge ranks in Hugging Face tokenizer.json
         // form so external ByteLevel-BPE runtimes such as GigaToken can load it.
         void save_huggingface_json(const std::filesystem::path& path) const;
-        [[nodiscard]] static BpeTokenizer load(const std::filesystem::path& path);
+        // Auto detects tokenizer.json and the legacy BPETOK binary format.
+        [[nodiscard]] static BpeTokenizer load(
+            const std::filesystem::path& path,
+            TokenizerFormat format = TokenizerFormat::Auto);
 
         [[nodiscard]] std::size_t vocab_size() const noexcept;
         [[nodiscard]] const std::vector<MergeRule>& merges() const noexcept;
@@ -147,6 +160,11 @@ namespace bpe {
             TokenId right,
             unsigned dense_limit_bits) const noexcept;
         [[nodiscard]] bool is_special(TokenId id) const noexcept;
+        void save_binary(const std::filesystem::path& path) const;
+        [[nodiscard]] static BpeTokenizer load_binary(
+            const std::filesystem::path& path);
+        [[nodiscard]] static BpeTokenizer load_huggingface_json(
+            const std::filesystem::path& path);
 
         PretokenizerMode pretokenizer_mode_ = PretokenizerMode::GptLike;
         std::vector<std::string> special_tokens_;
