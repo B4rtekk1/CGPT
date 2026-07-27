@@ -1,3 +1,11 @@
+/**
+ * @file swiglu.cu
+ * @brief CUDA implementation of the SwiGLU activation.
+ *
+ * Both separated-input (`gate`, `up`) and fused-input (`gate_up`) layouts are supported.
+ * FP16 and BF16 use packed two-element vector paths whenever the last dimension permits vector access.
+ */
+
 #include "ops/swiglu.h"
 
 #include "core/cuda_check.h"
@@ -15,6 +23,7 @@ namespace {
     constexpr int THREADS_PER_BLOCK = 256;
     constexpr int MAX_BLOCKS_PER_ROW = 32;
 
+    /** @brief Converts supported CUDA scalar types to and from FP32 arithmetic. */
     template<typename T>
     struct CudaTypeTraits;
 
@@ -51,10 +60,19 @@ namespace {
         }
     };
 
+    /**
+     * @brief Computes the SiLU activation using the CUDA fast exponential.
+     * @param value Input value.
+     * @return `value / (1 + exp(-value))`.
+     */
     __device__ __forceinline__ float silu(const float value) {
         return value / (1.0f + __expf(-value));
     }
 
+    /**
+     * @brief Scalar SwiGLU kernel for separate gate and up tensors.
+     * @tparam T Tensor element type.
+     */
     template<typename T>
     __global__ void swiglu_separate_scalar_kernel(
         T* __restrict__ output,
@@ -75,6 +93,7 @@ namespace {
         }
     }
 
+    /** @brief Packed FP16 SwiGLU kernel for separate gate and up tensors, */
     __global__ void swiglu_separate_half2_kernel(
         half2* __restrict__ output,
         const half2* __restrict__ gate,
@@ -98,6 +117,7 @@ namespace {
         }
     }
 
+    /** @brief Packed BF16 SwiGLU kernel for separate gate a nd up tensors.*/
     __global__ void swiglu_separate_bfloat162_kernel(
         __nv_bfloat162* __restrict__ output,
         const __nv_bfloat162* __restrict__ gate,
@@ -121,6 +141,10 @@ namespace {
         }
     }
 
+    /**
+     * @brief Scalar SwiGLU kernel for fused `[gate, up]` rows.
+     * @tparam T Tensor element type.
+     */
     template<typename T>
     __global__ void swiglu_fused_scalar_kernel(
         T* __restrict__ output,
@@ -147,6 +171,7 @@ namespace {
         }
     }
 
+    /** @brief Packed FP16 SwiGLU kernel for fused `[gate, up]` rows. */
     __global__ void swiglu_fused_half2_kernel(
         half2* __restrict__ output,
         const half2* __restrict__ gate_up,
@@ -172,6 +197,7 @@ namespace {
         }
     }
 
+    /** @brief Packed BF16 SwiGLU kernel for fused `[gate, up]` rows. */
     __global__ void swiglu_fused_bfloat162_kernel(
         __nv_bfloat162* __restrict__ output,
         const __nv_bfloat162* __restrict__ gate_up,
@@ -197,12 +223,14 @@ namespace {
         }
     }
 
+    /** @brief Returns capped one-dimensional grid size for an elementwise kernel. */
     [[nodiscard]] int get_block_count(const std::uint32_t element_count) {
         const std::uint32_t blocks =
             (element_count + THREADS_PER_BLOCK - 1U) / THREADS_PER_BLOCK;
         return static_cast<int>(std::min<std::uint32_t>(blocks, 65535U));
     }
 
+    /** @brief Returns the number of x-dimensional blocks assigned to each row. */
     [[nodiscard]] int get_blocks_per_row(const std::uint32_t row_size) {
         const std::uint32_t blocks =
             (row_size + THREADS_PER_BLOCK - 1U) / THREADS_PER_BLOCK;
@@ -214,6 +242,10 @@ namespace {
         );
     }
 
+    /**
+     * @brief Converts a size to 32-bit indexing after an overflow check.
+     * @throws std::overflow_error When the value exceeds `uint32_t`.
+     */
     [[nodiscard]] std::uint32_t checked_u32(
         const std::size_t value,
         const char* const description
@@ -227,6 +259,7 @@ namespace {
         return static_cast<std::uint32_t>(value);
     }
 
+    /** @brief Validates the separate-input SwiGLU tensor contract. */
     void validate_separate_tensors(
         const Tensor& output,
         const Tensor& gate,
@@ -257,6 +290,7 @@ namespace {
         }
     }
 
+    /** @brief Validates the fused-input SwiGLU tensor contract. */
     void validate_fused_tensors(
         const Tensor& output,
         const Tensor& gate_up
@@ -328,6 +362,7 @@ namespace {
     }
 
     template<typename T>
+    /** @brief Launches the scalar separate-input implementation. */
     void launch_separate_scalar(
         Tensor& output,
         const Tensor& gate,
@@ -350,6 +385,7 @@ namespace {
         );
     }
 
+    /** @brief Launches the packed FP16 separate-input implementation. */
     void launch_separate_half2(
         Tensor& output,
         const Tensor& gate,
@@ -372,6 +408,7 @@ namespace {
         );
     }
 
+    /** @brief Launches the packed BF16 separate-input implementation. */
     void launch_separate_bfloat162(
         Tensor& output,
         const Tensor& gate,
@@ -395,6 +432,7 @@ namespace {
     }
 
     template<typename T>
+    /** @brief Launches the scalar fused-input implementation. */
     void launch_fused_scalar(
         Tensor& output,
         const Tensor& gate_up,
@@ -419,6 +457,7 @@ namespace {
         );
     }
 
+    /** @brief Launches the packed FP16 fused-input implementation. */
     void launch_fused_half2(
         Tensor& output,
         const Tensor& gate_up,
@@ -443,6 +482,7 @@ namespace {
         );
     }
 
+    /** @brief Launches the packed BF16 fused-input implementation. */
     void launch_fused_bfloat162(
         Tensor& output,
         const Tensor& gate_up,
@@ -468,6 +508,16 @@ namespace {
     }
 }
 
+/**
+ * @brief Applies SwiGLU to separate gate and up tensors.
+ *
+ * Computes `output = SiLU(gate) * up` elementwise.
+ *
+ * @param output Destination tensor.
+ * @param gate Gate projection tensor.
+ * @param up Up projection tensor.
+ * @param stream CUDA stream used for asynchronous execution.
+ */
 void swiglu_forward(
     Tensor& output,
     const Tensor& gate,
@@ -510,6 +560,16 @@ void swiglu_forward(
     CUDA_CHECK(cudaGetLastError());
 }
 
+/**
+ * @brief Applies SwiGLU to a fused `[gate, up]` tensor.
+ *
+ * The final dimension of `gate_up` must contain two equally sized contiguous
+ * halves. The output final dimension equals one half of the input dimension.
+ *
+ * @param output Destination tensor.
+ * @param gate_up Fused gate/up tensor.
+ * @param stream CUDA stream used for asynchronous execution.
+ */
 void swiglu_forward(
     Tensor& output,
     const Tensor& gate_up,

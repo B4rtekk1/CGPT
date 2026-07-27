@@ -16,7 +16,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -55,7 +54,7 @@ void require_same_device(const Tensor& a, const Tensor& b) {
  * @param layout Matrix layout descriptor to configure.
  */
 void set_row_major(cublasLtMatrixLayout_t layout) {
-    const cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+    constexpr cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
     CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
         layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
 }
@@ -200,7 +199,7 @@ public:
         CUBLAS_CHECK(cublasLtMatmulDescCreate(
             &operation_, compute_type, CUDA_R_32F));
 
-        const cublasOperation_t transpose_weight = CUBLAS_OP_T;
+        constexpr cublasOperation_t transpose_weight = CUBLAS_OP_T;
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
             operation_,
             CUBLASLT_MATMUL_DESC_TRANSB,
@@ -229,7 +228,7 @@ public:
                 sizeof(transpose_weight)));
 
             fused_bias_supported_ = true;
-            const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+            constexpr cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
             CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
                 operation_,
                 CUBLASLT_MATMUL_DESC_EPILOGUE,
@@ -367,7 +366,7 @@ public:
                 stream);
         };
 
-        const cublasLtMatmulDesc_t active_operation =
+        cublasLtMatmulDesc_t active_operation =
             bias != nullptr && !fused_bias_supported_
                 ? unfused_operation_
                 : operation_;
