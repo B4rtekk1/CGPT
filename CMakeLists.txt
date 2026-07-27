@@ -54,6 +54,7 @@ endfunction()
 add_cgpt_test(rmsnorm_test tests/rmsnorm_test.cu cgpt_core)
 add_cgpt_test(linear_test tests/linear_test.cu cgpt_core)
 add_cgpt_test(swiglu_test tests/swiglu_test.cu cgpt_core)
+add_cgpt_test(rope_test tests/rope_test.cu cgpt_core)
 add_cgpt_test(tensor_test tests/tensor_test.cu cgpt_core)
 add_cgpt_test(device_buffer_test tests/device_buffer_test.cu cgpt_core)
 add_cgpt_test(gpu_buffer_test tests/gpu_buffer_test.cu cgpt_core)
@@ -62,7 +63,7 @@ add_cgpt_test(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp cgpt_tokenizer)
 add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_tokenizer)
 
 set_tests_properties(
-        rmsnorm_test linear_test swiglu_test tensor_test device_buffer_test gpu_buffer_test dtype_test bpe_tokenizer_test
+        rmsnorm_test linear_test swiglu_test rope_test tensor_test device_buffer_test gpu_buffer_test dtype_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
 
 set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuda_check.h"
+#include <cublasLt.h>
 #include <cublas_v2.h>
 
 #include "device_guard.h"

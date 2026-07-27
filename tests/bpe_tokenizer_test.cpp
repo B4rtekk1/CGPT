@@ -70,6 +70,87 @@ namespace {
         }
         return tokens;
     }
+
+    void test_batch_flat_and_cache_options(const bpe::BpeTokenizer& tokenizer) {
+        const std::vector<std::string> owned = {
+            "short", "a deliberately longer document for scheduling", "", "<bos>x<eos>"};
+        std::vector<std::string_view> views;
+        views.reserve(owned.size());
+        for (const std::string& text : owned) views.emplace_back(text);
+
+        const bpe::EncodeOptions uncached{.cache_entries = 0, .cache_max_input_bytes = 0};
+        const auto from_owned = tokenizer.encode_batch(owned, 3, uncached);
+        const auto from_views = tokenizer.encode_batch(views, 3, uncached);
+        require(from_owned == from_views, "Both batch API overloads must agree");
+
+        const bpe::EncodedBatch flat = tokenizer.encode_batch_flat(views, 3, uncached);
+        require(flat.offsets.size() == views.size() + 1 && flat.offsets.front() == 0,
+                "Flat batch offsets have an invalid shape");
+        for (std::size_t index = 0; index < views.size(); ++index) {
+            require(flat.offsets[index] <= flat.offsets[index + 1],
+                    "Flat batch offsets are not monotonic");
+            const std::span<const bpe::TokenId> item(
+                flat.tokens.data() + flat.offsets[index],
+                flat.offsets[index + 1] - flat.offsets[index]);
+            require(std::vector<bpe::TokenId>(item.begin(), item.end()) == from_views[index],
+                    "Flat batch tokens differ from regular batch encoding");
+        }
+        require(flat.offsets.back() == flat.tokens.size(),
+                "Flat batch offsets do not cover all tokens");
+
+        const std::span<const std::string_view> empty;
+        const auto empty_flat = tokenizer.encode_batch_flat(empty);
+        require(empty_flat.tokens.empty() && empty_flat.offsets == std::vector<std::size_t>{0},
+                "Empty flat batch has invalid output");
+    }
+
+    void test_low_memory_and_pretokenizer_modes() {
+        const std::string corpus = "alpha alpha beta beta 123456 punctuation! alpha beta";
+        bpe::TrainerConfig low_memory;
+        low_memory.vocab_size = 264;
+        low_memory.min_pair_frequency = 2;
+        low_memory.mode = bpe::TrainerMode::LowMemoryStreaming;
+        low_memory.low_memory_merges_per_pass = 2;
+        low_memory.low_memory_dense_vocab_limit = 512;
+
+        std::istringstream stream(corpus);
+        const bpe::BpeTokenizer tokenizer =
+            bpe::BpeTokenizer::train(stream, low_memory, 5);
+        const std::string text = "<bos>alpha 123! beta<eos>";
+        require(tokenizer.decode(tokenizer.encode(text)) == text,
+                "Low-memory tokenizer round-trip failed");
+        require(tokenizer.merges().size() > 0,
+                "Low-memory tokenizer did not train any merges");
+
+        bpe::TrainerConfig none = low_memory;
+        none.mode = bpe::TrainerMode::ExactInMemory;
+        none.pretokenizer = bpe::PretokenizerMode::None;
+        const bpe::BpeTokenizer no_pretokenizer =
+            bpe::BpeTokenizer::train({"ab ab ab"}, none);
+        require(no_pretokenizer.pretokenizer_mode() == bpe::PretokenizerMode::None,
+                "Tokenizer did not retain its pretokenizer mode");
+        require(no_pretokenizer.decode(no_pretokenizer.encode("ab ab")) == "ab ab",
+                "Tokenizer without pretokenization did not round-trip");
+
+        const auto binary_path = std::filesystem::temp_directory_path() /
+                                 "cgpt_bpe_none_pretokenizer.bin";
+        no_pretokenizer.save(binary_path, bpe::TokenizerFormat::Binary);
+        const auto reloaded = bpe::BpeTokenizer::load(binary_path, bpe::TokenizerFormat::Binary);
+        require(reloaded.pretokenizer_mode() == bpe::PretokenizerMode::None,
+                "Binary model lost the pretokenizer mode");
+        std::filesystem::remove(binary_path);
+
+        expect_throw([&] {
+            no_pretokenizer.save("ignored.json", bpe::TokenizerFormat::Auto);
+        }, "Saving with Auto format was accepted");
+        expect_throw([] {
+            bpe::TrainerConfig invalid;
+            invalid.mode = bpe::TrainerMode::LowMemoryStreaming;
+            invalid.low_memory_merges_per_pass = 0;
+            std::istringstream input("text");
+            (void)bpe::BpeTokenizer::train_low_memory(input, invalid, 16);
+        }, "Zero low-memory merges per pass was accepted");
+    }
 }
 
 int main() {
@@ -159,6 +240,8 @@ int main() {
             require(batch[i] == tokenizer.encode(batch_input[i]),
                     "Batch encoder differs from scalar encoding");
         }
+        test_batch_flat_and_cache_options(tokenizer);
+        test_low_memory_and_pretokenizer_modes();
 
         std::istringstream stream(corpus[0] + corpus[1]);
         bpe::TrainerConfig streaming_config = config;
