@@ -85,12 +85,6 @@ constexpr std::size_t dtype_size(const Dtype dtype) {
     throw std::invalid_argument("Dtype has no CUDA mapping");
 }
 
-// Backwards-compatible spelling retained for existing callers.
-[[deprecated("use to_cuda_dtype")]]
-[[nodiscard]] constexpr cudaDataType_t to_cuda_Dtype(const Dtype dtype) {
-    return to_cuda_dtype(dtype);
-}
-
 enum class ComputeType {
     F32,
     TF32

@@ -267,7 +267,7 @@ void test_preallocated_output() {
 void test_device_type() {
     Tensor cpu_tensor({2, 3}, DeviceType::CPU);
     if (cpu_tensor.device_type() != DeviceType::CPU ||
-        cpu_tensor.deviceType() != DeviceType::CPU) {
+        cpu_tensor.device_type() != DeviceType::CPU) {
         std::cerr << "Tensor did not preserve CPU device type\n";
         throw std::runtime_error("Tensor did not preserve CPU device type");
     }

@@ -127,10 +127,6 @@ public:
         return device_type_;
     }
 
-    [[nodiscard]] DeviceType deviceType() const noexcept {
-        return device_type();
-    }
-
     [[nodiscard]] Dtype dtype() const noexcept {
         return dtype_;
     }

@@ -35,7 +35,6 @@
 #include <mma.h>
 
 #include <cmath>
-#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -114,9 +113,9 @@ __device__ __forceinline__ void load_rows_f16(
 
     auto* destination_vector = reinterpret_cast<uint4*>(destination);
 
-    for (int vector_index = threadIdx.x;
+    for (int vector_index = static_cast<int>(threadIdx.x);
          vector_index < kVectorCount;
-         vector_index += blockDim.x) {
+         vector_index += static_cast<int>(blockDim.x)) {
         const int row = vector_index / kVectorsPerRow;
         const int column_vector = vector_index % kVectorsPerRow;
         const int source_row = first_row + row;
@@ -167,9 +166,9 @@ __device__ __forceinline__ void load_kv_rows_f16(
     auto* key_shared_vector = reinterpret_cast<uint4*>(key_shared);
     auto* value_shared_vector = reinterpret_cast<uint4*>(value_shared);
 
-    for (int vector_index = threadIdx.x;
+    for (int vector_index = static_cast<int>(threadIdx.x);
          vector_index < kVectorCount;
-         vector_index += blockDim.x) {
+         vector_index += static_cast<int>(blockDim.x)) {
         const int row = vector_index / kVectorsPerRow;
         const int column_vector = vector_index % kVectorsPerRow;
         const int source_row = first_row + row;
@@ -276,10 +275,8 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
         static_cast<std::int64_t>(num_kv_heads) * HeadDim;
 
     extern __shared__ __align__(16) unsigned char shared_raw[];
-    unsigned char* ptr = shared_raw;
-
-    auto* query_shared = reinterpret_cast<__half*>(ptr);
-    ptr += BlockM * HeadDim * sizeof(__half);
+    auto* query_shared = reinterpret_cast<__half*>(shared_raw);
+    auto* ptr = shared_raw + BlockM * HeadDim * sizeof(__half);
 
     auto* key_shared = reinterpret_cast<__half*>(ptr);
     ptr += kBlockN * HeadDim * sizeof(__half);
@@ -311,12 +308,12 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
         query_sequence,
         query_row_stride);
 
-    for (int index = threadIdx.x;
+    for (int index = static_cast<int>(threadIdx.x);
          index < BlockM * HeadDim;
          index += kThreads) {
         output_accumulator[index] = __float2half_rn(0.0F);
     }
-    for (int row = threadIdx.x; row < BlockM; row += kThreads) {
+    for (int row = static_cast<int>(threadIdx.x); row < BlockM; row += kThreads) {
         running_max[row] = -INFINITY;
         running_sum[row] = 0.0F;
     }
@@ -327,8 +324,8 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
               query_position_offset + query_begin + BlockM)
         : key_value_sequence;
 
-    const int warp = threadIdx.x / kWarpSize;
-    const int lane = threadIdx.x & (kWarpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp_row_begin = warp * 16;
     float* warp_scores = scores + warp_row_begin * kBlockN;
     __half* warp_probabilities =
@@ -491,7 +488,7 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
         __syncthreads();
     }
 
-    for (int index = threadIdx.x;
+    for (int index = static_cast<int>(threadIdx.x);
          index < BlockM * HeadDim;
          index += kThreads) {
         const int row = index / HeadDim;
@@ -588,10 +585,8 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
          + kv_head) * HeadDim;
 
     extern __shared__ __align__(16) unsigned char shared_raw[];
-    unsigned char* ptr = shared_raw;
-
-    auto* query_shared = reinterpret_cast<__half*>(ptr);
-    ptr += GroupSize * kBlockM * HeadDim * sizeof(__half);
+    auto* query_shared = reinterpret_cast<__half*>(shared_raw);
+    auto* ptr = shared_raw + GroupSize * kBlockM * HeadDim * sizeof(__half);
     auto* key_shared = reinterpret_cast<__half*>(ptr);
     ptr += kN * HeadDim * sizeof(__half);
     auto* value_shared = reinterpret_cast<__half*>(ptr);
@@ -611,7 +606,7 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
     constexpr int kVectorsPerRow = HeadDim / 8;
     constexpr int kQueryVectors = GroupSize * kBlockM * kVectorsPerRow;
     auto* query_shared_vec = reinterpret_cast<uint4*>(query_shared);
-    for (int vector_index = threadIdx.x;
+    for (int vector_index = static_cast<int>(threadIdx.x);
          vector_index < kQueryVectors;
          vector_index += kThreads) {
         const int head_local = vector_index / (kBlockM * kVectorsPerRow);
@@ -633,10 +628,10 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
     }
 
     constexpr int kStateElements = GroupSize * kBlockM * HeadDim;
-    for (int index = threadIdx.x; index < kStateElements; index += kThreads) {
+    for (int index = static_cast<int>(threadIdx.x); index < kStateElements; index += kThreads) {
         output_accumulator[index] = 0.0F;
     }
-    for (int row = threadIdx.x;
+    for (int row = static_cast<int>(threadIdx.x);
          row < GroupSize * kBlockM;
          row += kThreads) {
         running_max[row] = -INFINITY;
@@ -649,8 +644,8 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
               query_position_offset + query_begin + kBlockM)
         : key_value_sequence;
 
-    const int warp = threadIdx.x / kWarpSize;
-    const int lane = threadIdx.x & (kWarpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int state_row_begin = warp * kBlockM;
     __half* warp_query = query_shared + warp * kBlockM * HeadDim;
     float* warp_scores = scores + warp * kBlockM * kN;
@@ -787,7 +782,7 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
     }
 
     constexpr int kOutputElements = GroupSize * kBlockM * HeadDim;
-    for (int index = threadIdx.x; index < kOutputElements; index += kThreads) {
+    for (int index = static_cast<int>(threadIdx.x); index < kOutputElements; index += kThreads) {
         const int head_local = index / (kBlockM * HeadDim);
         const int within_head = index % (kBlockM * HeadDim);
         const int row = within_head / HeadDim;
@@ -1089,7 +1084,7 @@ void validate_kernel_integer_ranges(
     std::size_t key_value_sequence,
     const FlashAttentionOptions& options
 ) {
-    constexpr std::size_t kIntMax =
+    constexpr auto kIntMax =
         static_cast<std::size_t>(std::numeric_limits<int>::max());
     if (batch_size > kIntMax
         || query_sequence > kIntMax

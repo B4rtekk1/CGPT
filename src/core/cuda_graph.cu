@@ -60,7 +60,7 @@ CudaGraph::~CudaGraph() noexcept {
 }
 
 void CudaGraph::capture(
-    const cudaStream_t stream,
+    cudaStream_t stream,
     const std::function<void()>& capture_body,
     const cudaStreamCaptureMode mode
 ) {
@@ -146,7 +146,7 @@ void CudaGraph::instantiate(cudaGraph_t graph) {
     executable_ = executable;
 }
 
-void CudaGraph::launch(const cudaStream_t stream) const {
+void CudaGraph::launch(cudaStream_t stream) const {
     if (executable_ == nullptr) {
         throw std::logic_error(
             "CudaGraph::launch: graph has not been instantiated"
@@ -159,7 +159,7 @@ void CudaGraph::launch(const cudaStream_t stream) const {
     );
 }
 
-void CudaGraph::upload(const cudaStream_t stream) const {
+void CudaGraph::upload(cudaStream_t stream) const {
     if (executable_ == nullptr) {
         throw std::logic_error(
             "CudaGraph::upload: graph has not been instantiated"

@@ -14,6 +14,7 @@ set(CMAKE_CUDA_ARCHITECTURES 86-real CACHE STRING "CUDA architectures")
 set(CGPT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_library(cgpt_core STATIC
+        src/ops/embedding.cu
         src/ops/linear.cu
         src/ops/rmsnorm.cu
         src/ops/swiglu.cu
@@ -46,9 +47,6 @@ if (MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
             COMPILE_OPTIONS "/arch:AVX2")
 endif()
 
-add_executable(CGPT src/main.cu)
-target_link_libraries(CGPT PRIVATE cgpt_core cgpt_tokenizer)
-
 function(add_cgpt_test name source dependency)
     add_executable(${name} ${source})
     target_link_libraries(${name} PRIVATE ${dependency})
@@ -64,15 +62,16 @@ add_cgpt_test(swiglu_test tests/swiglu_test.cu cgpt_core)
 add_cgpt_test(rope_test tests/rope_test.cu cgpt_core)
 add_cgpt_test(tensor_test tests/tensor_test.cu cgpt_core)
 add_cgpt_test(device_buffer_test tests/device_buffer_test.cu cgpt_core)
-add_cgpt_test(gpu_buffer_test tests/gpu_buffer_test.cu cgpt_core)
 add_cgpt_test(dtype_test tests/dtype_test.cu cgpt_core)
 add_cgpt_test(flash_attention_test tests/flash_attention_test.cu cgpt_core)
+add_cgpt_test(embedding_test tests/embedding_test.cu cgpt_core)
+add_cgpt_test(cuda_graph_test tests/cuda_graph_test.cu cgpt_core)
 add_cgpt_test(transformer_block_test tests/transformer_block_test.cu cgpt_core)
 add_cgpt_test(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp cgpt_tokenizer)
 add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_tokenizer)
 
 set_tests_properties(
-        rmsnorm_test linear_test swiglu_test rope_test tensor_test device_buffer_test gpu_buffer_test dtype_test flash_attention_test transformer_block_test bpe_tokenizer_test
+        rmsnorm_test linear_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cuda_graph_test transformer_block_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
 
 set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES

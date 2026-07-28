@@ -44,7 +44,7 @@ void test_dtype_names_and_cuda_mappings() {
     assert(to_cuda_dtype(Dtype::BF16) == CUDA_R_16BF);
     assert(to_cuda_dtype(Dtype::F32) == CUDA_R_32F);
     assert(to_cuda_dtype(Dtype::I32) == CUDA_R_32I);
-    assert(to_cuda_Dtype(Dtype::F32) == CUDA_R_32F);
+    assert(to_cuda_dtype(Dtype::F32) == CUDA_R_32F);
 }
 
 void test_checked_byte_size() {
