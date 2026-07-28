@@ -142,6 +142,26 @@ public:
         return shape_[axis];
     }
 
+    /**
+     * @brief Changes tensor metadata without moving or reallocating storage.
+     *
+     * The new shape must contain exactly the same number of elements as the
+     * current shape. Because Tensor storage is contiguous, every valid reshape
+     * remains contiguous as well.
+     *
+     * @param new_shape Requested tensor shape.
+     * @throws std::invalid_argument If the shape is empty, contains a zero,
+     *         overflows size_t, or changes the number of elements.
+     */
+    void reshape(std::vector<std::size_t> new_shape) {
+        const std::size_t new_element_count = element_count(new_shape);
+        if (new_element_count != element_count_) {
+            throw std::invalid_argument(
+                "Tensor::reshape cannot change the number of elements");
+        }
+        shape_ = std::move(new_shape);
+    }
+
     [[nodiscard]] static Tensor empty(
         std::vector<std::size_t> shape,
         DeviceType device_type = DeviceType::CUDA,

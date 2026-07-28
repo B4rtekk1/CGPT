@@ -1,10 +1,11 @@
-#include "../include/core/tensor.h"
-#include "../include/core/cuda_check.h"
+#include "core/tensor.h"
+#include "core/cuda_check.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -156,6 +157,8 @@ Tensor Tensor::zeros(
         // cudaMemset is faster than a kernel for zeros.
         CUDA_CHECK(cudaMemsetAsync(
             result.raw_data(), 0, result.nbytes(), stream));
+    } else {
+        std::memset(result.raw_data(), 0, result.nbytes());
     }
 
     return result;

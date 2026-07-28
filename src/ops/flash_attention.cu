@@ -1,3 +1,31 @@
+/**
+ * @file flash_attention.cu
+ * @brief FP16 Tensor Core implementation of tiled Flash Attention for GQA.
+ *
+ * This translation unit implements the forward pass of scaled dot-product
+ * attention without materializing the full @f$QK^T@f$ matrix in global memory.
+ * Keys and values are streamed through shared-memory tiles, while each query
+ * row maintains an online softmax state consisting of a running maximum,
+ * normalization sum, and output accumulator.
+ *
+ * Supported tensor layouts:
+ * @code
+ * query:  [batch, query_sequence, query_heads, head_dim]
+ * key:    [batch, key_value_sequence, kv_heads, head_dim]
+ * value:  [batch, key_value_sequence, kv_heads, head_dim]
+ * output: [batch, query_sequence, query_heads, head_dim]
+ * @endcode
+ *
+ * The implementation currently supports:
+ * - FP16 input and output tensors,
+ * - head dimensions 32, 64, and 128,
+ * - grouped-query attention where query_heads is divisible by kv_heads,
+ * - optional causal masking,
+ * - prefilling and cached decoding through query_position_offset.
+ *
+ * @note Tensor storage must be contiguous in the documented row-major layout.
+ * @note The kernels use WMMA and therefore require a Tensor Core-capable GPU.
+ */
 #include "ops/flash_attention.h"
 
 #include "core/cuda_check.h"
@@ -14,10 +42,22 @@
 
 namespace {
 
+/// Number of threads in a CUDA warp.
 constexpr int kWarpSize = 32;
+
+/// Number of K/V rows processed per iteration by the generic per-head kernel.
 constexpr int kBlockN = 16;
+
+/// Number of K/V rows processed per iteration by the grouped 4:1 GQA kernel.
 constexpr int kGroupedBlockN = 32;
 
+/**
+ * @brief Computes a warp-wide sum using shuffle-down instructions.
+ *
+ * @param value Value contributed by the calling lane.
+ * @return The complete sum in lane 0. Values returned by other lanes are
+ *         partial and must not be used as the final reduction result.
+ */
 __device__ __forceinline__ float warp_reduce_sum(float value) {
     #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
@@ -26,6 +66,13 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
     return value;
 }
 
+/**
+ * @brief Computes a warp-wide maximum using shuffle-down instructions.
+ *
+ * @param value Value contributed by the calling lane.
+ * @return The complete maximum in lane 0. Values returned by other lanes are
+ *         partial and must not be used as the final reduction result.
+ */
 __device__ __forceinline__ float warp_reduce_max(float value) {
     #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
@@ -34,6 +81,25 @@ __device__ __forceinline__ float warp_reduce_max(float value) {
     return value;
 }
 
+/**
+ * @brief Cooperatively loads a rectangular FP16 tile into shared memory.
+ *
+ * Threads copy 16-byte vectors, corresponding to eight contiguous FP16 values.
+ * Rows beyond @p valid_rows are explicitly zero-filled, allowing callers to
+ * process a partial final query tile without separate boundary kernels.
+ *
+ * @tparam Rows Number of rows in the destination tile.
+ * @tparam HeadDim Number of FP16 elements in each row; must be divisible by 8.
+ * @param destination Shared-memory destination of size Rows * HeadDim.
+ * @param source Pointer to row zero of the selected tensor/head slice.
+ * @param first_row First logical source row requested by the tile.
+ * @param valid_rows Total number of valid rows in the source slice.
+ * @param source_row_stride Distance between consecutive source rows, in FP16
+ *        elements rather than bytes.
+ *
+ * @pre destination is aligned sufficiently for uint4 stores.
+ * @pre Every valid source row is aligned sufficiently for uint4 loads.
+ */
 template <int Rows, int HeadDim>
 __device__ __forceinline__ void load_rows_f16(
     __half* __restrict__ destination,
@@ -67,6 +133,23 @@ __device__ __forceinline__ void load_rows_f16(
     }
 }
 
+/**
+ * @brief Cooperatively loads matching K and V tiles into shared memory.
+ *
+ * Key and value rows use the same logical indices and stride. Invalid rows in
+ * the final tile are zero-filled. The attention mask still marks those rows as
+ * invalid, so the zero-fill exists only to make vectorized WMMA input safe.
+ *
+ * @tparam HeadDim Number of FP16 elements per attention head.
+ * @tparam Rows Number of K/V rows loaded in one iteration.
+ * @param key_shared Shared-memory key tile of size Rows * HeadDim.
+ * @param value_shared Shared-memory value tile of size Rows * HeadDim.
+ * @param key Pointer to row zero of the selected key head.
+ * @param value Pointer to row zero of the selected value head.
+ * @param first_row First K/V sequence position requested by the tile.
+ * @param valid_rows Total number of valid K/V rows.
+ * @param source_row_stride Distance between consecutive rows, in FP16 elements.
+ */
 template <int HeadDim, int Rows>
 __device__ __forceinline__ void load_kv_rows_f16(
     __half* __restrict__ key_shared,
@@ -107,6 +190,44 @@ __device__ __forceinline__ void load_kv_rows_f16(
     }
 }
 
+/**
+ * @brief Computes one tiled FP16 GQA attention forward pass per query head.
+ *
+ * Grid mapping:
+ * @code
+ * blockIdx.x -> (batch, query_head, query_tile)
+ * @endcode
+ * A CTA owns BlockM query rows for exactly one query head. Every warp owns 16
+ * of those rows and performs both matrix products with WMMA:
+ * @f$S = QK^T@f$ and @f$O = PV@f$.
+ *
+ * Keys and values are streamed in kBlockN-row tiles. For each query row, the
+ * kernel updates the numerically stable online-softmax recurrence:
+ * @f[
+ * m' = max(m, max(S_t)),
+ * l' = l exp(m-m') + sum(exp(S_t-m')),
+ * O' = O exp(m-m') + exp(S_t-m')V_t.
+ * @f]
+ * Final output is @f$O/l@f$. Therefore no full attention matrix is written to
+ * global memory.
+ *
+ * @tparam HeadDim Attention head width. Supported values: 32, 64, 128.
+ * @tparam BlockM Number of query rows owned by a CTA. Supported values: 16, 32,
+ *         64; current dispatch uses 64.
+ * @param output Contiguous FP16 tensor [B, Q, Hq, D].
+ * @param query Contiguous FP16 tensor [B, Q, Hq, D].
+ * @param key Contiguous FP16 tensor [B, K, Hkv, D].
+ * @param value Contiguous FP16 tensor [B, K, Hkv, D].
+ * @param batch_size Number of batches B.
+ * @param query_sequence Query sequence length Q.
+ * @param key_value_sequence Key/value sequence length K.
+ * @param num_query_heads Number of query heads Hq.
+ * @param num_kv_heads Number of key/value heads Hkv.
+ * @param scale Multiplicative score scale, normally 1/sqrt(D).
+ * @param causal Whether to mask keys to the right of each absolute query.
+ * @param query_position_offset Absolute position represented by query row zero;
+ *        used when Q contains only newly decoded tokens.
+ */
 template <int HeadDim, int BlockM>
 __global__ void flash_gqa_f16_tensor_core_kernel(
     __half* __restrict__ output,
@@ -318,7 +439,8 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
         }
         __syncwarp();
 
-        // P @ V. Again, every warp processes its own 16 query rows.
+        // Multiply the current probability tile by V. Each warp still owns
+        // the same 16 query rows, so no inter-warp accumulation is required.
         {
             using namespace nvcuda;
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
@@ -391,6 +513,40 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
 }
 
 
+/**
+ * @brief Specialized GQA kernel that reuses each K/V tile across a head group.
+ *
+ * Grid mapping:
+ * @code
+ * blockIdx.x -> (batch, kv_head, query_tile)
+ * warp       -> one query head associated with kv_head
+ * @endcode
+ *
+ * Unlike the generic kernel, a CTA owns all query heads mapped to one K/V head.
+ * K and V are therefore loaded once per 32-row sequence tile and consumed by
+ * four independent warps. Each warp maintains its own online-softmax state and
+ * output accumulator, so synchronization is required only around shared K/V
+ * tile replacement.
+ *
+ * This specialization is intentionally constrained to D=128 and a 4:1 GQA
+ * ratio. Its larger float accumulator improves numerical behavior but requires
+ * more dynamic shared memory than the generic path.
+ *
+ * @tparam HeadDim Must be 128.
+ * @tparam GroupSize Must be 4 query heads per K/V head.
+ * @param output Contiguous FP16 tensor [B, Q, Hq, D].
+ * @param query Contiguous FP16 tensor [B, Q, Hq, D].
+ * @param key Contiguous FP16 tensor [B, K, Hkv, D].
+ * @param value Contiguous FP16 tensor [B, K, Hkv, D].
+ * @param batch_size Number of batches B.
+ * @param query_sequence Query sequence length Q.
+ * @param key_value_sequence Key/value sequence length K.
+ * @param num_query_heads Number of query heads Hq.
+ * @param num_kv_heads Number of key/value heads Hkv.
+ * @param scale Multiplicative score scale, normally 1/sqrt(D).
+ * @param causal Whether to enable the causal mask.
+ * @param query_position_offset Absolute position represented by query row zero.
+ */
 template <int HeadDim, int GroupSize>
 __global__ __launch_bounds__(128, 1)
 void flash_gqa_grouped_f16_tensor_core_kernel(
@@ -653,6 +809,12 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
     }
 }
 
+/**
+ * @brief Computes dynamic shared-memory usage of the grouped GQA kernel.
+ *
+ * The returned size includes Q, K, V, score, probability, float output,
+ * temporary WMMA, running-maximum, and running-sum storage.
+ */
 template <int HeadDim, int GroupSize>
 constexpr std::size_t grouped_f16_shared_bytes() {
     constexpr int kBlockM = 16;
@@ -668,6 +830,13 @@ constexpr std::size_t grouped_f16_shared_bytes() {
          + static_cast<std::size_t>(GroupSize) * kBlockM * sizeof(float);
 }
 
+/**
+ * @brief Launches the grouped D=128, 4:1 GQA specialization.
+ *
+ * Configures opt-in dynamic shared memory when the specialization exceeds the
+ * legacy 48 KiB per-block limit. Launch errors are reported immediately through
+ * CUDA_CHECK; execution remains asynchronous with respect to the host.
+ */
 template <int HeadDim, int GroupSize>
 void launch_grouped_f16(
     Tensor& output,
@@ -726,6 +895,13 @@ void launch_grouped_f16(
     CUDA_CHECK(cudaGetLastError());
 }
 
+/**
+ * @brief Computes dynamic shared-memory usage of the generic tiled kernel.
+ *
+ * The returned size includes the query tile, one K/V tile, intermediate scores
+ * and probabilities, the FP16 online output accumulator, WMMA scratch space,
+ * and softmax statistics.
+ */
 template <int HeadDim, int BlockM>
 constexpr std::size_t tiled_f16_shared_bytes() {
     constexpr int kWarps = BlockM / 16;
@@ -740,6 +916,13 @@ constexpr std::size_t tiled_f16_shared_bytes() {
          + static_cast<std::size_t>(BlockM) * sizeof(float);
 }
 
+/**
+ * @brief Launches the generic per-query-head Tensor Core kernel.
+ *
+ * One CUDA block is created for every (batch, query head, query tile) tuple.
+ * The function only validates launch-size overflow; tensor contracts are checked
+ * by flash_gqa_attention_forward before dispatch.
+ */
 template <int HeadDim, int BlockM>
 void launch_tiled_f16(
     Tensor& output,
@@ -797,6 +980,12 @@ void launch_tiled_f16(
     CUDA_CHECK(cudaGetLastError());
 }
 
+/**
+ * @brief Selects the compile-time kernel specialization for a validated request.
+ *
+ * D=128 with exactly four query heads per K/V head uses the grouped kernel.
+ * All other supported configurations use the generic per-head kernel.
+ */
 void launch_tiled_f16_dispatch(
     Tensor& output,
     const Tensor& query,
@@ -844,10 +1033,12 @@ void launch_tiled_f16_dispatch(
     }
 }
 
+/// Returns true when a compiled Tensor Core specialization exists for head_dim.
 bool is_supported_head_dim(std::size_t head_dim) {
     return head_dim == 32U || head_dim == 64U || head_dim == 128U;
 }
 
+/** @brief Verifies the rank-four tensor contract used by all attention operands. */
 void validate_tensor(const Tensor& tensor, const char* name) {
     if (tensor.shape().size() != 4U) {
         throw std::invalid_argument(
@@ -856,6 +1047,12 @@ void validate_tensor(const Tensor& tensor, const char* name) {
     }
 }
 
+/**
+ * @brief Validates head topology and requirements of the implemented backend.
+ *
+ * This checks logical configuration only. Shapes, dtype, and causal sequence
+ * bounds are validated separately by the public entry point.
+ */
 void validate_options(const FlashAttentionOptions& options) {
     if (options.num_query_heads == 0U
         || options.num_kv_heads == 0U
@@ -880,6 +1077,12 @@ void validate_options(const FlashAttentionOptions& options) {
     }
 }
 
+/**
+ * @brief Ensures every value converted to int by a kernel launch is representable.
+ *
+ * Tensor address arithmetic itself uses 64-bit offsets; sequence dimensions and
+ * launch parameters are intentionally kept in 32-bit registers inside kernels.
+ */
 void validate_kernel_integer_ranges(
     std::size_t batch_size,
     std::size_t query_sequence,
@@ -902,6 +1105,46 @@ void validate_kernel_integer_ranges(
 
 } // namespace
 
+/**
+ * @brief Executes the FP16 forward pass of scaled dot-product GQA attention.
+ *
+ * The operation is equivalent to:
+ * @f[
+ * output = softmax(mask(query key^T * scale)) value
+ * @f]
+ * but computes attention in sequence tiles and never stores the complete score
+ * or probability matrix in global memory.
+ *
+ * Tensor layouts:
+ * @code
+ * query:  [B, Q, Hq,  D]
+ * key:    [B, K, Hkv, D]
+ * value:  [B, K, Hkv, D]
+ * output: [B, Q, Hq,  D]
+ * @endcode
+ *
+ * Query head h uses K/V head floor(h / (Hq / Hkv)). For causal attention, a
+ * query at local index q is allowed to read keys up to the absolute position
+ * query_position_offset + q. Consequently, cached decoding normally uses
+ * query_position_offset = K - Q.
+ *
+ * @param output Preallocated contiguous FP16 output tensor. Its shape must equal
+ *        the query shape. The tensor is written asynchronously on @p stream.
+ * @param query Contiguous FP16 query tensor [B, Q, Hq, D].
+ * @param key Contiguous FP16 key tensor [B, K, Hkv, D].
+ * @param value Contiguous FP16 value tensor with exactly the key shape.
+ * @param stream CUDA stream used for the kernel launch.
+ * @param options Attention topology, masking mode, score scale, and cache offset.
+ *
+ * @throws std::invalid_argument If rank, shape, dtype, head topology, supported
+ *         head dimension, Tensor Core mode, or causal bounds are invalid.
+ * @throws std::overflow_error If launch dimensions exceed 32-bit kernel limits
+ *         or the one-dimensional CUDA grid limit.
+ *
+ * @note If options.attention_scale <= 0, the function uses 1/sqrt(head_dim).
+ * @note The function checks launch errors but does not synchronize @p stream.
+ * @note output must not alias query, key, or value.
+ */
 void flash_gqa_attention_forward(
     Tensor& output,
     const Tensor& query,
