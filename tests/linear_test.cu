@@ -1,5 +1,6 @@
 #include "core/cuda_check.h"
 #include "ops/linear.h"
+#include "cuda_benchmark.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -172,6 +173,20 @@ void test_validation() {
     });
 }
 
+void benchmark_kernel() {
+    constexpr std::size_t kRows = 512;
+    constexpr std::size_t kInputFeatures = 4096;
+    constexpr std::size_t kOutputFeatures = 4096;
+    Tensor input({kRows, kInputFeatures}, Dtype::F16);
+    Tensor weight({kOutputFeatures, kInputFeatures}, Dtype::F16);
+    Tensor output({kRows, kOutputFeatures}, Dtype::F16);
+    const CublasLtContext context;
+
+    test::benchmark_cuda_launches("Linear kernel", [&](cudaStream_t stream) {
+        linear_forward(output, input, weight, context, stream);
+    });
+}
+
 } // namespace
 
 int main() {
@@ -183,6 +198,7 @@ int main() {
         test_reduced_precision(Dtype::F16, 2.0e-2f);
         test_reduced_precision(Dtype::BF16, 5.0e-2f);
         test_validation();
+        benchmark_kernel();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

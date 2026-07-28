@@ -1,5 +1,6 @@
 #include "core/cuda_check.h"
 #include "ops/rope.h"
+#include "cuda_benchmark.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -82,7 +83,7 @@ namespace {
         });
         expect_invalid_argument([] {
             Tensor q({1, 2, 1, 4}); Tensor k({1, 2, 1, 4});
-            Tensor c({2, 1}); Tensor s({2, 1});
+            Tensor c({2, 2}); Tensor s({2, 2});
             rope_forward(q, k, c, s, nullptr, RopeOptions{.rotary_dim = 2});
         });
         expect_invalid_argument([] {
@@ -93,6 +94,22 @@ namespace {
             rope_forward(q, k, c, s, nullptr);
         });
     }
+
+    void benchmark_kernel() {
+        constexpr std::size_t kBatchSize = 1;
+        constexpr std::size_t kSequenceLength = 512;
+        constexpr std::size_t kQueryHeads = 32;
+        constexpr std::size_t kKeyHeads = 8;
+        constexpr std::size_t kHeadDimension = 128;
+        Tensor query({kBatchSize, kSequenceLength, kQueryHeads, kHeadDimension}, Dtype::F16);
+        Tensor key({kBatchSize, kSequenceLength, kKeyHeads, kHeadDimension}, Dtype::F16);
+        Tensor cosine({kSequenceLength, kHeadDimension / 2}, Dtype::F16);
+        Tensor sine({kSequenceLength, kHeadDimension / 2}, Dtype::F16);
+
+        test::benchmark_cuda_launches("RoPE kernel", [&](cudaStream_t stream) {
+            rope_forward(query, key, cosine, sine, stream);
+        });
+    }
 }
 
 int main() {
@@ -101,6 +118,7 @@ int main() {
         test_rotation_and_partial_dimension(Dtype::F16, 3.0e-3f);
         test_rotation_and_partial_dimension(Dtype::BF16, 2.0e-2f);
         test_position_offset_and_validation();
+        benchmark_kernel();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

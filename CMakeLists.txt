@@ -18,12 +18,17 @@ add_library(cgpt_core STATIC
         src/ops/rmsnorm.cu
         src/ops/swiglu.cu
         src/ops/rope.cu
-        src/tensor.cu)
+        src/tensor.cu
+        src/ops/flash_attention.cu)
 
 target_include_directories(cgpt_core PUBLIC
         ${CGPT_INCLUDE_DIR}
         ${CGPT_INCLUDE_DIR}/core)
 target_link_libraries(cgpt_core PUBLIC CUDA::cudart CUDA::cublasLt)
+if (MSVC)
+    target_compile_options(cgpt_core PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+endif()
 set_target_properties(cgpt_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 set_target_properties(cgpt_core PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
@@ -59,11 +64,12 @@ add_cgpt_test(tensor_test tests/tensor_test.cu cgpt_core)
 add_cgpt_test(device_buffer_test tests/device_buffer_test.cu cgpt_core)
 add_cgpt_test(gpu_buffer_test tests/gpu_buffer_test.cu cgpt_core)
 add_cgpt_test(dtype_test tests/dtype_test.cu cgpt_core)
+add_cgpt_test(flash_attention_test tests/flash_attention_test.cu cgpt_core)
 add_cgpt_test(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp cgpt_tokenizer)
 add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_tokenizer)
 
 set_tests_properties(
-        rmsnorm_test linear_test swiglu_test rope_test tensor_test device_buffer_test gpu_buffer_test dtype_test bpe_tokenizer_test
+        rmsnorm_test linear_test swiglu_test rope_test tensor_test device_buffer_test gpu_buffer_test dtype_test flash_attention_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
 
 set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES

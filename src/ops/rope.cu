@@ -236,6 +236,82 @@ __global__ void rope_qk_kernel(
     }
 }
 
+
+/**
+ * @brief Specialized FP16 RoPE kernel for GQA [B, S, 32, 128] / [B, S, 8, 128].
+ *
+ * One block handles one token. The first 64 threads stage the token's cosine
+ * and sine coefficients in shared FP32 memory. All 256 threads then process
+ * the 40 heads across Q and K, giving ten rotary pairs per thread. This avoids
+ * the long per-thread head loops used by the generic kernel while preserving
+ * coefficient reuse.
+ */
+__global__ __launch_bounds__(256) void rope_qk_f16_32_8_128_kernel(
+    half* __restrict__ query,
+    half* __restrict__ key,
+    const half* __restrict__ cos_cache,
+    const half* __restrict__ sin_cache,
+    const std::uint32_t sequence_length,
+    const std::uint32_t position_offset
+) {
+    constexpr std::uint32_t QUERY_HEADS = 32U;
+    constexpr std::uint32_t KEY_HEADS = 8U;
+    constexpr std::uint32_t HEAD_DIM = 128U;
+    constexpr std::uint32_t PAIRS_PER_HEAD = 64U;
+    constexpr std::uint32_t TOTAL_HEADS = QUERY_HEADS + KEY_HEADS;
+    constexpr std::uint32_t WORK_PER_TOKEN = TOTAL_HEADS * PAIRS_PER_HEAD;
+
+    const std::uint32_t token = blockIdx.x;
+    const std::uint32_t sequence_index = token % sequence_length;
+    const std::size_t cache_base =
+        static_cast<std::size_t>(position_offset + sequence_index) *
+        PAIRS_PER_HEAD;
+
+    __shared__ float shared_cos[PAIRS_PER_HEAD];
+    __shared__ float shared_sin[PAIRS_PER_HEAD];
+
+    if (threadIdx.x < PAIRS_PER_HEAD) {
+        shared_cos[threadIdx.x] = __half2float(cos_cache[cache_base + threadIdx.x]);
+        shared_sin[threadIdx.x] = __half2float(sin_cache[cache_base + threadIdx.x]);
+    }
+    __syncthreads();
+
+    const std::size_t query_token_base =
+        static_cast<std::size_t>(token) * QUERY_HEADS * HEAD_DIM;
+    const std::size_t key_token_base =
+        static_cast<std::size_t>(token) * KEY_HEADS * HEAD_DIM;
+
+#pragma unroll
+    for (std::uint32_t work = threadIdx.x;
+         work < WORK_PER_TOKEN;
+         work += blockDim.x) {
+        const std::uint32_t pair = work & (PAIRS_PER_HEAD - 1U);
+        const std::uint32_t combined_head = work >> 6U;
+        const std::size_t pair_offset = static_cast<std::size_t>(pair) * 2U;
+
+        half* pair_pointer;
+        if (combined_head < QUERY_HEADS) {
+            pair_pointer = query + query_token_base +
+                static_cast<std::size_t>(combined_head) * HEAD_DIM + pair_offset;
+        } else {
+            const std::uint32_t key_head = combined_head - QUERY_HEADS;
+            pair_pointer = key + key_token_base +
+                static_cast<std::size_t>(key_head) * HEAD_DIM + pair_offset;
+        }
+
+        const half2 packed = *reinterpret_cast<const half2*>(pair_pointer);
+        const float2 value = __half22float2(packed);
+        const float cosine = shared_cos[pair];
+        const float sine = shared_sin[pair];
+
+        const float rotated_x = fmaf(-value.y, sine, value.x * cosine);
+        const float rotated_y = fmaf(value.x, sine, value.y * cosine);
+
+        *reinterpret_cast<half2*>(pair_pointer) =
+            __floats2half2_rn(rotated_x, rotated_y);
+    }
+}
+
 /**
  * @brief Converts a size value to @c uint32_t with overflow checking.
  *
@@ -561,11 +637,28 @@ void rope_forward(
             break;
 
         case Dtype::F16:
-            launch_rope<half>(
-                query, key, cos_cache, sin_cache, token_count,
-                sequence_length, head_dim, rotary_pair_count,
-                position_offset, stream
-            );
+            if (query.shape()[2] == 32U &&
+                key.shape()[2] == 8U &&
+                head_dim == 128U &&
+                rotary_pair_count == 64U &&
+                token_count <= MAX_PORTABLE_GRID_X) {
+                rope_qk_f16_32_8_128_kernel<<<
+                    static_cast<std::uint32_t>(token_count), 256U, 0, stream
+                >>>(
+                    static_cast<half*>(query.raw_data()),
+                    static_cast<half*>(key.raw_data()),
+                    static_cast<const half*>(cos_cache.raw_data()),
+                    static_cast<const half*>(sin_cache.raw_data()),
+                    sequence_length,
+                    position_offset
+                );
+            } else {
+                launch_rope<half>(
+                    query, key, cos_cache, sin_cache, token_count,
+                    sequence_length, head_dim, rotary_pair_count,
+                    position_offset, stream
+                );
+            }
             break;
 
         case Dtype::BF16:

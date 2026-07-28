@@ -16,7 +16,10 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
+#include <limits>
 #include <memory>
+#include <vector>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -260,7 +263,8 @@ public:
             &key.workspace_bytes,
             sizeof(key.workspace_bytes)));
 
-        cublasLtMatmulHeuristicResult_t heuristic{};
+        constexpr int max_algorithms = 32;
+        std::vector<cublasLtMatmulHeuristicResult_t> heuristics(max_algorithms);
         int returned_results = 0;
         const cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
             handle,
@@ -270,20 +274,27 @@ public:
             output_layout_,
             output_layout_,
             preference,
-            1,
-            &heuristic,
+            max_algorithms,
+            heuristics.data(),
             &returned_results);
         CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
 
-        if (heuristic_status == CUBLAS_STATUS_SUCCESS &&
-            returned_results > 0 &&
-            heuristic.state == CUBLAS_STATUS_SUCCESS) {
-            algorithm_ = heuristic.algo;
-            workspace_required_ = heuristic.workspaceSize;
-            workspace_.allocate(workspace_required_);
-            has_selected_algorithm_ = true;
-        } else if (heuristic_status != CUBLAS_STATUS_NOT_SUPPORTED &&
-                   heuristic_status != CUBLAS_STATUS_SUCCESS) {
+        if (heuristic_status == CUBLAS_STATUS_SUCCESS) {
+            std::size_t maximum_workspace = 0;
+            candidates_.reserve(static_cast<std::size_t>(returned_results));
+            for (int i = 0; i < returned_results; ++i) {
+                const auto& heuristic = heuristics[static_cast<std::size_t>(i)];
+                if (heuristic.state != CUBLAS_STATUS_SUCCESS ||
+                    heuristic.workspaceSize > key.workspace_bytes) {
+                    continue;
+                }
+                candidates_.push_back({heuristic.algo, heuristic.workspaceSize});
+                maximum_workspace = std::max(maximum_workspace, heuristic.workspaceSize);
+            }
+            if (maximum_workspace != 0) {
+                workspace_.allocate(maximum_workspace);
+            }
+        } else if (heuristic_status != CUBLAS_STATUS_NOT_SUPPORTED) {
             CUBLAS_CHECK(heuristic_status);
         }
     }
@@ -343,10 +354,9 @@ public:
         constexpr float beta = 0.0f;
         const auto launch = [&](
             const cublasLtMatmulAlgo_t* algorithm,
+            const std::size_t workspace_bytes,
             cublasLtMatmulDesc_t operation
         ) {
-            const bool uses_workspace =
-                algorithm != nullptr && workspace_required_ != 0;
             return cublasLtMatmul(
                 handle,
                 operation,
@@ -361,8 +371,8 @@ public:
                 output.raw_data(),
                 output_layout_,
                 algorithm,
-                uses_workspace ? workspace_.data() : nullptr,
-                uses_workspace ? workspace_required_ : 0,
+                workspace_bytes != 0 ? workspace_.data() : nullptr,
+                workspace_bytes,
                 stream);
         };
 
@@ -370,30 +380,40 @@ public:
             bias != nullptr && !fused_bias_supported_
                 ? unfused_operation_
                 : operation_;
-        cublasStatus_t status =
-            launch(
-                has_selected_algorithm_ ? &algorithm_ : nullptr,
-                active_operation);
-        if (status == CUBLAS_STATUS_NOT_SUPPORTED && has_selected_algorithm_) {
-            has_selected_algorithm_ = false;
-            workspace_required_ = 0;
-            status = launch(nullptr, active_operation);
+
+        if (!autotuned_ && !candidates_.empty()) {
+            autotune(
+                handle, output, input, weight, active_operation, stream);
         }
+
+        const cublasLtMatmulAlgo_t* selected_algorithm =
+            selected_candidate_ < candidates_.size()
+                ? &candidates_[selected_candidate_].algorithm
+                : nullptr;
+        const std::size_t selected_workspace =
+            selected_candidate_ < candidates_.size()
+                ? candidates_[selected_candidate_].workspace_bytes
+                : 0;
+
+        cublasStatus_t status = launch(
+            selected_algorithm, selected_workspace, active_operation);
+        if (status == CUBLAS_STATUS_NOT_SUPPORTED && selected_algorithm != nullptr) {
+            selected_candidate_ = candidates_.size();
+            status = launch(nullptr, 0, active_operation);
+        }
+
         bool needs_bias_fallback = bias != nullptr && !fused_bias_supported_;
         if (status == CUBLAS_STATUS_NOT_SUPPORTED &&
-            bias != nullptr &&
-            fused_bias_supported_) {
+            bias != nullptr && fused_bias_supported_) {
             fused_bias_supported_ = false;
-            has_selected_algorithm_ = false;
-            workspace_required_ = 0;
-            status = launch(nullptr, unfused_operation_);
+            selected_candidate_ = candidates_.size();
+            status = launch(nullptr, 0, unfused_operation_);
             needs_bias_fallback = true;
         }
         if (status == CUBLAS_STATUS_NOT_SUPPORTED &&
             fp32_fallback_operation_ != nullptr) {
-            has_selected_algorithm_ = false;
-            workspace_required_ = 0;
-            status = launch(nullptr, fp32_fallback_operation_);
+            selected_candidate_ = candidates_.size();
+            status = launch(nullptr, 0, fp32_fallback_operation_);
             needs_bias_fallback = bias != nullptr;
         }
         CUBLAS_CHECK(status);
@@ -403,16 +423,104 @@ public:
     }
 
 private:
+    struct AlgorithmCandidate {
+        cublasLtMatmulAlgo_t algorithm{};
+        std::size_t workspace_bytes = 0;
+    };
+
+    void autotune(
+        cublasLtHandle_t handle,
+        Tensor& output,
+        const Tensor& input,
+        const Tensor& weight,
+        cublasLtMatmulDesc_t operation,
+        cudaStream_t stream
+    ) {
+        constexpr float alpha = 1.0f;
+        constexpr float beta = 0.0f;
+        constexpr int measured_launches = 4;
+
+        cudaEvent_t start_event = nullptr;
+        cudaEvent_t stop_event = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&start_event, cudaEventDefault));
+        CUDA_CHECK(cudaEventCreateWithFlags(&stop_event, cudaEventDefault));
+
+        float best_time_ms = std::numeric_limits<float>::infinity();
+        std::size_t best_index = candidates_.size();
+
+        for (std::size_t index = 0; index < candidates_.size(); ++index) {
+            const auto& candidate = candidates_[index];
+            void* workspace_pointer =
+                candidate.workspace_bytes != 0 ? workspace_.data() : nullptr;
+
+            const cublasStatus_t warmup_status = cublasLtMatmul(
+                handle, operation, &alpha,
+                input.raw_data(), input_layout_,
+                weight.raw_data(), weight_layout_,
+                &beta,
+                output.raw_data(), output_layout_,
+                output.raw_data(), output_layout_,
+                &candidate.algorithm,
+                workspace_pointer,
+                candidate.workspace_bytes,
+                stream);
+            if (warmup_status != CUBLAS_STATUS_SUCCESS) {
+                continue;
+            }
+
+            CUDA_CHECK(cudaEventRecord(start_event, stream));
+            cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+            for (int launch_index = 0;
+                 launch_index < measured_launches;
+                 ++launch_index) {
+                status = cublasLtMatmul(
+                    handle, operation, &alpha,
+                    input.raw_data(), input_layout_,
+                    weight.raw_data(), weight_layout_,
+                    &beta,
+                    output.raw_data(), output_layout_,
+                    output.raw_data(), output_layout_,
+                    &candidate.algorithm,
+                    workspace_pointer,
+                    candidate.workspace_bytes,
+                    stream);
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    break;
+                }
+            }
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                continue;
+            }
+
+            CUDA_CHECK(cudaEventRecord(stop_event, stream));
+            CUDA_CHECK(cudaEventSynchronize(stop_event));
+            float elapsed_ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(
+                &elapsed_ms, start_event, stop_event));
+            elapsed_ms /= static_cast<float>(measured_launches);
+
+            if (elapsed_ms < best_time_ms) {
+                best_time_ms = elapsed_ms;
+                best_index = index;
+            }
+        }
+
+        CUDA_CHECK(cudaEventDestroy(stop_event));
+        CUDA_CHECK(cudaEventDestroy(start_event));
+        selected_candidate_ = best_index;
+        autotuned_ = true;
+    }
+
     cublasLtMatmulDesc_t operation_ = nullptr;
     cublasLtMatmulDesc_t unfused_operation_ = nullptr;
     cublasLtMatmulDesc_t fp32_fallback_operation_ = nullptr;
     cublasLtMatrixLayout_t input_layout_ = nullptr;
     cublasLtMatrixLayout_t weight_layout_ = nullptr;
     cublasLtMatrixLayout_t output_layout_ = nullptr;
-    cublasLtMatmulAlgo_t algorithm_{};
+    std::vector<AlgorithmCandidate> candidates_;
     DeviceBuffer workspace_;
-    std::size_t workspace_required_ = 0;
-    bool has_selected_algorithm_ = false;
+    std::size_t selected_candidate_ = 0;
+    bool autotuned_ = false;
     bool fused_bias_supported_ = false;
 };
 

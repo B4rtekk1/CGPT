@@ -1,5 +1,6 @@
 #include "core/cuda_check.h"
 #include "ops/swiglu.h"
+#include "cuda_benchmark.h"
 
 #include <algorithm>
 #include <cmath>
@@ -120,6 +121,16 @@ void expect_invalid_argument(Function&& function) {
     throw std::runtime_error("SwiGLU test: invalid arguments were accepted");
 }
 
+template <typename Function>
+void expect_overflow_error(Function&& function) {
+    try {
+        function();
+    } catch (const std::overflow_error&) {
+        return;
+    }
+    throw std::runtime_error("SwiGLU test: overflow was not rejected");
+}
+
 void test_validation() {
     Tensor gate({2, 3});
     Tensor up({2, 3});
@@ -166,7 +177,7 @@ void test_validation() {
         Tensor f32_input({2, 6});
         swiglu_forward(f16_output, f32_input);
     });
-    expect_invalid_argument([&] {
+    expect_overflow_error([&] {
         Tensor output({65536, 1});
         Tensor input({65536, 2});
         swiglu_forward(output, input);
@@ -192,6 +203,17 @@ void test_custom_stream() {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+void benchmark_kernel() {
+    constexpr std::size_t kRows = 512;
+    constexpr std::size_t kIntermediateSize = 4096;
+    Tensor input({kRows, 2 * kIntermediateSize}, Dtype::F16);
+    Tensor output({kRows, kIntermediateSize}, Dtype::F16);
+
+    test::benchmark_cuda_launches("SwiGLU kernel", [&](cudaStream_t stream) {
+        swiglu_forward(output, input, stream);
+    });
+}
+
 } // namespace
 
 int main() {
@@ -210,6 +232,7 @@ int main() {
         test_fused(Dtype::BF16, 2.0e-2f, 514);
         test_validation();
         test_custom_stream();
+        benchmark_kernel();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

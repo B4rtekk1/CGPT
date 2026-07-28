@@ -1,5 +1,6 @@
 #include "../include/core/cuda_check.h"
 #include "ops/rmsnorm.h"
+#include "cuda_benchmark.h"
 
 #include <algorithm>
 #include <cmath>
@@ -279,6 +280,18 @@ void test_device_type() {
     expect_close(copied, values, 0.0f);
 }
 
+void benchmark_kernel() {
+    constexpr std::size_t kRows = 512;
+    constexpr std::size_t kHiddenSize = 4096;
+    Tensor input({kRows, kHiddenSize}, Dtype::F16);
+    Tensor weight({kHiddenSize}, Dtype::F16);
+    Tensor output({kRows, kHiddenSize}, Dtype::F16);
+
+    test::benchmark_cuda_launches("RMSNorm kernel", [&](cudaStream_t stream) {
+        rmsnorm_forward(output, input, weight, 1.0e-5F, stream);
+    });
+}
+
 } // namespace
 
 int main() {
@@ -290,6 +303,10 @@ int main() {
 
     // Exercises the register-cached float4 path used by model-sized layers.
     run_case({2, 4096}, 1.0e-5f);
+
+    // Matches the Flash Attention LLM benchmark: batch=1, sequence=512,
+    // 32 query heads, and head_dim=128. RMSNorm sees it as [512, 4096].
+    run_case({512, 4096}, 1.0e-5f, Dtype::F16, 3.0e-3f);
 
     // F16/BF16 inputs accumulate the RMS in F32, then round on output.
     run_case({3, 513}, 1.0e-5f, Dtype::F16, 3.0e-3f);
@@ -310,6 +327,7 @@ int main() {
     test_invalid_epsilon();
     test_custom_stream();
     test_preallocated_output();
+    benchmark_kernel();
 
     std::cout << "RMSNorm tests passed.\n";
     return EXIT_SUCCESS;
