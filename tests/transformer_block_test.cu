@@ -1,4 +1,5 @@
 #include "core/cuda_check.h"
+#include "core/cuda_graph.h"
 #include "core/transformer_block.h"
 #include "cuda_benchmark.h"
 
@@ -203,6 +204,50 @@ void test_forward() {
     }
 }
 
+void test_cuda_graph() {
+    BlockFixture fixture;
+    const auto expected = reference_forward(
+        make_values(fixture.input.numel(), 0.1F), make_values(kHidden, 1.0F),
+        make_values(fixture.q.numel(), 0.2F), make_values(fixture.k.numel(), 0.3F),
+        make_values(fixture.v.numel(), 0.4F), make_values(fixture.o.numel(), 0.5F),
+        make_values(kHidden, 1.4F), make_values(fixture.gate.numel(), 0.6F),
+        make_values(fixture.up.numel(), 0.7F), make_values(fixture.down.numel(), 0.8F));
+    const CublasLtContext context;
+
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    try {
+        // Create and cache cuBLASLt plans before capture. CUDA graph capture
+        // must only record the already prepared GPU work.
+        transformer_block_forward(fixture.output, fixture.input, fixture.weights(),
+                                  fixture.workspace, fixture.cos_cache, fixture.sin_cache,
+                                  context, stream, fixture.options);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        CudaGraph graph;
+        graph.capture(stream, [&] {
+            transformer_block_forward(fixture.output, fixture.input, fixture.weights(),
+                                      fixture.workspace, fixture.cos_cache, fixture.sin_cache,
+                                      context, stream, fixture.options);
+        });
+        if (!graph.initialized()) {
+            throw std::runtime_error("Transformer block test: CUDA graph was not initialized");
+        }
+
+        graph.upload(stream);
+        graph.launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<float> actual(fixture.output.numel());
+        fixture.output.copy_to_host(actual);
+        expect_close(actual, expected, 8.0e-2F);
+    } catch (...) {
+        cudaStreamDestroy(stream);
+        throw;
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 template <typename Function> void expect_invalid_argument(Function&& function) {
     try { function(); } catch (const std::invalid_argument&) { return; }
     throw std::runtime_error("Transformer block test: invalid input was accepted");
@@ -244,6 +289,7 @@ void benchmark_kernel() {
 int main() {
     try {
         test_forward();
+        test_cuda_graph();
         test_validation();
         benchmark_kernel();
     } catch (const std::exception& error) {

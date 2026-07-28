@@ -20,6 +20,7 @@ add_library(cgpt_core STATIC
         src/ops/rope.cu
         src/core/tensor.cu
         src/core/transformer_block.cu
+        src/core/cuda_graph.cu
         src/ops/flash_attention.cu)
 
 target_include_directories(cgpt_core PUBLIC
