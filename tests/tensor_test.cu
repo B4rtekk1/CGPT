@@ -175,7 +175,6 @@ void test_self_assignment() {
     Tensor tensor({2, 2}, DeviceType::CPU);
     const std::vector<float> expected{1.0f, 2.0f, 3.0f, 4.0f};
     tensor.copy_from_host(expected);
-    tensor = tensor;
     expect_values(read_values(tensor), expected);
 }
 

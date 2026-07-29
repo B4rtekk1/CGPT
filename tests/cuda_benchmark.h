@@ -2,9 +2,36 @@
 
 #include "core/cuda_check.h"
 
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 
 namespace test {
+
+inline bool benchmark_results_are_collected() {
+    return std::getenv("CGPT_BENCHMARK_RESULTS_FILE") != nullptr;
+}
+
+inline void report_cuda_benchmark(
+    const char* name,
+    const float average_ms,
+    const int measured_iterations,
+    const int warmup_iterations
+) {
+    if (const char* const results_file = std::getenv("CGPT_BENCHMARK_RESULTS_FILE")) {
+        std::ofstream output(results_file, std::ios::app);
+        if (output) {
+            output << name << '\t' << std::fixed << std::setprecision(6)
+                   << average_ms << '\n';
+            return;
+        }
+    }
+
+    std::cout << name << ": " << average_ms
+              << " ms (average of " << measured_iterations
+              << " launches; " << warmup_iterations << " warmup launches)\n";
+}
 
 template <typename Launch>
 void benchmark_cuda_launches(const char* name, Launch&& launch) {
@@ -32,10 +59,11 @@ void benchmark_cuda_launches(const char* name, Launch&& launch) {
 
         float elapsed_ms = 0.0F;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-        std::cout << name << ": "
-                  << elapsed_ms / static_cast<float>(kMeasuredIterations)
-                  << " ms (average of " << kMeasuredIterations
-                  << " launches; " << kWarmupIterations << " warmup launches)\n";
+        report_cuda_benchmark(
+            name,
+            elapsed_ms / static_cast<float>(kMeasuredIterations),
+            kMeasuredIterations,
+            kWarmupIterations);
     } catch (...) {
         if (stop != nullptr) {
             cudaEventDestroy(stop);

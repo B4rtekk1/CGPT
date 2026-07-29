@@ -1,5 +1,6 @@
 #include "core/cuda_check.h"
 #include "ops/embedding.h"
+#include "cuda_benchmark.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -154,6 +155,26 @@ void test_validation() {
     });
 }
 
+void benchmark_kernel() {
+    constexpr std::size_t kVocabularySize = 32'000;
+    constexpr std::size_t kTokenCount = 512;
+    constexpr std::size_t kHiddenSize = 4096;
+
+    Tensor weight({kVocabularySize, kHiddenSize}, Dtype::F16);
+    Tensor output({kTokenCount, kHiddenSize}, Dtype::F16);
+    DeviceTokenIds token_ids(kTokenCount);
+    std::vector<bpe::TokenId> host_ids(kTokenCount);
+    for (std::size_t index = 0; index < host_ids.size(); ++index) {
+        host_ids[index] = static_cast<bpe::TokenId>(index % kVocabularySize);
+    }
+    embedding_upload_token_ids(token_ids.get(), host_ids);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    test::benchmark_cuda_launches("Embedding kernel", [&](cudaStream_t stream) {
+        embedding_forward(output, token_ids.get(), kTokenCount, weight, stream);
+    });
+}
+
 } // namespace
 
 int main() {
@@ -162,6 +183,7 @@ int main() {
         test_bounds_check();
         test_reduced_precision_and_stream();
         test_validation();
+        benchmark_kernel();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

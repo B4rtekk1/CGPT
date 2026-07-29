@@ -5,7 +5,7 @@
 
 struct LinearOptions {
     ComputeType compute_type = ComputeType::TF32;
-    std::size_t workspace_bytes = 4U * 1024U * 1024U;
+    std::size_t workspace_bytes = 32U * 1024U * 1024U;
 };
 
 void linear_forward(
