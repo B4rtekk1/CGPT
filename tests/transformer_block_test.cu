@@ -78,6 +78,24 @@ std::vector<float> linear(const std::vector<float>& input, const std::vector<flo
     return output;
 }
 
+void rotate_second_position(
+    std::vector<float>& values,
+    const std::size_t heads,
+    const std::size_t head_dim
+) {
+    // The second cache entry used below is cos=0, sin=1, so every adjacent
+    // pair (x, y) becomes (-y, x).  This mirrors the RoPE kernel layout.
+    for (std::size_t head = 0; head < heads; ++head) {
+        const std::size_t base = heads * head_dim + head * head_dim;
+        for (std::size_t dimension = 0; dimension < head_dim; dimension += 2) {
+            const float x = values[base + dimension];
+            const float y = values[base + dimension + 1];
+            values[base + dimension] = -y;
+            values[base + dimension + 1] = x;
+        }
+    }
+}
+
 std::vector<float> reference_forward(const std::vector<float>& input,
                                      const std::vector<float>& attention_norm,
                                      const std::vector<float>& q_weight,
@@ -87,12 +105,17 @@ std::vector<float> reference_forward(const std::vector<float>& input,
                                      const std::vector<float>& ffn_norm,
                                      const std::vector<float>& gate_weight,
                                      const std::vector<float>& up_weight,
-                                     const std::vector<float>& down_weight) {
+                                     const std::vector<float>& down_weight,
+                                     const bool rotate_rope = false) {
     constexpr std::size_t rows = kBatch * kSequence;
     const auto norm = rmsnorm(input, attention_norm, rows, kHidden);
-    const auto query = linear(norm, q_weight, rows, kHidden, kHidden);
-    const auto key = linear(norm, k_weight, rows, kHidden, kHeadDim);
+    auto query = linear(norm, q_weight, rows, kHidden, kHidden);
+    auto key = linear(norm, k_weight, rows, kHidden, kHeadDim);
     const auto value = linear(norm, v_weight, rows, kHidden, kHeadDim);
+    if (rotate_rope) {
+        rotate_second_position(query, kQueryHeads, kHeadDim);
+        rotate_second_position(key, kKvHeads, kHeadDim);
+    }
 
     std::vector<float> attention(rows * kHidden);
     const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
@@ -204,6 +227,34 @@ void test_forward() {
     }
 }
 
+void test_forward_with_rope() {
+    BlockFixture fixture;
+    fixture.cos_cache.copy_from_host(std::vector<float>{
+        1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F,
+        1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F,
+        0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+        0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F});
+    fixture.sin_cache.copy_from_host(std::vector<float>{
+        0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+        0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F,
+        1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F,
+        1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F});
+    const auto expected = reference_forward(
+        make_values(fixture.input.numel(), 0.1F), make_values(kHidden, 1.0F),
+        make_values(fixture.q.numel(), 0.2F), make_values(fixture.k.numel(), 0.3F),
+        make_values(fixture.v.numel(), 0.4F), make_values(fixture.o.numel(), 0.5F),
+        make_values(kHidden, 1.4F), make_values(fixture.gate.numel(), 0.6F),
+        make_values(fixture.up.numel(), 0.7F), make_values(fixture.down.numel(), 0.8F),
+        true);
+    const CublasLtContext context;
+    transformer_block_forward(fixture.output, fixture.input, fixture.weights(), fixture.workspace,
+                              fixture.cos_cache, fixture.sin_cache, context, nullptr, fixture.options);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> actual(fixture.output.numel());
+    fixture.output.copy_to_host(actual);
+    expect_close(actual, expected, 8.0e-2F);
+}
+
 void test_cuda_graph() {
     BlockFixture fixture;
     const auto expected = reference_forward(
@@ -289,6 +340,7 @@ void benchmark_kernel() {
 int main() {
     try {
         test_forward();
+        test_forward_with_rope();
         test_cuda_graph();
         test_validation();
         benchmark_kernel();

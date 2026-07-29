@@ -278,6 +278,20 @@ int main() {
         options.attention_scale = 0.0F;
         run_case(1, 2, 5, options, Dtype::F16, 3.0e-2F);
 
+        // Single-token decoding at the end of a multi-tile K/V cache.  This
+        // specifically verifies that the causal position offset exposes every
+        // cache entry, including entries in the final (partial) 16-token tile.
+        options.num_query_heads = 4;
+        options.num_kv_heads = 2;
+        options.head_dim = 32;
+        options.block_size = 64;
+        options.key_tile_size = 16;
+        options.causal = true;
+        options.query_position_offset = 16;
+        options.attention_scale = 0.19F;
+        options.use_tensor_cores = true;
+        run_case(1, 1, 17, options, Dtype::F16, 3.0e-2F);
+
         // Cover each Tensor Core kernel specialization.
         options.num_query_heads = 2;
         options.num_kv_heads = 1;

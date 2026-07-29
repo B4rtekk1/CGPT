@@ -125,6 +125,30 @@ void test_reduced_precision_and_stream() {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+void test_reduced_precision_odd_hidden_size() {
+    // An odd hidden size cannot use half2/BF16x2 loads, so this covers the
+    // scalar reduced-precision kernels independently of the packed path.
+    for (const Dtype dtype : {Dtype::F16, Dtype::BF16}) {
+        Tensor weight({3, 3}, dtype);
+        Tensor output({2, 3}, dtype);
+        weight.copy_from_host(std::vector<float>{
+            0.5f, -1.25f, 2.75f,
+            3.5f, 4.25f, -5.5f,
+            -6.75f, 7.125f, 8.5f});
+
+        DeviceTokenIds token_ids(2);
+        embedding_upload_token_ids(
+            token_ids.get(), std::vector<bpe::TokenId>{1, 2});
+        embedding_forward(output, token_ids.get(), 2, weight);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        expect_close(
+            read_tensor(output),
+            {3.5f, 4.25f, -5.5f, -6.75f, 7.125f, 8.5f},
+            dtype == Dtype::F16 ? 1.0e-2f : 5.0e-2f);
+    }
+}
+
 void test_validation() {
     Tensor weight({2, 3});
     Tensor output({2, 3});
@@ -182,6 +206,7 @@ int main() {
         test_lookup_and_upload();
         test_bounds_check();
         test_reduced_precision_and_stream();
+        test_reduced_precision_odd_hidden_size();
         test_validation();
         benchmark_kernel();
     } catch (const std::exception& error) {
