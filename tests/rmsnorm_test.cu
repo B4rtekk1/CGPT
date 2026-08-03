@@ -1,5 +1,6 @@
 #include "../include/core/cuda_check.h"
 #include "ops/rmsnorm.h"
+#include "ops/backward/rmsnorm_backward.h"
 #include "cuda_benchmark.h"
 
 #include <algorithm>
@@ -264,6 +265,59 @@ void test_preallocated_output() {
     expect_close(actual, expected, 1.0e-4f);
 }
 
+void test_backward() {
+    constexpr std::size_t rows = 3;
+    constexpr std::size_t hidden = 7;
+    constexpr float epsilon = 1.0e-5f;
+    std::vector<float> input(rows * hidden);
+    std::vector<float> weight(hidden);
+    std::vector<float> grad_output(rows * hidden);
+    std::vector<float> expected_input(rows * hidden);
+    std::vector<float> expected_weight(hidden, 0.0f);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = 0.125f * static_cast<float>(static_cast<int>(index % 13) - 6);
+        grad_output[index] = 0.25f * static_cast<float>(static_cast<int>(index % 9) - 4);
+    }
+    for (std::size_t column = 0; column < hidden; ++column) {
+        weight[column] = 0.5f + 0.125f * static_cast<float>(column);
+    }
+    for (std::size_t row = 0; row < rows; ++row) {
+        float sum_squares = 0.0f;
+        float weighted_dot = 0.0f;
+        for (std::size_t column = 0; column < hidden; ++column) {
+            const std::size_t index = row * hidden + column;
+            sum_squares += input[index] * input[index];
+            weighted_dot += grad_output[index] * weight[column] * input[index];
+        }
+        const float inv_rms = 1.0f / std::sqrt(sum_squares / static_cast<float>(hidden) + epsilon);
+        const float correction = weighted_dot / static_cast<float>(hidden) * inv_rms * inv_rms * inv_rms;
+        for (std::size_t column = 0; column < hidden; ++column) {
+            const std::size_t index = row * hidden + column;
+            expected_input[index] = grad_output[index] * weight[column] * inv_rms -
+                input[index] * correction;
+            expected_weight[column] += grad_output[index] * input[index] * inv_rms;
+        }
+    }
+
+    Tensor input_tensor({rows, hidden});
+    Tensor weight_tensor({hidden});
+    Tensor grad_output_tensor({rows, hidden});
+    Tensor grad_input({rows, hidden});
+    Tensor grad_weight({hidden});
+    input_tensor.copy_from_host(input);
+    weight_tensor.copy_from_host(weight);
+    grad_output_tensor.copy_from_host(grad_output);
+    rmsnorm_backward(grad_input, grad_weight, grad_output_tensor, input_tensor, weight_tensor, epsilon);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> actual_input(grad_input.numel());
+    std::vector<float> actual_weight(grad_weight.numel());
+    grad_input.copy_to_host(actual_input);
+    grad_weight.copy_to_host(actual_weight);
+    expect_close(actual_input, expected_input, 2.0e-4f);
+    expect_close(actual_weight, expected_weight, 2.0e-4f);
+}
+
 void test_device_type() {
     Tensor cpu_tensor({2, 3}, DeviceType::CPU);
     if (cpu_tensor.device_type() != DeviceType::CPU) {
@@ -326,6 +380,7 @@ int main() {
     test_invalid_epsilon();
     test_custom_stream();
     test_preallocated_output();
+    test_backward();
     benchmark_kernel();
 
     std::cout << "RMSNorm tests passed.\n";

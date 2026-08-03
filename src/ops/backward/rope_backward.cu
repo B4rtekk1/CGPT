@@ -1,0 +1,228 @@
+/**
+ * @file rope_backward.cu @brief CUDA backward pass for Rotary Positional Embedding (RoPE).
+ */
+
+#include "ops/backward/rope_backward.h"
+#include "core/cuda_check.h"alloca
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+
+namespace {
+    constexpr std::uint32_t kThreadsPerBlock = 256U;
+    constexpr std::uint32_t kMaxGridX = 65535U;
+
+    template<typename T>
+    __device__ __forceinline__ float to_float(const T value) {
+        return static_cast<float>(value);
+    }
+
+    template<>
+    __device__ __forceinline__ float to_float<half>(const half value) {
+        return __half2float(value);
+    }
+
+    template<>
+    __device__ __forceinline__ float to_float<__nv_bfloat16>(const __nv_bfloat16 value) {
+        return __bfloat162float(value);
+    }
+
+    /** @brief Applies the transpose of the forward rotation to one gradient pair. */
+    template<typename T>
+    __global__ void rope_backward_kernel(
+        T * __restrict__ grad_query,
+        T * __restrict__ grad_key,
+        const T * __restrict__ grad_rotated_query,
+        const T * __restrict__ grad_rotated_key,
+        const T * __restrict__ cos_cache,
+        const T * __restrict__ sin_cache,
+        const std::size_t token_count,
+        const std::uint32_t sequence_length,
+        const std::uint32_t query_head_count,
+        const std::uint32_t key_head_count,
+        const std::uint32_t head_dim,
+        const std::uint32_t rotary_pair_count,
+        const std::uint32_t position_offset
+    ) {
+        for (std::size_t token = blockIdx.x; token < token_count; token += gridDim.x) {
+            const auto position = static_cast<std::uint32_t>(token % sequence_length);
+            const std::size_t cache_offset = static_cast<std::size_t>(position + position_offset) * rotary_pair_count;
+            const std::size_t query_token_offset = token * static_cast<std::size_t>(query_head_count) * head_dim;
+            const std::size_t key_token_offset = cache_offset + key_head_count * head_dim;
+
+            for (std::uint32_t pair = threadIdx.x; pair < rotary_pair_count; pair += blockDim.x) {
+                const float cosine = to_float(cos_cache[cache_offset + pair]);
+                const float sine = to_float(sin_cache[cache_offset + pair]);
+                const std::size_t pair_offset = static_cast<std::size_t>(pair) * 2U;
+
+                for (std::uint32_t head = 0; head < query_head_count; ++head) {
+                    const std::size_t offset = query_token_offset +
+                                               static_cast<std::size_t>(head) * head_dim + pair_offset;
+                    const float dy0 = to_float(grad_rotated_query[offset]);
+                    const float dy1 = to_float(grad_rotated_query[offset + 1U]);
+                    grad_query[offset] = static_cast<T>(fmaf(dy1, sine, dy0 * cosine));
+                    grad_query[offset + 1U] =
+                            static_cast<T>(fmaf(-dy0, sine, dy1 * cosine));
+                }
+
+                for (std::uint32_t head = 0; head < key_head_count; ++head) {
+                    const std::size_t offset = key_token_offset +
+                                               static_cast<std::size_t>(head) * head_dim + pair_offset;
+                    const float dy0 = to_float(grad_rotated_key[offset]);
+                    const float dy1 = to_float(grad_rotated_key[offset + 1U]);
+                    grad_key[offset] = static_cast<T>(fmaf(dy1, sine, dy0 * cosine));
+                    grad_key[offset + 1U] =
+                            static_cast<T>(fmaf(-dy0, sine, dy1 * cosine));
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] std::uint32_t checked_u32(const std::size_t value, const char *name) {
+        if (value > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error(std::string("RoPE backward: ") + name + " exceeds uint32_t range");
+        }
+        return static_cast<std::uint32_t>(value);
+    }
+
+    void validate_tensor(const Tensor &tensor, const char *name) {
+        if (tensor.device_type() != DeviceType::CUDA) {
+            throw std::invalid_argument(std::string("RoPE backward: ") + name +
+                                        " must be a CUDA tensor");
+        }
+        if (tensor.shape().size() != 4) {
+            throw std::invalid_argument(std::string("RoPE backward: ") + name +
+                                        " must have shape [batch, sequence, heads, head_dim]");
+        }
+    }
+
+    void validate_inputs(
+        const Tensor &grad_query, const Tensor &grad_key,
+        const Tensor &grad_rotated_query, const Tensor &grad_rotated_key,
+        const Tensor &cos_cache, const Tensor &sin_cache, const RopeOptions &options
+    ) {
+        validate_tensor(grad_query, "grad_query");
+        validate_tensor(grad_key, "grad_key");
+        validate_tensor(grad_rotated_query, "grad_rotated_query");
+        validate_tensor(grad_rotated_key, "grad_rotated_key");
+
+        if (grad_query.shape() != grad_rotated_query.shape() ||
+            grad_key.shape() != grad_rotated_key.shape() ||
+            grad_query.shape()[0] != grad_key.shape()[0] ||
+            grad_query.shape()[1] != grad_key.shape()[1] ||
+            grad_query.shape()[3] != grad_key.shape()[3]) {
+            throw std::invalid_argument("RoPE backward: incompatible Q/K gradient shapes");
+        }
+        if (cos_cache.device_type() != DeviceType::CUDA ||
+            sin_cache.device_type() != DeviceType::CUDA ||
+            cos_cache.shape().size() != 2 || sin_cache.shape() != cos_cache.shape()) {
+            throw std::invalid_argument(
+                "RoPE backward: caches must be CUDA tensors with identical [max_sequence, rotary_dim / 2] shapes");
+        }
+        if (grad_query.dtype() != grad_key.dtype() ||
+            grad_query.dtype() != grad_rotated_query.dtype() ||
+            grad_query.dtype() != grad_rotated_key.dtype() ||
+            grad_query.dtype() != cos_cache.dtype() || grad_query.dtype() != sin_cache.dtype()) {
+            throw std::invalid_argument("RoPE backward: all tensors must have the same dtype");
+        }
+
+        const std::size_t head_dim = grad_query.shape()[3];
+        const std::size_t sequence_length = grad_query.shape()[1];
+        const std::size_t rotary_dim = options.rotary_dim == 0 ? head_dim : options.rotary_dim;
+        if (head_dim == 0 || sequence_length == 0) {
+            return;
+        }
+        if ((head_dim & 1U) != 0U || rotary_dim == 0 || rotary_dim > head_dim ||
+            (rotary_dim & 1U) != 0U) {
+            throw std::invalid_argument(
+                "RoPE backward: head_dim and rotary_dim must be even, with rotary_dim in [2, head_dim]");
+        }
+        if (cos_cache.shape()[1] != rotary_dim / 2U ||
+            options.position_offset > std::numeric_limits<std::size_t>::max() - sequence_length ||
+            cos_cache.shape()[0] < options.position_offset + sequence_length) {
+            throw std::invalid_argument("RoPE backward: cache does not cover the requested rotary positions");
+        }
+        static_cast<void>(checked_u32(sequence_length, "sequence length"));
+        static_cast<void>(checked_u32(grad_query.shape()[2], "query head count"));
+        static_cast<void>(checked_u32(grad_key.shape()[2], "key head count"));
+        static_cast<void>(checked_u32(head_dim, "head dimension"));
+        static_cast<void>(checked_u32(rotary_dim / 2U, "rotary pair count"));
+        static_cast<void>(checked_u32(options.position_offset, "position offset"));
+    }
+
+    template<typename T>
+    void launch(
+        Tensor &grad_query, Tensor &grad_key,
+        const Tensor &grad_rotated_query, const Tensor &grad_rotated_key,
+        const Tensor &cos_cache, const Tensor &sin_cache,
+        const std::size_t token_count, const RopeOptions &options, cudaStream_t stream
+    ) {
+        const auto grid_size = static_cast<std::uint32_t>(
+            std::min(token_count, static_cast<std::size_t>(kMaxGridX)));
+        rope_backward_kernel<T><<<grid_size, kThreadsPerBlock, 0, stream>>>(
+            static_cast<T *>(grad_query.raw_data()), static_cast<T *>(grad_key.raw_data()),
+            static_cast<const T *>(grad_rotated_query.raw_data()),
+            static_cast<const T *>(grad_rotated_key.raw_data()),
+            static_cast<const T *>(cos_cache.raw_data()), static_cast<const T *>(sin_cache.raw_data()),
+            token_count, checked_u32(grad_query.shape()[1], "sequence length"),
+            checked_u32(grad_query.shape()[2], "query head count"),
+            checked_u32(grad_key.shape()[2], "key head count"),
+            checked_u32(grad_query.shape()[3], "head dimension"),
+            checked_u32((options.rotary_dim == 0 ? grad_query.shape()[3] : options.rotary_dim) / 2U,
+                        "rotary pair count"),
+            checked_u32(options.position_offset, "position offset"));
+    }
+}
+
+void rope_backward(
+    Tensor &grad_query, Tensor &grad_key,
+    const Tensor &grad_rotated_query, const Tensor &grad_rotated_key,
+    const Tensor &cos_cache, const Tensor &sin_cache,
+    cudaStream_t stream, const RopeOptions &rope_options
+) {
+    validate_inputs(grad_query, grad_key, grad_rotated_query, grad_rotated_key,
+                    cos_cache, sin_cache, rope_options);
+    if (grad_query.numel() == 0 || grad_key.numel() == 0 || grad_query.shape()[1] == 0) {
+        return;
+    }
+    // RoPE leaves dimensions beyond rotary_dim unchanged; copy those values
+    // (and establish the complete output) before overwriting rotary pairs.
+    if (grad_query.raw_data() != grad_rotated_query.raw_data()) {
+        CUDA_CHECK(cudaMemcpyAsync(grad_query.raw_data(), grad_rotated_query.raw_data(),
+            grad_query.nbytes(), cudaMemcpyDeviceToDevice, stream));
+    }
+    if (grad_key.raw_data() != grad_rotated_key.raw_data()) {
+        CUDA_CHECK(cudaMemcpyAsync(grad_key.raw_data(), grad_rotated_key.raw_data(),
+            grad_key.nbytes(), cudaMemcpyDeviceToDevice, stream));
+    }
+    if (grad_query.shape()[0] != 0 &&
+        grad_query.shape()[1] > std::numeric_limits<std::size_t>::max() /
+        grad_query.shape()[0]) {
+        throw std::overflow_error("RoPE backward: batch times sequence overflow");
+    }
+    const std::size_t token_count = grad_query.shape()[0] * grad_query.shape()[1];
+    if (token_count == 0) {
+        return;
+    }
+
+    switch (grad_query.dtype()) {
+        case Dtype::F32:
+            launch<float>(grad_query, grad_key, grad_rotated_query, grad_rotated_key,
+                          cos_cache, sin_cache, token_count, rope_options, stream);
+            break;
+        case Dtype::F16:
+            launch<half>(grad_query, grad_key, grad_rotated_query, grad_rotated_key,
+                         cos_cache, sin_cache, token_count, rope_options, stream);
+            break;
+        case Dtype::BF16:
+            launch<__nv_bfloat16>(grad_query, grad_key, grad_rotated_query, grad_rotated_key,
+                                  cos_cache, sin_cache, token_count, rope_options, stream);
+            break;
+        default:
+            throw std::invalid_argument("RoPE backward: unsupported dtype");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

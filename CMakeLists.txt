@@ -17,6 +17,11 @@ add_library(cgpt_core STATIC
         src/ops/embedding.cu
         src/ops/linear.cu
         src/ops/backward/linear_backward.cu
+        src/ops/backward/rmsnorm_backward.cu
+        src/ops/backward/swiglu_backward.cu
+        src/ops/backward/flash_attention_backward.cu
+        src/ops/backward/embedding_backward.cu
+        src/ops/backward/rope_backward.cu
         src/ops/rmsnorm.cu
         src/ops/swiglu.cu
         src/ops/rope.cu
@@ -60,6 +65,7 @@ endfunction()
 
 add_cgpt_test(rmsnorm_test tests/rmsnorm_test.cu cgpt_core)
 add_cgpt_test(linear_test tests/linear_test.cu cgpt_core)
+add_cgpt_test(linear_backward_test tests/linear_backward_test.cu cgpt_core)
 add_cgpt_test(swiglu_test tests/swiglu_test.cu cgpt_core)
 add_cgpt_test(rope_test tests/rope_test.cu cgpt_core)
 add_cgpt_test(tensor_test tests/tensor_test.cu cgpt_core)
@@ -76,13 +82,14 @@ add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_t
 
 add_executable(run_all_tests tests/run_all_tests.cpp)
 add_dependencies(run_all_tests
-        rmsnorm_test linear_test swiglu_test rope_test tensor_test device_buffer_test dtype_test
+        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test
         flash_attention_test embedding_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test
         bpe_tokenizer_test bpe_tokenizer_100mb_test)
 add_custom_target(run_all
         COMMAND $<TARGET_FILE:run_all_tests>
                 rmsnorm_test $<TARGET_FILE:rmsnorm_test>
                 linear_test $<TARGET_FILE:linear_test>
+                linear_backward_test $<TARGET_FILE:linear_backward_test>
                 swiglu_test $<TARGET_FILE:swiglu_test>
                 rope_test $<TARGET_FILE:rope_test>
                 tensor_test $<TARGET_FILE:tensor_test>
@@ -103,7 +110,7 @@ add_custom_target(run_all
         COMMENT "Running all tests and printing the benchmark summary")
 
 set_tests_properties(
-        rmsnorm_test linear_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test bpe_tokenizer_test
+        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
 
 set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES
