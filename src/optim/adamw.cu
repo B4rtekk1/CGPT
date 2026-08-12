@@ -42,7 +42,7 @@ namespace {
         const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (index >= count) return;
 
-        const float grad = static_cast<float>(gradient[index]);
+        const auto grad = static_cast<float>(gradient[index]);
         const float first = first_moment[index] = beta1 * first_moment[index] + (1.0f - beta1) * grad;
         const float second = second_moment[index] = beta2 * second_moment[index] + (1.0f - beta2) * grad * grad;
         const float normalized = (first / bias_correction1) / (sqrtf(second / bias_correction2) + epsilon);
@@ -108,9 +108,9 @@ void adamw_step(Tensor& parameter, const Tensor& gradient, AdamWState& state,
                 options.learning_rate, options.epsilon, options.weight_decay);
         };
         switch (parameter.dtype()) {
-            case Dtype::F32: launch.template operator()<float>(); break;
-            case Dtype::F16: launch.template operator()<__half>(); break;
-            case Dtype::BF16: launch.template operator()<__nv_bfloat16>(); break;
+            case Dtype::F32: launch.operator()<float>(); break;
+            case Dtype::F16: launch.operator()<__half>(); break;
+            case Dtype::BF16: launch.operator()<__nv_bfloat16>(); break;
             default: throw std::invalid_argument("adamw_step: unsupported dtype");
         }
         CUDA_CHECK(cudaGetLastError());

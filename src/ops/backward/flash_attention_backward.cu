@@ -201,7 +201,7 @@ void validate(const Tensor& gq, const Tensor& gk, const Tensor& gv, const Tensor
 }
 }
 
-static void flash_gqa_attention_backward(
+void flash_gqa_attention_backward(
     Tensor& grad_query, Tensor& grad_key, Tensor& grad_value, const Tensor& grad_output,
     const Tensor& query, const Tensor& key, const Tensor& value, cudaStream_t stream,
     const FlashAttentionOptions& options, bool accumulate_grads

@@ -30,6 +30,7 @@ struct TransformerModelWorkspace {
     Tensor layer_output;
     Tensor normalized;
     std::vector<TransformerBlockWorkspace> layers;
+    std::vector<Tensor> layer_inputs;
 
     TransformerModelWorkspace(
         const TransformerModelOptions& options,
@@ -37,6 +38,24 @@ struct TransformerModelWorkspace {
         std::size_t sequence_length,
         Dtype dtype = Dtype::F16
     );
+};
+
+struct TransformerModelGradients {
+    Tensor& token_embedding;
+    std::vector<TransformerBlockGradients> layers;
+    Tensor& final_norm;
+    Tensor& lm_head;
+};
+
+struct TransformerModelBackwardWorkspace {
+    Tensor grad_normalized;
+    Tensor grad_hidden;
+    Tensor grad_previous;
+    Tensor lm_head_bias;
+    std::vector<TransformerBlockBackwardWorkspace> layers;
+
+    TransformerModelBackwardWorkspace(const TransformerModelOptions& options,
+        std::size_t batch_size, std::size_t sequence_length, Dtype dtype = Dtype::F16);
 };
 
 /**
@@ -60,3 +79,20 @@ void transformer_model_forward(
     const TransformerModelOptions& options,
     std::size_t position_offset = 0
 );
+
+/** Backpropagates a completed transformer_model_forward call. */
+void transformer_model_backward(
+    const Tensor& grad_logits,
+    const bpe::TokenId* device_token_ids,
+    std::size_t batch_size,
+    std::size_t sequence_length,
+    const TransformerModelWeights& weights,
+    TransformerModelGradients gradients,
+    const TransformerModelWorkspace& forward_workspace,
+    TransformerModelBackwardWorkspace& backward_workspace,
+    const Tensor& cos_cache,
+    const Tensor& sin_cache,
+    const CublasLtContext& cublas_context,
+    cudaStream_t stream,
+    const TransformerModelOptions& options,
+    std::size_t position_offset = 0);
