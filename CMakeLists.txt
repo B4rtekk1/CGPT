@@ -50,6 +50,7 @@ add_library(cgpt_tokenizer STATIC
         src/tokenizer/bpe_tokenizer.cpp
         src/utils/progress_bar.cpp)
 target_include_directories(cgpt_tokenizer PUBLIC ${CGPT_INCLUDE_DIR})
+target_link_libraries(cgpt_core PUBLIC cgpt_tokenizer)
 
 if (MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     set_source_files_properties(src/tokenizer/bpe_tokenizer.cpp PROPERTIES

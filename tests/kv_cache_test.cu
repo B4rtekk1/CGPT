@@ -143,6 +143,31 @@ void test_append_and_move() {
            "KVCache move construction lost sequence lengths");
 }
 
+void test_append_with_divergent_lengths() {
+    KVCache cache({1, 2, 4, 1, 2});
+    cache.set_sequence_length(0, 0, 1);
+    cache.set_sequence_length(0, 1, 2);
+    const auto values = to_half({1.0F, 2.0F, 3.0F, 4.0F});
+    const DeviceBuffer device_values = copy_to_device(values);
+
+    cache.append(
+        0,
+        2,
+        1,
+        static_cast<const __half*>(device_values.data()),
+        static_cast<const __half*>(device_values.data()));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    expect_values(
+        read_device(cache.key_sequence(0, 0), 8),
+        {0.0F, 0.0F, 1.0F, 2.0F, 0.0F, 0.0F, 0.0F, 0.0F},
+        "KVCache append did not honor the first divergent sequence length");
+    expect_values(
+        read_device(cache.key_sequence(0, 1), 8),
+        {0.0F, 0.0F, 0.0F, 0.0F, 3.0F, 4.0F, 0.0F, 0.0F},
+        "KVCache append did not honor the second divergent sequence length");
+}
+
 } // namespace
 
 int main() {
@@ -150,6 +175,7 @@ int main() {
         test_validation();
         test_write_layout();
         test_append_and_move();
+        test_append_with_divergent_lengths();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return EXIT_FAILURE;

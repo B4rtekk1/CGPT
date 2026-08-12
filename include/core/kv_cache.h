@@ -73,7 +73,6 @@ private:
     __half* keys_ = nullptr;
     __half* values_ = nullptr;
     std::size_t* host_lengths_ = nullptr;
-    std::size_t* device_lengths_ = nullptr;
 
     [[nodiscard]] std::size_t elements_per_token() const noexcept;
     [[nodiscard]] std::size_t elements_per_sequence() const noexcept;

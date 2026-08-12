@@ -8,89 +8,13 @@
 
 namespace {
 
-constexpr int kThreadsPerBlock = 256;
-constexpr int kMaxBlocks = 4096;
-
-__global__ void write_kv_kernel(
-    __half* __restrict__ cache_keys,
-    __half* __restrict__ cache_values,
-    const __half* __restrict__ input_keys,
-    const __half* __restrict__ input_values,
-    const std::size_t layer,
-    const std::size_t batch_size,
-    const std::size_t token_offset,
-    const std::size_t token_count,
-    const std::size_t max_batch_size,
-    const std::size_t max_sequence_length,
-    const std::size_t elements_per_token
-) {
-    const std::size_t input_elements = batch_size * token_count * elements_per_token;
-
-    for (std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < input_elements;
-         index += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
-        const std::size_t element = index % elements_per_token;
-        const std::size_t token_linear = index / elements_per_token;
-        const std::size_t token = token_linear % token_count;
-        const std::size_t batch = token_linear / token_count;
-
-        const std::size_t cache_index =
-            (((layer * max_batch_size + batch) * max_sequence_length + token_offset + token) *
-             elements_per_token) +
-            element;
-
-        cache_keys[cache_index] = input_keys[index];
-        cache_values[cache_index] = input_values[index];
-    }
-}
-
-__global__ void append_kv_kernel(
-    __half* __restrict__ cache_keys,
-    __half* __restrict__ cache_values,
-    const __half* __restrict__ input_keys,
-    const __half* __restrict__ input_values,
-    const std::size_t* __restrict__ sequence_lengths,
-    const std::size_t layer,
-    const std::size_t batch_size,
-    const std::size_t token_count,
-    const std::size_t max_batch_size,
-    const std::size_t max_sequence_length,
-    const std::size_t elements_per_token
-) {
-    const std::size_t input_elements = batch_size * token_count * elements_per_token;
-
-    for (std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < input_elements;
-         index += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
-        const std::size_t element = index % elements_per_token;
-        const std::size_t token_linear = index / elements_per_token;
-        const std::size_t token = token_linear % token_count;
-        const std::size_t batch = token_linear / token_count;
-        const std::size_t destination_token = sequence_lengths[batch] + token;
-
-        const std::size_t cache_index =
-            (((layer * max_batch_size + batch) * max_sequence_length + destination_token) *
-             elements_per_token) +
-            element;
-
-        cache_keys[cache_index] = input_keys[index];
-        cache_values[cache_index] = input_values[index];
-    }
-}
-
-int launch_blocks(const std::size_t element_count) {
-    const std::size_t required =
-        (element_count + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    return static_cast<int>(std::min<std::size_t>(required, kMaxBlocks));
-}
-
 void validate_batch_index(const KVCacheConfig& config, const std::size_t batch) {
     if (batch >= config.max_batch_size) {
         throw std::out_of_range("KVCache batch index is out of range");
     }
 }
 
-} // namespace
+}
 
 KVCache::KVCache(const KVCacheConfig& config) : config_(config) {
     validate_config();
@@ -101,9 +25,6 @@ KVCache::KVCache(const KVCacheConfig& config) : config_(config) {
     try {
         CUDA_CHECK(cudaMalloc(&values_, bytes));
         host_lengths_ = new std::size_t[config_.num_layers * config_.max_batch_size]{};
-        CUDA_CHECK(cudaMalloc(
-            &device_lengths_,
-            config_.num_layers * config_.max_batch_size * sizeof(std::size_t)));
         clear();
     } catch (...) {
         release();
@@ -119,8 +40,7 @@ KVCache::KVCache(KVCache&& other) noexcept
     : config_(other.config_),
       keys_(std::exchange(other.keys_, nullptr)),
       values_(std::exchange(other.values_, nullptr)),
-      host_lengths_(std::exchange(other.host_lengths_, nullptr)),
-      device_lengths_(std::exchange(other.device_lengths_, nullptr)) {
+      host_lengths_(std::exchange(other.host_lengths_, nullptr)) {
     other.config_ = {};
 }
 
@@ -131,7 +51,6 @@ KVCache& KVCache::operator=(KVCache&& other) noexcept {
         keys_ = std::exchange(other.keys_, nullptr);
         values_ = std::exchange(other.values_, nullptr);
         host_lengths_ = std::exchange(other.host_lengths_, nullptr);
-        device_lengths_ = std::exchange(other.device_lengths_, nullptr);
         other.config_ = {};
     }
     return *this;
@@ -206,11 +125,6 @@ void KVCache::clear(cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(keys_, 0, bytes, stream));
     CUDA_CHECK(cudaMemsetAsync(values_, 0, bytes, stream));
     reset_lengths();
-    CUDA_CHECK(cudaMemsetAsync(
-        device_lengths_,
-        0,
-        config_.num_layers * config_.max_batch_size * sizeof(std::size_t),
-        stream));
 }
 
 void KVCache::reset_lengths() noexcept {
@@ -239,22 +153,22 @@ void KVCache::write(
         throw std::invalid_argument("KVCache input key/value pointer is null");
     }
 
-    const std::size_t per_token = elements_per_token();
-    const std::size_t element_count = batch_size * token_count * per_token;
+    // A batch item occupies one contiguous row in both layouts.  Delegating
+    // the strided bulk copy to the CUDA copy engine avoids a launch plus
+    // integer division/modulo for every cache element.
+    const std::size_t row_bytes = token_count * elements_per_token() * sizeof(__half);
+    const std::size_t cache_pitch = elements_per_sequence() * sizeof(__half);
+    __half* const key_destination =
+        key_sequence(layer, 0) + token_offset * elements_per_token();
+    __half* const value_destination =
+        value_sequence(layer, 0) + token_offset * elements_per_token();
 
-    write_kv_kernel<<<launch_blocks(element_count), kThreadsPerBlock, 0, stream>>>(
-        keys_,
-        values_,
-        key,
-        value,
-        layer,
-        batch_size,
-        token_offset,
-        token_count,
-        config_.max_batch_size,
-        config_.max_sequence_length,
-        per_token);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        key_destination, cache_pitch, key, row_bytes, row_bytes, batch_size,
+        cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        value_destination, cache_pitch, value, row_bytes, row_bytes, batch_size,
+        cudaMemcpyDeviceToDevice, stream));
 }
 
 void KVCache::append(
@@ -282,29 +196,36 @@ void KVCache::append(
         }
     }
 
-    CUDA_CHECK(cudaMemcpyAsync(
-        device_lengths_,
-        host_lengths_ + length_index(layer, 0),
-        batch_size * sizeof(std::size_t),
-        cudaMemcpyHostToDevice,
-        stream));
+    const std::size_t row_bytes = token_count * elements_per_token() * sizeof(__half);
+    const std::size_t first_length = host_lengths_[length_index(layer, 0)];
+    bool uniform_lengths = true;
+    for (std::size_t batch = 1; batch < batch_size; ++batch) {
+        uniform_lengths = uniform_lengths &&
+            host_lengths_[length_index(layer, batch)] == first_length;
+    }
 
-    const std::size_t per_token = elements_per_token();
-    const std::size_t element_count = batch_size * token_count * per_token;
-
-    append_kv_kernel<<<launch_blocks(element_count), kThreadsPerBlock, 0, stream>>>(
-        keys_,
-        values_,
-        key,
-        value,
-        device_lengths_,
-        layer,
-        batch_size,
-        token_count,
-        config_.max_batch_size,
-        config_.max_sequence_length,
-        per_token);
-    CUDA_CHECK(cudaGetLastError());
+    if (uniform_lengths) {
+        const std::size_t cache_pitch = elements_per_sequence() * sizeof(__half);
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            key_sequence(layer, 0) + first_length * elements_per_token(),
+            cache_pitch, key, row_bytes, row_bytes, batch_size,
+            cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            value_sequence(layer, 0) + first_length * elements_per_token(),
+            cache_pitch, value, row_bytes, row_bytes, batch_size,
+            cudaMemcpyDeviceToDevice, stream));
+    } else {
+        for (std::size_t batch = 0; batch < batch_size; ++batch) {
+            const std::size_t offset = host_lengths_[length_index(layer, batch)];
+            const std::size_t source_offset = batch * token_count * elements_per_token();
+            CUDA_CHECK(cudaMemcpyAsync(
+                key_sequence(layer, batch) + offset * elements_per_token(),
+                key + source_offset, row_bytes, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                value_sequence(layer, batch) + offset * elements_per_token(),
+                value + source_offset, row_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+    }
 
     for (std::size_t batch = 0; batch < batch_size; ++batch) {
         host_lengths_[length_index(layer, batch)] += token_count;
@@ -375,10 +296,6 @@ void KVCache::release() noexcept {
     if (values_ != nullptr) {
         cudaFree(values_);
         values_ = nullptr;
-    }
-    if (device_lengths_ != nullptr) {
-        cudaFree(device_lengths_);
-        device_lengths_ = nullptr;
     }
     delete[] host_lengths_;
     host_lengths_ = nullptr;
