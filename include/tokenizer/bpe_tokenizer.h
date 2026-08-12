@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <optional>
 #include <vector>
 
 namespace bpe {
@@ -112,6 +113,7 @@ namespace bpe {
         [[nodiscard]] std::size_t vocab_size() const noexcept;
         [[nodiscard]] const std::vector<MergeRule>& merges() const noexcept;
         [[nodiscard]] const std::vector<std::string>& special_tokens() const noexcept;
+        [[nodiscard]] std::optional<TokenId> special_token_id(std::string_view token) const noexcept;
         [[nodiscard]] PretokenizerMode pretokenizer_mode() const noexcept;
 
     private:

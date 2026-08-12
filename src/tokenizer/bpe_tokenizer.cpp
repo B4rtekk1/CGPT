@@ -2380,6 +2380,15 @@ const std::vector<std::string>& BpeTokenizer::special_tokens() const noexcept {
     return special_tokens_;
 }
 
+std::optional<TokenId> BpeTokenizer::special_token_id(const std::string_view token) const noexcept {
+    for (std::size_t index = 0; index < special_tokens_.size(); ++index) {
+        if (special_tokens_[index] == token) {
+            return kByteVocabularySize + static_cast<TokenId>(index);
+        }
+    }
+    return std::nullopt;
+}
+
 PretokenizerMode BpeTokenizer::pretokenizer_mode() const noexcept {
     return pretokenizer_mode_;
 }

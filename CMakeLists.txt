@@ -29,6 +29,7 @@ add_library(cgpt_core STATIC
         src/core/kv_cache.cu
         src/core/transformer_block.cu
         src/core/transformer_model.cu
+        src/core/generation.cu
         src/core/cuda_graph.cu
         src/ops/flash_attention.cu)
 
