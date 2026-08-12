@@ -28,6 +28,7 @@ add_library(cgpt_core STATIC
         src/core/tensor.cu
         src/core/kv_cache.cu
         src/core/transformer_block.cu
+        src/core/transformer_model.cu
         src/core/cuda_graph.cu
         src/ops/flash_attention.cu)
 
@@ -77,13 +78,14 @@ add_cgpt_test(cuda_graph_test tests/cuda_graph_test.cu cgpt_core)
 add_cgpt_test(cuda_benchmark_test tests/cuda_benchmark_test.cu cgpt_core)
 add_cgpt_test(kv_cache_test tests/kv_cache_test.cu cgpt_core)
 add_cgpt_test(transformer_block_test tests/transformer_block_test.cu cgpt_core)
+add_cgpt_test(transformer_model_test tests/transformer_model_test.cu cgpt_core)
 add_cgpt_test(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp cgpt_tokenizer)
 add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_tokenizer)
 
 add_executable(run_all_tests tests/run_all_tests.cpp)
 add_dependencies(run_all_tests
         rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test
-        flash_attention_test embedding_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test
+        flash_attention_test embedding_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test
         bpe_tokenizer_test bpe_tokenizer_100mb_test)
 add_custom_target(run_all
         COMMAND $<TARGET_FILE:run_all_tests>
@@ -101,6 +103,7 @@ add_custom_target(run_all
                 cuda_benchmark_test $<TARGET_FILE:cuda_benchmark_test>
                 kv_cache_test $<TARGET_FILE:kv_cache_test>
                 transformer_block_test $<TARGET_FILE:transformer_block_test>
+                transformer_model_test $<TARGET_FILE:transformer_model_test>
                 bpe_tokenizer_test $<TARGET_FILE:bpe_tokenizer_test>
                 bpe_tokenizer_100mb_test $<TARGET_FILE:bpe_tokenizer_100mb_test>
         DEPENDS run_all_tests
@@ -110,7 +113,7 @@ add_custom_target(run_all
         COMMENT "Running all tests and printing the benchmark summary")
 
 set_tests_properties(
-        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test bpe_tokenizer_test
+        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
 
 set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES

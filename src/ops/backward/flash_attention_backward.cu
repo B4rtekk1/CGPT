@@ -92,9 +92,9 @@ __global__ void attention_backward_kernel(
         + static_cast<std::size_t>(query_head) * head_dim;
     const std::size_t kv_batch_base = static_cast<std::size_t>(batch) * key_value_sequence * kv_heads * head_dim;
     __shared__ float reduction[8];
-    __shared__ float max_score = 0;
-    __shared__ float normalizer = 0;
-    __shared__ float softmax_dot = 0;
+    __shared__ float max_score;
+    __shared__ float normalizer;
+    __shared__ float softmax_dot;
 
     float row_max = -CUDART_INF_F;
     for (int k_pos = 0; k_pos < visible; ++k_pos) {
