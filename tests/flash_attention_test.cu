@@ -101,6 +101,78 @@ std::vector<float> attention_reference(
     return output;
 }
 
+struct AttentionGradients {
+    std::vector<float> query;
+    std::vector<float> key;
+    std::vector<float> value;
+};
+
+AttentionGradients attention_backward_reference(
+    const std::vector<float>& grad_output, const std::vector<float>& query,
+    const std::vector<float>& key, const std::vector<float>& value,
+    std::size_t batch_size, std::size_t query_sequence,
+    std::size_t key_value_sequence, const FlashAttentionOptions& options
+) {
+    AttentionGradients result{
+        std::vector<float>(query.size()), std::vector<float>(key.size()),
+        std::vector<float>(value.size())};
+    const std::size_t heads_per_kv = options.num_query_heads / options.num_kv_heads;
+    const float scale = options.attention_scale > 0.0F
+        ? options.attention_scale : 1.0F / std::sqrt(static_cast<float>(options.head_dim));
+
+    for (std::size_t batch = 0; batch < batch_size; ++batch) {
+        for (std::size_t q_pos = 0; q_pos < query_sequence; ++q_pos) {
+            const std::size_t visible = options.causal
+                ? std::min(key_value_sequence, options.query_position_offset + q_pos + 1U)
+                : key_value_sequence;
+            for (std::size_t q_head = 0; q_head < options.num_query_heads; ++q_head) {
+                const std::size_t kv_head = q_head / heads_per_kv;
+                std::vector<float> probability(visible);
+                std::vector<float> d_probability(visible);
+                float maximum = -INFINITY;
+                for (std::size_t k_pos = 0; k_pos < visible; ++k_pos) {
+                    float score = 0.0F;
+                    float dp = 0.0F;
+                    for (std::size_t d = 0; d < options.head_dim; ++d) {
+                        const auto qi = index4(batch, q_pos, q_head, d, query_sequence,
+                            options.num_query_heads, options.head_dim);
+                        const auto ki = index4(batch, k_pos, kv_head, d, key_value_sequence,
+                            options.num_kv_heads, options.head_dim);
+                        score += query[qi] * key[ki];
+                        dp += grad_output[qi] * value[ki];
+                    }
+                    probability[k_pos] = score * scale;
+                    d_probability[k_pos] = dp;
+                    maximum = std::max(maximum, probability[k_pos]);
+                }
+                float normalizer = 0.0F;
+                for (float& p : probability) {
+                    p = std::exp(p - maximum);
+                    normalizer += p;
+                }
+                float softmax_dot = 0.0F;
+                for (std::size_t k_pos = 0; k_pos < visible; ++k_pos) {
+                    probability[k_pos] /= normalizer;
+                    softmax_dot += probability[k_pos] * d_probability[k_pos];
+                }
+                for (std::size_t k_pos = 0; k_pos < visible; ++k_pos) {
+                    const float d_score = probability[k_pos] * (d_probability[k_pos] - softmax_dot);
+                    for (std::size_t d = 0; d < options.head_dim; ++d) {
+                        const auto qi = index4(batch, q_pos, q_head, d, query_sequence,
+                            options.num_query_heads, options.head_dim);
+                        const auto ki = index4(batch, k_pos, kv_head, d, key_value_sequence,
+                            options.num_kv_heads, options.head_dim);
+                        result.query[qi] += scale * d_score * key[ki];
+                        result.key[ki] += scale * d_score * query[qi];
+                        result.value[ki] += probability[k_pos] * grad_output[qi];
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
 std::vector<float> values(std::size_t count, float phase) {
     std::vector<float> result(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -231,6 +303,50 @@ void test_custom_stream() {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
+void test_backward() {
+    auto options = valid_options();
+    options.num_query_heads = 4;
+    options.num_kv_heads = 2;
+    options.head_dim = 32;
+    options.causal = true;
+    options.query_position_offset = 2;
+    options.attention_scale = 0.23F;
+    constexpr std::size_t batch = 2;
+    constexpr std::size_t query_sequence = 3;
+    constexpr std::size_t key_sequence = 5;
+    const std::vector<std::size_t> query_shape{batch, query_sequence, 4, 32};
+    const std::vector<std::size_t> key_shape{batch, key_sequence, 2, 32};
+    const auto query_values = values(batch * query_sequence * 4 * 32, 0.2F);
+    const auto key_values = values(batch * key_sequence * 2 * 32, 0.7F);
+    const auto value_values = values(key_values.size(), 1.4F);
+    const auto grad_output_values = values(query_values.size(), 2.1F);
+    const auto expected = attention_backward_reference(
+        grad_output_values, query_values, key_values, value_values,
+        batch, query_sequence, key_sequence, options);
+
+    Tensor query(query_shape, Dtype::F16), key(key_shape, Dtype::F16);
+    Tensor value(key_shape, Dtype::F16), grad_output(query_shape, Dtype::F16);
+    Tensor grad_query(query_shape, Dtype::F16), grad_key(key_shape, Dtype::F16);
+    Tensor grad_value(key_shape, Dtype::F16);
+    query.copy_from_host(query_values);
+    key.copy_from_host(key_values);
+    value.copy_from_host(value_values);
+    grad_output.copy_from_host(grad_output_values);
+    flash_gqa_attention_backward(
+        grad_query, grad_key, grad_value, grad_output, query, key, value,
+        nullptr, options);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> actual_query(grad_query.numel());
+    std::vector<float> actual_key(grad_key.numel());
+    std::vector<float> actual_value(grad_value.numel());
+    grad_query.copy_to_host(actual_query);
+    grad_key.copy_to_host(actual_key);
+    grad_value.copy_to_host(actual_value);
+    expect_close(actual_query, expected.query, 3.0e-2F);
+    expect_close(actual_key, expected.key, 3.0e-2F);
+    expect_close(actual_value, expected.value, 3.0e-2F);
+}
+
 void benchmark_kernel() {
     FlashAttentionOptions options;
     options.num_query_heads = 32;
@@ -320,6 +436,7 @@ int main() {
         run_case(1, 3, 5, options, Dtype::F16, 3.0e-2F);
 
         test_custom_stream();
+        test_backward();
         test_validation();
         benchmark_kernel();
     } catch (const std::exception& error) {

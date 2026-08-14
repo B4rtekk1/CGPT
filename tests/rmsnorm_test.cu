@@ -265,9 +265,12 @@ void test_preallocated_output() {
     expect_close(actual, expected, 1.0e-4f);
 }
 
-void test_backward() {
-    constexpr std::size_t rows = 3;
-    constexpr std::size_t hidden = 7;
+void run_backward_case(
+    const std::size_t rows,
+    const std::size_t hidden,
+    const Dtype dtype = Dtype::F32,
+    const float tolerance = 2.0e-4f
+) {
     constexpr float epsilon = 1.0e-5f;
     std::vector<float> input(rows * hidden);
     std::vector<float> weight(hidden);
@@ -299,11 +302,11 @@ void test_backward() {
         }
     }
 
-    Tensor input_tensor({rows, hidden});
-    Tensor weight_tensor({hidden});
-    Tensor grad_output_tensor({rows, hidden});
-    Tensor grad_input({rows, hidden});
-    Tensor grad_weight({hidden});
+    Tensor input_tensor({rows, hidden}, dtype);
+    Tensor weight_tensor({hidden}, dtype);
+    Tensor grad_output_tensor({rows, hidden}, dtype);
+    Tensor grad_input({rows, hidden}, dtype);
+    Tensor grad_weight({hidden}, dtype);
     input_tensor.copy_from_host(input);
     weight_tensor.copy_from_host(weight);
     grad_output_tensor.copy_from_host(grad_output);
@@ -314,8 +317,8 @@ void test_backward() {
     std::vector<float> actual_weight(grad_weight.numel());
     grad_input.copy_to_host(actual_input);
     grad_weight.copy_to_host(actual_weight);
-    expect_close(actual_input, expected_input, 2.0e-4f);
-    expect_close(actual_weight, expected_weight, 2.0e-4f);
+    expect_close(actual_input, expected_input, tolerance);
+    expect_close(actual_weight, expected_weight, tolerance);
 }
 
 void test_device_type() {
@@ -344,6 +347,13 @@ void benchmark_kernel() {
         rmsnorm_forward(output, input, weight, 1.0e-5F, stream);
     });
 
+    Tensor bf16_input({kRows, kHiddenSize}, Dtype::BF16);
+    Tensor bf16_weight({kHiddenSize}, Dtype::BF16);
+    Tensor bf16_output({kRows, kHiddenSize}, Dtype::BF16);
+    test::benchmark_cuda_launches("RMSNorm BF16 kernel", [&](cudaStream_t stream) {
+        rmsnorm_forward(bf16_output, bf16_input, bf16_weight, 1.0e-5F, stream);
+    });
+
     Tensor grad_output({kRows, kHiddenSize}, Dtype::F16);
     Tensor grad_input({kRows, kHiddenSize}, Dtype::F16);
     Tensor grad_weight({kHiddenSize}, Dtype::F16);
@@ -351,6 +361,15 @@ void benchmark_kernel() {
         rmsnorm_backward(
             grad_input, grad_weight, grad_output,
             input, weight, 1.0e-5F, stream);
+    }, 1000, 20);
+
+    Tensor bf16_grad_output({kRows, kHiddenSize}, Dtype::BF16);
+    Tensor bf16_grad_input({kRows, kHiddenSize}, Dtype::BF16);
+    Tensor bf16_grad_weight({kHiddenSize}, Dtype::BF16);
+    test::benchmark_cuda_launches("RMSNorm BF16 backward kernel", [&](cudaStream_t stream) {
+        rmsnorm_backward(
+            bf16_grad_input, bf16_grad_weight, bf16_grad_output,
+            bf16_input, bf16_weight, 1.0e-5F, stream);
     }, 1000, 20);
 }
 
@@ -373,6 +392,7 @@ int main() {
     // F16/BF16 inputs accumulate the RMS in F32, then round on output.
     run_case({3, 513}, 1.0e-5f, Dtype::F16, 3.0e-3f);
     run_case({3, 513}, 1.0e-5f, Dtype::BF16, 2.0e-2f);
+    run_case({2, 4096}, 1.0e-5f, Dtype::BF16, 2.0e-2f);
 
     expect_invalid_argument(Tensor({2, 4, 1}), Tensor({4}));
     expect_invalid_argument(Tensor({2, 4}), Tensor({2, 4}));
@@ -389,7 +409,10 @@ int main() {
     test_invalid_epsilon();
     test_custom_stream();
     test_preallocated_output();
-    test_backward();
+    run_backward_case(3, 7);
+    run_backward_case(2, 4096, Dtype::F16, 5.0e-3f);
+    // Exercises a longer row reduction and the BF16 backward path.
+    run_backward_case(129, 513, Dtype::BF16, 2.5e-1f);
     benchmark_kernel();
 
     std::cout << "RMSNorm tests passed.\n";

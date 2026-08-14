@@ -1,5 +1,6 @@
 #include "core/cuda_check.h"
 #include "ops/embedding.h"
+#include "ops/backward/embedding_backward.h"
 #include "cuda_benchmark.h"
 
 #include <cmath>
@@ -179,6 +180,28 @@ void test_validation() {
     });
 }
 
+void test_backward_repeated_tokens() {
+    for (const Dtype dtype : {Dtype::F16, Dtype::BF16}) {
+        Tensor grad_weight({3, 4}, dtype);
+        Tensor grad_output({3, 4}, dtype);
+        grad_output.copy_from_host(std::vector<float>{
+            1.0f, 2.0f, 3.0f, 4.0f,
+            0.5f, 1.5f, -1.0f, 2.0f,
+            7.0f, 8.0f, 9.0f, 10.0f});
+        DeviceTokenIds token_ids(3);
+        embedding_upload_token_ids(
+            token_ids.get(), std::vector<bpe::TokenId>{1, 1, 2});
+        embedding_backward(grad_weight, grad_output, token_ids.get(), 3);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        expect_close(
+            read_tensor(grad_weight),
+            {0.0f, 0.0f, 0.0f, 0.0f,
+             1.5f, 3.5f, 2.0f, 6.0f,
+             7.0f, 8.0f, 9.0f, 10.0f},
+            dtype == Dtype::F16 ? 1.0e-2f : 5.0e-2f);
+    }
+}
+
 void benchmark_kernel() {
     constexpr std::size_t kVocabularySize = 32'000;
     constexpr std::size_t kTokenCount = 512;
@@ -197,6 +220,13 @@ void benchmark_kernel() {
     test::benchmark_cuda_launches("Embedding kernel", [&](cudaStream_t stream) {
         embedding_forward(output, token_ids.get(), kTokenCount, weight, stream);
     });
+
+    CUDA_CHECK(cudaMemset(weight.raw_data(), 0, weight.nbytes()));
+    test::benchmark_cuda_launches("Embedding backward kernel", [&](cudaStream_t stream) {
+        embedding_backward(
+            weight, output, token_ids.get(), kTokenCount, stream,
+            EmbeddingBackwardOptions{.accumulate_weight = true});
+    }, 1000, 20);
 }
 
 } // namespace
@@ -208,6 +238,7 @@ int main() {
         test_reduced_precision_and_stream();
         test_reduced_precision_odd_hidden_size();
         test_validation();
+        test_backward_repeated_tokens();
         benchmark_kernel();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

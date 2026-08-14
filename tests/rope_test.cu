@@ -1,5 +1,6 @@
 #include "core/cuda_check.h"
 #include "ops/rope.h"
+#include "ops/backward/rope_backward.h"
 #include "cuda_benchmark.h"
 
 #include <cmath>
@@ -95,6 +96,36 @@ namespace {
         });
     }
 
+    void test_backward_rotation_and_partial_dimension(
+        const Dtype dtype,
+        const float tolerance
+    ) {
+        Tensor grad_rotated_query({1, 2, 2, 4}, dtype);
+        Tensor grad_rotated_key({1, 2, 1, 4}, dtype);
+        Tensor grad_query({1, 2, 2, 4}, dtype);
+        Tensor grad_key({1, 2, 1, 4}, dtype);
+        Tensor cosine({2, 1}, dtype);
+        Tensor sine({2, 1}, dtype);
+        const std::vector<float> q{
+            1, 2, 30, 40,  3, 4, 50, 60,
+            5, 6, 70, 80,  7, 8, 90, 100};
+        const std::vector<float> k{1, -2, 30, 40, 5, -6, 70, 80};
+        grad_rotated_query.copy_from_host(q);
+        grad_rotated_key.copy_from_host(k);
+        cosine.copy_from_host(std::vector<float>{1.0f, 0.0f});
+        sine.copy_from_host(std::vector<float>{0.0f, 1.0f});
+
+        rope_backward(
+            grad_query, grad_key, grad_rotated_query, grad_rotated_key,
+            cosine, sine, nullptr, RopeOptions{.rotary_dim = 2});
+        CUDA_CHECK(cudaDeviceSynchronize());
+        expect_close(read_tensor(grad_query), {
+            1, 2, 30, 40,  3, 4, 50, 60,
+            6, -5, 70, 80,  8, -7, 90, 100}, tolerance);
+        expect_close(read_tensor(grad_key), {
+            1, -2, 30, 40,  -6, -5, 70, 80}, tolerance);
+    }
+
     void benchmark_kernel() {
         constexpr std::size_t kBatchSize = 1;
         constexpr std::size_t kSequenceLength = 512;
@@ -109,6 +140,45 @@ namespace {
         test::benchmark_cuda_launches("RoPE kernel", [&](cudaStream_t stream) {
             rope_forward(query, key, cosine, sine, stream);
         });
+
+        Tensor grad_rotated_query(
+            {kBatchSize, kSequenceLength, kQueryHeads, kHeadDimension}, Dtype::F16);
+        Tensor grad_rotated_key(
+            {kBatchSize, kSequenceLength, kKeyHeads, kHeadDimension}, Dtype::F16);
+        Tensor grad_query(
+            {kBatchSize, kSequenceLength, kQueryHeads, kHeadDimension}, Dtype::F16);
+        Tensor grad_key(
+            {kBatchSize, kSequenceLength, kKeyHeads, kHeadDimension}, Dtype::F16);
+        test::benchmark_cuda_launches("RoPE backward kernel", [&](cudaStream_t stream) {
+            rope_backward(
+                grad_query, grad_key, grad_rotated_query, grad_rotated_key,
+                cosine, sine, stream);
+        }, 1000, 20);
+
+        Tensor bf16_query(
+            {kBatchSize, kSequenceLength, kQueryHeads, kHeadDimension}, Dtype::BF16);
+        Tensor bf16_key(
+            {kBatchSize, kSequenceLength, kKeyHeads, kHeadDimension}, Dtype::BF16);
+        Tensor bf16_cosine({kSequenceLength, kHeadDimension / 2}, Dtype::BF16);
+        Tensor bf16_sine({kSequenceLength, kHeadDimension / 2}, Dtype::BF16);
+        test::benchmark_cuda_launches("RoPE BF16 kernel", [&](cudaStream_t stream) {
+            rope_forward(bf16_query, bf16_key, bf16_cosine, bf16_sine, stream);
+        }, 1000, 20);
+
+        Tensor bf16_grad_rotated_query(
+            {kBatchSize, kSequenceLength, kQueryHeads, kHeadDimension}, Dtype::BF16);
+        Tensor bf16_grad_rotated_key(
+            {kBatchSize, kSequenceLength, kKeyHeads, kHeadDimension}, Dtype::BF16);
+        Tensor bf16_grad_query(
+            {kBatchSize, kSequenceLength, kQueryHeads, kHeadDimension}, Dtype::BF16);
+        Tensor bf16_grad_key(
+            {kBatchSize, kSequenceLength, kKeyHeads, kHeadDimension}, Dtype::BF16);
+        test::benchmark_cuda_launches("RoPE BF16 backward kernel", [&](cudaStream_t stream) {
+            rope_backward(
+                bf16_grad_query, bf16_grad_key,
+                bf16_grad_rotated_query, bf16_grad_rotated_key,
+                bf16_cosine, bf16_sine, stream);
+        }, 1000, 20);
     }
 }
 
@@ -117,6 +187,9 @@ int main() {
         test_rotation_and_partial_dimension(Dtype::F32, 1.0e-5f);
         test_rotation_and_partial_dimension(Dtype::F16, 3.0e-3f);
         test_rotation_and_partial_dimension(Dtype::BF16, 2.0e-2f);
+        test_backward_rotation_and_partial_dimension(Dtype::F32, 1.0e-5f);
+        test_backward_rotation_and_partial_dimension(Dtype::F16, 3.0e-3f);
+        test_backward_rotation_and_partial_dimension(Dtype::BF16, 2.0e-2f);
         test_position_offset_and_validation();
         benchmark_kernel();
     } catch (const std::exception& error) {

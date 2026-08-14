@@ -6,6 +6,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 
@@ -14,6 +15,10 @@ namespace {
 
     [[nodiscard]] bool valid_block_size(const int block_size) noexcept {
         return block_size >= kWarpSize && block_size <= 1024 && block_size % kWarpSize == 0;
+    }
+
+    [[nodiscard]] bool aligned_to(const void *pointer, const std::uintptr_t alignment) noexcept {
+        return reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
     }
 
     template<typename T, bool BoundsCheck>
@@ -35,6 +40,32 @@ namespace {
         T *const weight_row = grad_weight + static_cast<std::size_t>(token_id) * hidden_size;
         const T *const output_row = grad_output + token * static_cast<std::size_t>(hidden_size);
         for (int feature = static_cast<int>(threadIdx.x); feature < hidden_size;
+             feature += static_cast<int>(blockDim.x)) {
+            atomicAdd(weight_row + feature, output_row[feature]);
+        }
+    }
+
+    template<typename PackedT, bool BoundsCheck>
+    __global__ void embedding_backward_packed_kernel(
+        PackedT * __restrict__ grad_weight,
+        const PackedT * __restrict__ grad_output,
+        const bpe::TokenId * __restrict__ token_ids,
+        const bpe::TokenId vocabulary_size,
+        const int packed_hidden_size
+    ) {
+        const std::size_t token = blockIdx.x;
+        const bpe::TokenId token_id = token_ids[token];
+        if constexpr (BoundsCheck) {
+            if (token_id >= vocabulary_size) {
+                return;
+            }
+        }
+
+        PackedT *const weight_row =
+            grad_weight + static_cast<std::size_t>(token_id) * packed_hidden_size;
+        const PackedT *const output_row =
+            grad_output + token * static_cast<std::size_t>(packed_hidden_size);
+        for (int feature = static_cast<int>(threadIdx.x); feature < packed_hidden_size;
              feature += static_cast<int>(blockDim.x)) {
             atomicAdd(weight_row + feature, output_row[feature]);
         }
@@ -103,6 +134,30 @@ namespace {
                 token_ids, vocabulary_size, hidden_size);
         }
     }
+
+    template<typename PackedT>
+    void launch_packed(
+        Tensor &grad_weight, const Tensor &grad_output,
+        const bpe::TokenId *token_ids, const std::size_t token_count,
+        cudaStream_t stream, const EmbeddingBackwardOptions &options
+    ) {
+        const auto vocabulary_size = static_cast<bpe::TokenId>(grad_weight.size(0));
+        const auto grid = static_cast<unsigned int>(token_count);
+        const int packed_hidden_size = static_cast<int>(grad_weight.size(1) / 2);
+        if (options.bounds_check) {
+            embedding_backward_packed_kernel<PackedT, true>
+                <<<grid, options.block_size, 0, stream>>>(
+                    static_cast<PackedT *>(grad_weight.raw_data()),
+                    static_cast<const PackedT *>(grad_output.raw_data()),
+                    token_ids, vocabulary_size, packed_hidden_size);
+        } else {
+            embedding_backward_packed_kernel<PackedT, false>
+                <<<grid, options.block_size, 0, stream>>>(
+                    static_cast<PackedT *>(grad_weight.raw_data()),
+                    static_cast<const PackedT *>(grad_output.raw_data()),
+                    token_ids, vocabulary_size, packed_hidden_size);
+        }
+    }
 }
 
 void embedding_backward(
@@ -118,15 +173,30 @@ void embedding_backward(
         CUDA_CHECK(cudaMemsetAsync(grad_weight.raw_data(), 0, grad_weight.nbytes(), stream));
     }
 
+    const bool can_pack = (grad_weight.size(1) & 1u) == 0 &&
+        aligned_to(grad_weight.raw_data(), alignof(std::uint32_t)) &&
+        aligned_to(grad_output.raw_data(), alignof(std::uint32_t));
     switch (grad_weight.dtype()) {
         case Dtype::F32:
             launch<float>(grad_weight, grad_output, device_token_ids, token_count, stream, options);
             break;
         case Dtype::F16:
-            launch<half>(grad_weight, grad_output, device_token_ids, token_count, stream, options);
+            if (can_pack) {
+                launch_packed<half2>(
+                    grad_weight, grad_output, device_token_ids, token_count, stream, options);
+            } else {
+                launch<half>(
+                    grad_weight, grad_output, device_token_ids, token_count, stream, options);
+            }
             break;
         case Dtype::BF16:
-            launch<__nv_bfloat16>(grad_weight, grad_output, device_token_ids, token_count, stream, options);
+            if (can_pack) {
+                launch_packed<__nv_bfloat162>(
+                    grad_weight, grad_output, device_token_ids, token_count, stream, options);
+            } else {
+                launch<__nv_bfloat16>(
+                    grad_weight, grad_output, device_token_ids, token_count, stream, options);
+            }
             break;
         default:
             throw std::invalid_argument("embedding_backward: unsupported dtype");

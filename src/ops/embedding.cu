@@ -191,6 +191,7 @@ void launch_scalar(
                 vocabulary_size, packed_hidden_size);
         }
     }
+
 }
 
 void embedding_upload_token_ids(
@@ -225,11 +226,19 @@ void embedding_forward(
     validate_embedding(output, device_token_ids, token_count, weight, options);
 
     const int hidden_size = static_cast<int>(weight.size(1));
+    const std::size_t row_bytes = weight.nbytes() / weight.size(0);
+    const bool can_pack_128 = row_bytes % sizeof(uint4) == 0 &&
+        aligned_to(output.raw_data(), alignof(uint4)) &&
+        aligned_to(weight.raw_data(), alignof(uint4));
     const bool can_pack = hidden_size % 2 == 0 &&
         aligned_to(output.raw_data(), alignof(std::uint32_t)) &&
         aligned_to(weight.raw_data(), alignof(std::uint32_t));
 
-    if (weight.dtype() == Dtype::F32) {
+    if (can_pack_128) {
+        launch_packed<uint4>(
+            output, device_token_ids, weight, token_count,
+            static_cast<int>(row_bytes / sizeof(uint4)), stream, options);
+    } else if (weight.dtype() == Dtype::F32) {
         launch_scalar<float>(
             output, device_token_ids, weight, token_count, hidden_size, stream, options);
     } else if (weight.dtype() == Dtype::F16 && can_pack) {

@@ -3,7 +3,7 @@
  */
 
 #include "ops/backward/rope_backward.h"
-#include "core/cuda_check.h"alloca
+#include "core/cuda_check.h"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
@@ -51,7 +51,8 @@ namespace {
             const auto position = static_cast<std::uint32_t>(token % sequence_length);
             const std::size_t cache_offset = static_cast<std::size_t>(position + position_offset) * rotary_pair_count;
             const std::size_t query_token_offset = token * static_cast<std::size_t>(query_head_count) * head_dim;
-            const std::size_t key_token_offset = cache_offset + key_head_count * head_dim;
+            const std::size_t key_token_offset =
+                token * static_cast<std::size_t>(key_head_count) * head_dim;
 
             for (std::uint32_t pair = threadIdx.x; pair < rotary_pair_count; pair += blockDim.x) {
                 const float cosine = to_float(cos_cache[cache_offset + pair]);
@@ -78,6 +79,74 @@ namespace {
                             static_cast<T>(fmaf(-dy0, sine, dy1 * cosine));
                 }
             }
+        }
+    }
+
+    /** Register-cached FP16 backward path for the model's 32/8-head layout. */
+    __global__ __launch_bounds__(256) void rope_backward_f16_32_8_128_kernel(
+        half * __restrict__ grad_query,
+        half * __restrict__ grad_key,
+        const half * __restrict__ grad_rotated_query,
+        const half * __restrict__ grad_rotated_key,
+        const half * __restrict__ cos_cache,
+        const half * __restrict__ sin_cache,
+        const std::uint32_t sequence_length,
+        const std::uint32_t position_offset
+    ) {
+        constexpr std::uint32_t query_heads = 32U;
+        constexpr std::uint32_t key_heads = 8U;
+        constexpr std::uint32_t head_dim = 128U;
+        constexpr std::uint32_t pairs_per_head = 64U;
+        constexpr std::uint32_t total_heads = query_heads + key_heads;
+        constexpr std::uint32_t work_per_token = total_heads * pairs_per_head;
+
+        const std::uint32_t token = blockIdx.x;
+        const std::uint32_t position = token % sequence_length;
+        const std::size_t cache_base =
+            static_cast<std::size_t>(position + position_offset) * pairs_per_head;
+
+        __shared__ float shared_cos[pairs_per_head];
+        __shared__ float shared_sin[pairs_per_head];
+        if (threadIdx.x < pairs_per_head) {
+            shared_cos[threadIdx.x] = __half2float(cos_cache[cache_base + threadIdx.x]);
+            shared_sin[threadIdx.x] = __half2float(sin_cache[cache_base + threadIdx.x]);
+        }
+        __syncthreads();
+
+        const std::size_t query_token_base =
+            static_cast<std::size_t>(token) * query_heads * head_dim;
+        const std::size_t key_token_base =
+            static_cast<std::size_t>(token) * key_heads * head_dim;
+
+#pragma unroll
+        for (std::uint32_t work = threadIdx.x;
+             work < work_per_token;
+             work += blockDim.x) {
+            const std::uint32_t pair = work & (pairs_per_head - 1U);
+            const std::uint32_t combined_head = work >> 6U;
+            const std::size_t pair_offset = static_cast<std::size_t>(pair) * 2U;
+
+            const half *input_pair;
+            half *output_pair;
+            if (combined_head < query_heads) {
+                const std::size_t offset = query_token_base +
+                    static_cast<std::size_t>(combined_head) * head_dim + pair_offset;
+                input_pair = grad_rotated_query + offset;
+                output_pair = grad_query + offset;
+            } else {
+                const std::size_t offset = key_token_base +
+                    static_cast<std::size_t>(combined_head - query_heads) * head_dim + pair_offset;
+                input_pair = grad_rotated_key + offset;
+                output_pair = grad_key + offset;
+            }
+
+            const float2 gradient =
+                __half22float2(*reinterpret_cast<const half2 *>(input_pair));
+            const float cosine = shared_cos[pair];
+            const float sine = shared_sin[pair];
+            *reinterpret_cast<half2 *>(output_pair) = __floats2half2_rn(
+                fmaf(gradient.y, sine, gradient.x * cosine),
+                fmaf(-gradient.x, sine, gradient.y * cosine));
         }
     }
 
@@ -162,7 +231,14 @@ namespace {
     ) {
         const auto grid_size = static_cast<std::uint32_t>(
             std::min(token_count, static_cast<std::size_t>(kMaxGridX)));
-        rope_backward_kernel<T><<<grid_size, kThreadsPerBlock, 0, stream>>>(
+        const auto rotary_pairs = checked_u32(
+            (options.rotary_dim == 0 ? grad_query.shape()[3] : options.rotary_dim) / 2U,
+            "rotary pair count");
+        const std::uint32_t block_size = rotary_pairs <= 32U ? 32U
+            : rotary_pairs <= 64U ? 64U
+            : rotary_pairs <= 128U ? 128U
+            : kThreadsPerBlock;
+        rope_backward_kernel<T><<<grid_size, block_size, 0, stream>>>(
             static_cast<T *>(grad_query.raw_data()), static_cast<T *>(grad_key.raw_data()),
             static_cast<const T *>(grad_rotated_query.raw_data()),
             static_cast<const T *>(grad_rotated_key.raw_data()),
@@ -171,8 +247,7 @@ namespace {
             checked_u32(grad_query.shape()[2], "query head count"),
             checked_u32(grad_key.shape()[2], "key head count"),
             checked_u32(grad_query.shape()[3], "head dimension"),
-            checked_u32((options.rotary_dim == 0 ? grad_query.shape()[3] : options.rotary_dim) / 2U,
-                        "rotary pair count"),
+            rotary_pairs,
             checked_u32(options.position_offset, "position offset"));
     }
 }
@@ -188,15 +263,20 @@ void rope_backward(
     if (grad_query.numel() == 0 || grad_key.numel() == 0 || grad_query.shape()[1] == 0) {
         return;
     }
-    // RoPE leaves dimensions beyond rotary_dim unchanged; copy those values
-    // (and establish the complete output) before overwriting rotary pairs.
-    if (grad_query.raw_data() != grad_rotated_query.raw_data()) {
-        CUDA_CHECK(cudaMemcpyAsync(grad_query.raw_data(), grad_rotated_query.raw_data(),
-            grad_query.nbytes(), cudaMemcpyDeviceToDevice, stream));
-    }
-    if (grad_key.raw_data() != grad_rotated_key.raw_data()) {
-        CUDA_CHECK(cudaMemcpyAsync(grad_key.raw_data(), grad_rotated_key.raw_data(),
-            grad_key.nbytes(), cudaMemcpyDeviceToDevice, stream));
+    // A full-width rotation overwrites every output element, so copying the
+    // complete Q/K tensors first only doubles global-memory traffic.
+    const std::size_t rotary_dim = rope_options.rotary_dim == 0
+        ? grad_query.shape()[3]
+        : rope_options.rotary_dim;
+    if (rotary_dim < grad_query.shape()[3]) {
+        if (grad_query.raw_data() != grad_rotated_query.raw_data()) {
+            CUDA_CHECK(cudaMemcpyAsync(grad_query.raw_data(), grad_rotated_query.raw_data(),
+                grad_query.nbytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+        if (grad_key.raw_data() != grad_rotated_key.raw_data()) {
+            CUDA_CHECK(cudaMemcpyAsync(grad_key.raw_data(), grad_rotated_key.raw_data(),
+                grad_key.nbytes(), cudaMemcpyDeviceToDevice, stream));
+        }
     }
     if (grad_query.shape()[0] != 0 &&
         grad_query.shape()[1] > std::numeric_limits<std::size_t>::max() /
@@ -214,8 +294,26 @@ void rope_backward(
                           cos_cache, sin_cache, token_count, rope_options, stream);
             break;
         case Dtype::F16:
-            launch<half>(grad_query, grad_key, grad_rotated_query, grad_rotated_key,
-                         cos_cache, sin_cache, token_count, rope_options, stream);
+            if (grad_query.shape()[2] == 32U &&
+                grad_key.shape()[2] == 8U &&
+                grad_query.shape()[3] == 128U &&
+                rotary_dim == 128U &&
+                token_count <= kMaxGridX) {
+                rope_backward_f16_32_8_128_kernel<<<
+                    static_cast<std::uint32_t>(token_count), kThreadsPerBlock, 0, stream
+                >>>(
+                    static_cast<half *>(grad_query.raw_data()),
+                    static_cast<half *>(grad_key.raw_data()),
+                    static_cast<const half *>(grad_rotated_query.raw_data()),
+                    static_cast<const half *>(grad_rotated_key.raw_data()),
+                    static_cast<const half *>(cos_cache.raw_data()),
+                    static_cast<const half *>(sin_cache.raw_data()),
+                    checked_u32(grad_query.shape()[1], "sequence length"),
+                    checked_u32(rope_options.position_offset, "position offset"));
+            } else {
+                launch<half>(grad_query, grad_key, grad_rotated_query, grad_rotated_key,
+                             cos_cache, sin_cache, token_count, rope_options, stream);
+            }
             break;
         case Dtype::BF16:
             launch<__nv_bfloat16>(grad_query, grad_key, grad_rotated_query, grad_rotated_key,

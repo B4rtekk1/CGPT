@@ -738,22 +738,24 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
         }
         __syncwarp();
 
+        // Accumulate every 16-row probability subtile in the WMMA fragment
+        // before spilling it once, instead of round-tripping each partial
+        // result through shared memory.
         #pragma unroll
-        for (int subtile = 0; subtile < kN; subtile += 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
-                           wmma::row_major> probability_fragment;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
-                           wmma::row_major> value_fragment;
+        for (int dimension = 0; dimension < HeadDim; dimension += 16) {
             wmma::fragment<wmma::accumulator, 16, 16, 16, float>
                 output_fragment;
-            wmma::load_matrix_sync(
-                probability_fragment,
-                warp_probabilities + subtile,
-                kN);
-
+            wmma::fill_fragment(output_fragment, 0.0F);
             #pragma unroll
-            for (int dimension = 0; dimension < HeadDim; dimension += 16) {
-                wmma::fill_fragment(output_fragment, 0.0F);
+            for (int subtile = 0; subtile < kN; subtile += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                               wmma::row_major> probability_fragment;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                               wmma::row_major> value_fragment;
+                wmma::load_matrix_sync(
+                    probability_fragment,
+                    warp_probabilities + subtile,
+                    kN);
                 wmma::load_matrix_sync(
                     value_fragment,
                     value_shared + subtile * HeadDim + dimension,
@@ -763,20 +765,20 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
                     probability_fragment,
                     value_fragment,
                     output_fragment);
-                wmma::store_matrix_sync(
-                    warp_mma_tile,
-                    output_fragment,
-                    16,
-                    wmma::mem_row_major);
-                __syncwarp();
-                for (int index = lane; index < kBlockM * 16; index += kWarpSize) {
-                    const int local_row = index >> 4;
-                    const int column = index & 15;
-                    warp_output[local_row * HeadDim + dimension + column] +=
-                        warp_mma_tile[index];
-                }
-                __syncwarp();
             }
+            wmma::store_matrix_sync(
+                warp_mma_tile,
+                output_fragment,
+                16,
+                wmma::mem_row_major);
+            __syncwarp();
+            for (int index = lane; index < kBlockM * 16; index += kWarpSize) {
+                const int local_row = index >> 4;
+                const int column = index & 15;
+                warp_output[local_row * HeadDim + dimension + column] +=
+                    warp_mma_tile[index];
+            }
+            __syncwarp();
         }
         __syncthreads();
     }

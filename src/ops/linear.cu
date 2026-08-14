@@ -263,7 +263,11 @@ public:
             &key.workspace_bytes,
             sizeof(key.workspace_bytes)));
 
-        constexpr int max_algorithms = 32;
+        // cuBLASLt returns heuristics in estimated-performance order. Tuning
+        // the leading candidates preserves the best steady-state kernel on
+        // tested Ampere shapes while avoiding dozens of blocking probe GEMMs
+        // whenever a new linear shape is encountered.
+        constexpr int max_algorithms = 8;
         std::vector<cublasLtMatmulHeuristicResult_t> heuristics(max_algorithms);
         int returned_results = 0;
         const cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
@@ -528,23 +532,35 @@ MatmulPlan& cached_plan(
     cublasLtHandle_t handle,
     const PlanKey& key
 ) {
-    thread_local std::unordered_map<
-        PlanKey,
-        std::unique_ptr<MatmulPlan>,
-        PlanKeyHash> plans;
+    struct CachedPlan {
+        std::unique_ptr<MatmulPlan> plan;
+        std::size_t last_used = 0;
+    };
+    struct PlanCache {
+        std::unordered_map<PlanKey, CachedPlan, PlanKeyHash> plans;
+        std::size_t clock = 0;
+    };
+    thread_local PlanCache cache;
 
-    if (const auto found = plans.find(key); found != plans.end()) {
-        return *found->second;
+    if (const auto found = cache.plans.find(key); found != cache.plans.end()) {
+        found->second.last_used = ++cache.clock;
+        return *found->second.plan;
     }
 
     constexpr std::size_t max_cached_plans = 64;
-    if (plans.size() >= max_cached_plans) {
-        plans.clear();
+    if (cache.plans.size() >= max_cached_plans) {
+        const auto oldest = std::min_element(
+            cache.plans.begin(), cache.plans.end(),
+            [](const auto& left, const auto& right) {
+                return left.second.last_used < right.second.last_used;
+            });
+        cache.plans.erase(oldest);
     }
 
     auto plan = std::make_unique<MatmulPlan>(handle, key);
     MatmulPlan& result = *plan;
-    plans.emplace(key, std::move(plan));
+    cache.plans.emplace(
+        key, CachedPlan{std::move(plan), ++cache.clock});
     return result;
 }
 

@@ -2,12 +2,11 @@
  * @file flash_attention_backward.cu
  * @brief Memory-efficient CUDA backward pass for grouped-query attention.
  *
- * One CTA owns one (batch, query position, query head) row. It makes three
- * streaming passes over K/V: online softmax maximum/normalizer,
- * softmax-dot-product reduction, then dQ/dK/dV. This avoids the O(Q*K)
- * attention-probability
- * workspace. K/V are shared between GQA heads, so their contributions use
- * atomics; dQ has exactly one owning CTA and needs none.
+ * One warp owns one (batch, query position, query head) row, and a CTA handles
+ * four rows. Each warp makes three streaming passes over K/V: online softmax
+ * maximum/normalizer, softmax-dot-product reduction, then dQ/dK/dV. This avoids
+ * the O(Q*K) attention-probability workspace. K/V are shared between GQA heads,
+ * so their contributions use atomics; dQ has exactly one owner and needs none.
  */
 #include "ops/flash_attention.h"
 
@@ -24,49 +23,15 @@
 #include <stdexcept>
 
 namespace {
-// One thread owns up to two dimensions for the largest supported head (D=256).
-// 128 threads avoid running four completely idle warps for the common D=128
-// model shape while retaining enough parallelism for the reductions.
 constexpr int kThreads = 128;
+constexpr int kWarpSize = 32;
+constexpr int kWarpsPerBlock = kThreads / kWarpSize;
 
-__device__ __forceinline__ float block_sum(float value, float* scratch) {
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
+__device__ __forceinline__ float warp_sum(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         value += __shfl_down_sync(0xffffffffU, value, offset);
     }
-    if (lane == 0) scratch[warp] = value;
-    __syncthreads();
-    const int warp_count = (static_cast<int>(blockDim.x) + 31) >> 5;
-    value = static_cast<int>(threadIdx.x) < warp_count ? scratch[lane] : 0.0f;
-    if (warp == 0) {
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            value += __shfl_down_sync(0xffffffffU, value, offset);
-        }
-        if (lane == 0) scratch[0] = value;
-    }
-    __syncthreads();
-    return scratch[0];
-}
-
-__device__ __forceinline__ float block_max(float value, float* scratch) {
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value = fmaxf(value, __shfl_down_sync(0xffffffffU, value, offset));
-    }
-    if (lane == 0) scratch[warp] = value;
-    __syncthreads();
-    const int warp_count = (static_cast<int>(blockDim.x) + 31) >> 5;
-    value = static_cast<int>(threadIdx.x) < warp_count ? scratch[lane] : -CUDART_INF_F;
-    if (warp == 0) {
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            value = fmaxf(value, __shfl_down_sync(0xffffffffU, value, offset));
-        }
-        if (lane == 0) scratch[0] = value;
-    }
-    __syncthreads();
-    return scratch[0];
+    return __shfl_sync(0xffffffffU, value, 0);
 }
 
 template <typename T>
@@ -84,11 +49,14 @@ __global__ void attention_backward_kernel(
     int query_heads, int kv_heads, int head_dim, float scale,
     bool causal, int query_position_offset, bool accumulate_grad_query
 ) {
-    const int linear = static_cast<int>(blockIdx.x);
-    const int query_head = linear % query_heads;
-    const int query_pos = (linear / query_heads) % query_sequence;
-    const int batch = linear / (query_heads * query_sequence);
-    if (batch >= batch_size) return;
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::size_t linear = static_cast<std::size_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    const std::size_t row_count = static_cast<std::size_t>(batch_size) * query_sequence * query_heads;
+    if (linear >= row_count) return;
+    const int query_head = static_cast<int>(linear % query_heads);
+    const int query_pos = static_cast<int>((linear / query_heads) % query_sequence);
+    const int batch = static_cast<int>(linear / (static_cast<std::size_t>(query_heads) * query_sequence));
 
     const int kv_head = query_head / (query_heads / kv_heads);
     const int visible = causal ? min(key_value_sequence, query_position_offset + query_pos + 1)
@@ -97,86 +65,84 @@ __global__ void attention_backward_kernel(
         (static_cast<std::size_t>(batch) * query_sequence + query_pos) * query_heads * head_dim
         + static_cast<std::size_t>(query_head) * head_dim;
     const std::size_t kv_batch_base = static_cast<std::size_t>(batch) * key_value_sequence * kv_heads * head_dim;
-    __shared__ float reduction[(kThreads + 31) / 32];
-    __shared__ float max_score;
-    __shared__ float normalizer;
-    __shared__ float softmax_dot;
-
-    // Online log-sum-exp combines the old maximum and normalizer passes.  Only
-    // lane zero owns the scalar state, but all threads still participate in
-    // every Q.K reduction.
+    // Each warp owns a complete attention row. This eliminates all block-wide
+    // barriers from the token loop and lets a 128-thread CTA process four rows.
     float row_max = -CUDART_INF_F;
     float row_normalizer = 0.0f;
     for (int k_pos = 0; k_pos < visible; ++k_pos) {
         const std::size_t kv_base = kv_batch_base +
             (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
         float dot = 0.0f;
-        for (int d = static_cast<int>(threadIdx.x); d < head_dim; d += static_cast<int>(blockDim.x))
+        for (int d = lane; d < head_dim; d += kWarpSize)
             dot = fmaf(static_cast<float>(query[q_base + d]), static_cast<float>(key[kv_base + d]), dot);
-        dot = block_sum(dot, reduction) * scale;
-        if (static_cast<int>(threadIdx.x) == 0) {
-            const float new_max = fmaxf(row_max, dot);
-            const float previous_scale = row_max == -CUDART_INF_F
-                ? 0.0f
-                : expf(row_max - new_max);
-            row_normalizer = row_normalizer * previous_scale + expf(dot - new_max);
-            row_max = new_max;
-        }
-        __syncthreads();
+        dot = warp_sum(dot) * scale;
+        const float new_max = fmaxf(row_max, dot);
+        const float previous_scale = row_max == -CUDART_INF_F ? 0.0f : expf(row_max - new_max);
+        row_normalizer = row_normalizer * previous_scale + expf(dot - new_max);
+        row_max = new_max;
     }
-    if (static_cast<int>(threadIdx.x) == 0) {
-        max_score = row_max;
-        normalizer = row_normalizer;
-    }
-    __syncthreads();
 
-    float local_softmax_dot = 0.0f;
+    float softmax_dot = 0.0f;
     for (int k_pos = 0; k_pos < visible; ++k_pos) {
         const std::size_t kv_base = kv_batch_base +
             (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
         float score = 0.0f;
         float d_probability = 0.0f;
-        for (int d = static_cast<int>(threadIdx.x); d < head_dim; d += static_cast<int>(blockDim.x)) {
+        for (int d = lane; d < head_dim; d += kWarpSize) {
             score = fmaf(static_cast<float>(query[q_base + d]), static_cast<float>(key[kv_base + d]), score);
             d_probability = fmaf(static_cast<float>(grad_output[q_base + d]), static_cast<float>(value[kv_base + d]), d_probability);
         }
-        score = block_sum(score, reduction) * scale;
-        d_probability = block_sum(d_probability, reduction);
-        if (threadIdx.x == 0)
-            local_softmax_dot += expf(score - max_score) / normalizer * d_probability;
-        __syncthreads();
+        score = warp_sum(score) * scale;
+        d_probability = warp_sum(d_probability);
+        const float probability = expf(score - row_max) / row_normalizer;
+        softmax_dot += probability * d_probability;
     }
-    if (threadIdx.x == 0) softmax_dot = local_softmax_dot;
-    __syncthreads();
 
-    // Every thread must participate in the reductions below, including when
-    // head_dim is smaller than the CTA. Each active lane owns one (or more)
-    // gradient dimensions across all streamed K/V rows.
-    float d_query = 0.0f;
+    // A lane owns dimensions lane, lane+32, ... for the complete K/V stream.
+    float d_query[4] = {};
     for (int k_pos = 0; k_pos < visible; ++k_pos) {
             const std::size_t kv_base = kv_batch_base +
                 (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
             float score_partial = 0.0f;
             float d_probability_partial = 0.0f;
-            for (int column = static_cast<int>(threadIdx.x); column < head_dim; column += static_cast<int>(blockDim.x)) {
+            for (int column = lane; column < head_dim; column += kWarpSize) {
                 score_partial = fmaf(static_cast<float>(query[q_base + column]), static_cast<float>(key[kv_base + column]), score_partial);
                 d_probability_partial = fmaf(static_cast<float>(grad_output[q_base + column]), static_cast<float>(value[kv_base + column]), d_probability_partial);
             }
-            const float score = block_sum(score_partial, reduction) * scale;
-            const float d_probability = block_sum(d_probability_partial, reduction);
-            const float probability = expf(score - max_score) / normalizer;
+            const float score = warp_sum(score_partial) * scale;
+            const float d_probability = warp_sum(d_probability_partial);
+            const float probability = expf(score - row_max) / row_normalizer;
             const float d_score = probability * (d_probability - softmax_dot);
-            for (int d = static_cast<int>(threadIdx.x); d < head_dim; d += static_cast<int>(blockDim.x)) {
-                d_query = fmaf(d_score * scale, static_cast<float>(key[kv_base + d]), d_query);
+            int owned = 0;
+            for (int d = lane; d < head_dim; d += kWarpSize, ++owned) {
+                d_query[owned] = fmaf(d_score * scale, static_cast<float>(key[kv_base + d]), d_query[owned]);
                 atomic_add(grad_key + kv_base + d, d_score * scale * static_cast<float>(query[q_base + d]));
                 atomic_add(grad_value + kv_base + d,
                            probability * static_cast<float>(grad_output[q_base + d]));
             }
     }
-    for (int d = static_cast<int>(threadIdx.x); d < head_dim; d += static_cast<int>(blockDim.x)) {
-        if (accumulate_grad_query) atomic_add(grad_query + q_base + d, d_query);
-        else grad_query[q_base + d] = static_cast<T>(d_query);
+    int owned = 0;
+    for (int d = lane; d < head_dim; d += kWarpSize, ++owned) {
+        const float result = accumulate_grad_query
+            ? static_cast<float>(grad_query[q_base + d]) + d_query[owned]
+            : d_query[owned];
+        grad_query[q_base + d] = static_cast<T>(result);
     }
+}
+
+template <typename T>
+void launch_attention_backward(
+    T* grad_query, T* grad_key, T* grad_value, const T* grad_output,
+    const T* query, const T* key, const T* value, unsigned int blocks,
+    int batch, int qs, int ks, int qh, int kh, int dim, float scale,
+    bool causal, int query_position_offset, bool accumulate_grads,
+    cudaStream_t stream
+) {
+    const auto args = dim3(blocks);
+    attention_backward_kernel<T><<<args, kThreads, 0, stream>>>(
+        grad_query, grad_key, grad_value, grad_output, query, key, value,
+        batch, qs, ks, qh, kh, dim, scale, causal, query_position_offset,
+        accumulate_grads);
 }
 
 void validate(const Tensor& gq, const Tensor& gk, const Tensor& gv, const Tensor& go,
@@ -197,7 +163,7 @@ void validate(const Tensor& gq, const Tensor& gk, const Tensor& gv, const Tensor
         q.size(0) != k.size(0))
         throw std::invalid_argument("flash_gqa_attention_backward: invalid attention configuration");
     if (o.head_dim > static_cast<std::size_t>(kThreads))
-        throw std::invalid_argument("flash_gqa_attention_backward: head_dim must not exceed 256");
+        throw std::invalid_argument("flash_gqa_attention_backward: head_dim must not exceed 128");
     if (!std::isfinite(o.attention_scale) || (o.attention_scale < 0.0f) ||
         (o.causal && o.query_position_offset + q.size(1) > k.size(1)))
         throw std::invalid_argument("flash_gqa_attention_backward: invalid scale or causal range");
@@ -215,7 +181,6 @@ void flash_gqa_attention_backward(
     validate(grad_query, grad_key, grad_value, grad_output, query, key, value, options);
     DeviceGuard device_guard(0);
     if (!accumulate_grads) {
-        CUDA_CHECK(cudaMemsetAsync(grad_query.raw_data(), 0, grad_query.nbytes(), stream));
         CUDA_CHECK(cudaMemsetAsync(grad_key.raw_data(), 0, grad_key.nbytes(), stream));
         CUDA_CHECK(cudaMemsetAsync(grad_value.raw_data(), 0, grad_value.nbytes(), stream));
     }
@@ -225,15 +190,22 @@ void flash_gqa_attention_backward(
     const int qh = static_cast<int>(options.num_query_heads);
     const int kh = static_cast<int>(options.num_kv_heads);
     const int dim = static_cast<int>(options.head_dim);
-    const unsigned long long blocks = static_cast<unsigned long long>(batch) * qs * qh;
+    const unsigned long long rows = static_cast<unsigned long long>(batch) * qs * qh;
+    const unsigned long long blocks = (rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
     if (blocks > static_cast<unsigned long long>(std::numeric_limits<unsigned int>::max()))
         throw std::invalid_argument("flash_gqa_attention_backward: CUDA grid is too large");
     const float scale = options.attention_scale > 0.0f ? options.attention_scale : rsqrtf(static_cast<float>(dim));
-    if (query.dtype() == Dtype::F16)
-        attention_backward_kernel<__half><<<static_cast<unsigned int>(blocks), kThreads, 0, stream>>>(static_cast<__half*>(grad_query.raw_data()), static_cast<__half*>(grad_key.raw_data()), static_cast<__half*>(grad_value.raw_data()), static_cast<const __half*>(grad_output.raw_data()), static_cast<const __half*>(query.raw_data()), static_cast<const __half*>(key.raw_data()), static_cast<const __half*>(value.raw_data()), batch, qs, ks, qh, kh, dim, scale, options.causal, static_cast<int>(options.query_position_offset), accumulate_grads);
-    else if (query.dtype() == Dtype::BF16)
-        attention_backward_kernel<__nv_bfloat16><<<static_cast<unsigned int>(blocks), kThreads, 0, stream>>>(static_cast<__nv_bfloat16*>(grad_query.raw_data()), static_cast<__nv_bfloat16*>(grad_key.raw_data()), static_cast<__nv_bfloat16*>(grad_value.raw_data()), static_cast<const __nv_bfloat16*>(grad_output.raw_data()), static_cast<const __nv_bfloat16*>(query.raw_data()), static_cast<const __nv_bfloat16*>(key.raw_data()), static_cast<const __nv_bfloat16*>(value.raw_data()), batch, qs, ks, qh, kh, dim, scale, options.causal, static_cast<int>(options.query_position_offset), accumulate_grads);
-    else
-        attention_backward_kernel<float><<<static_cast<unsigned int>(blocks), kThreads, 0, stream>>>(static_cast<float*>(grad_query.raw_data()), static_cast<float*>(grad_key.raw_data()), static_cast<float*>(grad_value.raw_data()), static_cast<const float*>(grad_output.raw_data()), static_cast<const float*>(query.raw_data()), static_cast<const float*>(key.raw_data()), static_cast<const float*>(value.raw_data()), batch, qs, ks, qh, kh, dim, scale, options.causal, static_cast<int>(options.query_position_offset), accumulate_grads);
+    const auto launch = [&]<typename T>() {
+        launch_attention_backward(
+            static_cast<T*>(grad_query.raw_data()), static_cast<T*>(grad_key.raw_data()),
+            static_cast<T*>(grad_value.raw_data()), static_cast<const T*>(grad_output.raw_data()),
+            static_cast<const T*>(query.raw_data()), static_cast<const T*>(key.raw_data()),
+            static_cast<const T*>(value.raw_data()), static_cast<unsigned int>(blocks),
+            batch, qs, ks, qh, kh, dim, scale, options.causal,
+            static_cast<int>(options.query_position_offset), accumulate_grads, stream);
+    };
+    if (query.dtype() == Dtype::F16) launch.template operator()<__half>();
+    else if (query.dtype() == Dtype::BF16) launch.template operator()<__nv_bfloat16>();
+    else launch.template operator()<float>();
     CUDA_CHECK(cudaGetLastError());
 }
