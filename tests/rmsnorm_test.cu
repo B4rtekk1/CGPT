@@ -343,6 +343,15 @@ void benchmark_kernel() {
     test::benchmark_cuda_launches("RMSNorm kernel", [&](cudaStream_t stream) {
         rmsnorm_forward(output, input, weight, 1.0e-5F, stream);
     });
+
+    Tensor grad_output({kRows, kHiddenSize}, Dtype::F16);
+    Tensor grad_input({kRows, kHiddenSize}, Dtype::F16);
+    Tensor grad_weight({kHiddenSize}, Dtype::F16);
+    test::benchmark_cuda_launches("RMSNorm backward kernel", [&](cudaStream_t stream) {
+        rmsnorm_backward(
+            grad_input, grad_weight, grad_output,
+            input, weight, 1.0e-5F, stream);
+    }, 1000, 20);
 }
 
 } // namespace

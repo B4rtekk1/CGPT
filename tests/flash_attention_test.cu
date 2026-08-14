@@ -1,5 +1,6 @@
 #include "core/cuda_check.h"
 #include "ops/flash_attention.h"
+#include "ops/backward/flash_attention_backward.h"
 #include "cuda_benchmark.h"
 
 #include <algorithm>
@@ -253,7 +254,17 @@ void benchmark_kernel() {
 
     test::benchmark_cuda_launches("Flash attention kernel", [&](cudaStream_t stream) {
         flash_gqa_attention_forward(output, query, key, value, stream, options);
-    });
+    }, 1000, 50);
+
+    Tensor grad_output(query_shape, Dtype::F16);
+    Tensor grad_query(query_shape, Dtype::F16);
+    Tensor grad_key(key_value_shape, Dtype::F16);
+    Tensor grad_value(key_value_shape, Dtype::F16);
+    test::benchmark_cuda_launches("Flash attention backward kernel", [&](cudaStream_t stream) {
+        flash_gqa_attention_backward(
+            grad_query, grad_key, grad_value, grad_output,
+            query, key, value, stream, options);
+    }, 20, 5);
 }
 
 } // namespace

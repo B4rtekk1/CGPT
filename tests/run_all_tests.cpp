@@ -63,11 +63,27 @@ bool set_benchmark_results_file(const std::filesystem::path& path) {
 #endif
 }
 
+bool set_kernel_profile_results_file(const std::filesystem::path& path) {
+#ifdef _WIN32
+    return _putenv_s("CGPT_KERNEL_PROFILE_RESULTS_FILE", path.string().c_str()) == 0;
+#else
+    return setenv("CGPT_KERNEL_PROFILE_RESULTS_FILE", path.c_str(), 1) == 0;
+#endif
+}
+
 void clear_benchmark_results_file() {
 #ifdef _WIN32
     _putenv_s("CGPT_BENCHMARK_RESULTS_FILE", "");
 #else
     unsetenv("CGPT_BENCHMARK_RESULTS_FILE");
+#endif
+}
+
+void clear_kernel_profile_results_file() {
+#ifdef _WIN32
+    _putenv_s("CGPT_KERNEL_PROFILE_RESULTS_FILE", "");
+#else
+    unsetenv("CGPT_KERNEL_PROFILE_RESULTS_FILE");
 #endif
 }
 
@@ -89,6 +105,65 @@ std::vector<KernelBenchmark> read_kernel_benchmarks(const std::filesystem::path&
     return benchmarks;
 }
 
+bool is_ascii_letter(const char character) {
+    return (character >= 'a' && character <= 'z') ||
+           (character >= 'A' && character <= 'Z');
+}
+
+bool is_ascii_digit(const char character) {
+    return character >= '0' && character <= '9';
+}
+
+std::string abbreviate(const std::string_view value, const std::size_t maximum_length) {
+    if (value.size() <= maximum_length) {
+        return std::string(value);
+    }
+    return std::string(value.substr(0, maximum_length - 3)) + "...";
+}
+
+std::string display_benchmark_name(const std::string_view name) {
+    constexpr std::string_view cupti_prefix{"CUPTI: "};
+    constexpr std::string_view kernel_marker{"_kernel"};
+    constexpr std::size_t maximum_label_length = 76;
+
+    if (!name.starts_with(cupti_prefix)) {
+        return abbreviate(name, maximum_label_length);
+    }
+
+    const std::string_view symbol = name.substr(cupti_prefix.size());
+    const std::size_t marker = symbol.rfind(kernel_marker);
+    if (marker == std::string_view::npos) {
+        return abbreviate(name, maximum_label_length);
+    }
+
+    // CUPTI reports compiler-mangled names.  The decimal length prefix directly
+    // before the function name lets us retain the useful kernel name without the
+    // generated translation-unit hash and C++ ABI details.
+    std::size_t function_start = marker;
+    while (function_start > 0) {
+        const char character = symbol[function_start - 1];
+        if (is_ascii_letter(character) || character == '_') {
+            --function_start;
+            continue;
+        }
+        if (is_ascii_digit(character)) {
+            std::size_t digit_start = function_start - 1;
+            while (digit_start > 0 && is_ascii_digit(symbol[digit_start - 1])) {
+                --digit_start;
+            }
+            if (function_start < symbol.size() && is_ascii_letter(symbol[function_start])) {
+                break;
+            }
+            function_start = digit_start;
+            continue;
+        }
+        break;
+    }
+
+    const std::string_view kernel_name = symbol.substr(function_start, marker - function_start + kernel_marker.size());
+    return abbreviate(std::string(cupti_prefix) + std::string(kernel_name), maximum_label_length);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -106,7 +181,8 @@ int main(int argc, char** argv) {
                                ".tsv");
     std::error_code remove_error;
     std::filesystem::remove(results_file, remove_error);
-    if (!set_benchmark_results_file(results_file)) {
+    if (!set_benchmark_results_file(results_file) ||
+        !set_kernel_profile_results_file(results_file)) {
         std::cerr << "Cannot enable kernel benchmark collection\n";
         return EXIT_FAILURE;
     }
@@ -145,6 +221,7 @@ int main(int argc, char** argv) {
               << total_seconds << " s\n";
 
     clear_benchmark_results_file();
+    clear_kernel_profile_results_file();
     const std::vector<KernelBenchmark> kernel_benchmarks =
         read_kernel_benchmarks(results_file);
     std::filesystem::remove(results_file, remove_error);
@@ -153,12 +230,14 @@ int main(int argc, char** argv) {
     if (kernel_benchmarks.empty()) {
         std::cout << "No CUDA kernel benchmarks were reported.\n";
     } else {
-        std::cout << std::left << std::setw(30) << "Kernel"
-                  << "Average time (ms)\n";
+        constexpr int label_width = 76;
+        std::cout << std::left << std::setw(label_width) << "Kernel / benchmark"
+                  << " | Average time (ms)\n";
         double total_average_ms = 0.0;
         for (const KernelBenchmark& benchmark : kernel_benchmarks) {
             total_average_ms += benchmark.average_ms;
-            std::cout << std::left << std::setw(30) << benchmark.name
+            std::cout << std::left << std::setw(label_width)
+                      << display_benchmark_name(benchmark.name) << " | "
                       << std::fixed << std::setprecision(6)
                       << benchmark.average_ms << '\n';
         }

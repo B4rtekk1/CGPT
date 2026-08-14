@@ -106,6 +106,40 @@ void test_forward() {
     CUDA_CHECK(cudaFree(device_ids));
 }
 
+void test_backward() {
+    Fixture fixture;
+    bpe::TokenId* device_ids = nullptr;
+    CUDA_CHECK(cudaMalloc(&device_ids, kSequence * sizeof(bpe::TokenId)));
+    try {
+        embedding_upload_token_ids(device_ids, std::vector<bpe::TokenId>{1, 3});
+        const CublasLtContext context;
+        transformer_model_forward(fixture.logits, device_ids, kBatch, kSequence, fixture.weights(),
+            fixture.workspace, fixture.cosine, fixture.sine, context, nullptr, fixture.options);
+        Tensor grad_logits({kBatch * kSequence, kVocabulary}, Dtype::F16);
+        grad_logits.copy_from_host(std::vector<float>(grad_logits.numel(), 0.1F));
+        Tensor ge({kVocabulary, kHidden}, Dtype::F16), gan({kHidden}, Dtype::F16), gq({kHidden, kHidden}, Dtype::F16);
+        Tensor gk({kKvHeads * kHeadDim, kHidden}, Dtype::F16), gv({kKvHeads * kHeadDim, kHidden}, Dtype::F16);
+        Tensor go({kHidden, kHidden}, Dtype::F16), gfn({kHidden}, Dtype::F16), gg({kIntermediate, kHidden}, Dtype::F16);
+        Tensor gu({kIntermediate, kHidden}, Dtype::F16), gd({kHidden, kIntermediate}, Dtype::F16);
+        Tensor gfinal({kHidden}, Dtype::F16), glm({kVocabulary, kHidden}, Dtype::F16);
+        std::vector<TransformerBlockGradients> layer_grads;
+        layer_grads.push_back({gan, gq, gk, gv, go, gfn, gg, gu, gd});
+        TransformerModelGradients grads{ge, layer_grads, gfinal, glm};
+        TransformerModelBackwardWorkspace backward(fixture.options, kBatch, kSequence, Dtype::F16);
+        transformer_model_backward(grad_logits, device_ids, kBatch, kSequence, fixture.weights(), grads,
+            fixture.workspace, backward, fixture.cosine, fixture.sine, context, nullptr, fixture.options);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> values(glm.numel());
+        glm.copy_to_host(values);
+        for (const float value : values)
+            if (!std::isfinite(value)) throw std::runtime_error("Transformer model test: backward gradient is not finite");
+    } catch (...) {
+        cudaFree(device_ids);
+        throw;
+    }
+    CUDA_CHECK(cudaFree(device_ids));
+}
+
 void test_validation() {
     Fixture fixture;
     const CublasLtContext context;
@@ -121,6 +155,7 @@ void test_validation() {
 int main() {
     try {
         test_forward();
+        test_backward();
         test_validation();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

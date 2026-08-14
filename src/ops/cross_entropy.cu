@@ -4,6 +4,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <math_constants.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -11,86 +12,174 @@
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kWarpSize = 32;
+constexpr int kWarps = kThreads / kWarpSize;
+static_assert(kThreads % kWarpSize == 0);
 
 template <typename T>
-__global__ void cross_entropy_loss_kernel(
-    float* loss, const T* logits, const bpe::TokenId* targets,
-    const std::size_t rows, const std::size_t vocabulary_size) {
-    const std::size_t row = blockIdx.x;
-    if (row >= rows) return;
-
-    __shared__ float reductions[kThreads];
-    const T* row_logits = logits + row * vocabulary_size;
-    float maximum = -INFINITY;
-    for (std::size_t column = threadIdx.x; column < vocabulary_size; column += blockDim.x) {
-        maximum = fmaxf(maximum, static_cast<float>(row_logits[column]));
-    }
-    reductions[threadIdx.x] = maximum;
-    __syncthreads();
-    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) reductions[threadIdx.x] = fmaxf(reductions[threadIdx.x], reductions[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    maximum = reductions[0];
-
-    float sum = 0.0f;
-    for (std::size_t column = threadIdx.x; column < vocabulary_size; column += blockDim.x) {
-        sum += expf(static_cast<float>(row_logits[column]) - maximum);
-    }
-    reductions[threadIdx.x] = sum;
-    __syncthreads();
-    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) reductions[threadIdx.x] += reductions[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        const bpe::TokenId target = targets[row];
-        if (target < vocabulary_size) {
-            atomicAdd(loss, (logf(reductions[0]) + maximum - static_cast<float>(row_logits[target])) /
-                            static_cast<float>(rows));
-        }
-    }
+__device__ __forceinline__ float to_float(T value) {
+    return static_cast<float>(value);
 }
 
 template <typename T>
-__global__ void cross_entropy_gradient_kernel(
-    T* gradient, const T* logits, const bpe::TokenId* targets,
-    const std::size_t rows, const std::size_t vocabulary_size) {
-    const std::size_t row = blockIdx.x;
+__device__ __forceinline__ T from_float(float value) {
+    return static_cast<T>(value);
+}
+
+__device__ __forceinline__ float warp_reduce_max(float value) {
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+    }
+    return value;
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float value) {
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float block_reduce_max(float value, float* warp_scratch) {
+    const int lane = threadIdx.x & (kWarpSize - 1);
+    const int warp = threadIdx.x / kWarpSize;
+
+    value = warp_reduce_max(value);
+    if (lane == 0) warp_scratch[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+        value = lane < kWarps ? warp_scratch[lane] : -CUDART_INF_F;
+        value = warp_reduce_max(value);
+        if (lane == 0) warp_scratch[0] = value;
+    }
+    __syncthreads();
+    return warp_scratch[0];
+}
+
+__device__ __forceinline__ float block_reduce_sum(float value, float* warp_scratch) {
+    const int lane = threadIdx.x & (kWarpSize - 1);
+    const int warp = threadIdx.x / kWarpSize;
+
+    value = warp_reduce_sum(value);
+    if (lane == 0) warp_scratch[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+        value = lane < kWarps ? warp_scratch[lane] : 0.0f;
+        value = warp_reduce_sum(value);
+        if (lane == 0) warp_scratch[0] = value;
+    }
+    __syncthreads();
+    return warp_scratch[0];
+}
+
+template <typename T>
+__global__ __launch_bounds__(kThreads)
+void cross_entropy_fused_kernel(
+    float* __restrict__ loss,
+    T* __restrict__ gradient,
+    const T* __restrict__ logits,
+    const bpe::TokenId* __restrict__ targets,
+    const std::size_t rows,
+    const std::size_t vocabulary_size,
+    const float inv_rows) {
+
+    const std::size_t row = static_cast<std::size_t>(blockIdx.x);
     if (row >= rows) return;
 
-    __shared__ float reductions[kThreads];
-    const T* row_logits = logits + row * vocabulary_size;
-    float maximum = -INFINITY;
-    for (std::size_t column = threadIdx.x; column < vocabulary_size; column += blockDim.x) {
-        maximum = fmaxf(maximum, static_cast<float>(row_logits[column]));
-    }
-    reductions[threadIdx.x] = maximum;
-    __syncthreads();
-    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) reductions[threadIdx.x] = fmaxf(reductions[threadIdx.x], reductions[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    maximum = reductions[0];
+    __shared__ float warp_scratch[kWarps];
 
-    float sum = 0.0f;
-    for (std::size_t column = threadIdx.x; column < vocabulary_size; column += blockDim.x) {
-        sum += expf(static_cast<float>(row_logits[column]) - maximum);
+    const T* __restrict__ row_logits = logits + row * vocabulary_size;
+    T* __restrict__ row_gradient = gradient + row * vocabulary_size;
+
+    constexpr std::size_t kStride = static_cast<std::size_t>(kThreads);
+    constexpr std::size_t kUnrolledStride = 4 * kStride;
+    const std::size_t tid = static_cast<std::size_t>(threadIdx.x);
+
+    float max0 = -CUDART_INF_F;
+    float max1 = -CUDART_INF_F;
+    float max2 = -CUDART_INF_F;
+    float max3 = -CUDART_INF_F;
+
+    std::size_t column = tid;
+    for (; column + 3 * kStride < vocabulary_size; column += kUnrolledStride) {
+        max0 = fmaxf(max0, to_float(row_logits[column]));
+        max1 = fmaxf(max1, to_float(row_logits[column + kStride]));
+        max2 = fmaxf(max2, to_float(row_logits[column + 2 * kStride]));
+        max3 = fmaxf(max3, to_float(row_logits[column + 3 * kStride]));
     }
-    reductions[threadIdx.x] = sum;
-    __syncthreads();
-    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) reductions[threadIdx.x] += reductions[threadIdx.x + stride];
-        __syncthreads();
+
+    float local_max = fmaxf(fmaxf(max0, max1), fmaxf(max2, max3));
+    for (; column < vocabulary_size; column += kStride) {
+        local_max = fmaxf(local_max, to_float(row_logits[column]));
     }
+    const float maximum = block_reduce_max(local_max, warp_scratch);
+
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+
+    column = tid;
+    for (; column + 3 * kStride < vocabulary_size; column += kUnrolledStride) {
+        const float e0 = __expf(to_float(row_logits[column]) - maximum);
+        const float e1 = __expf(to_float(row_logits[column + kStride]) - maximum);
+        const float e2 = __expf(to_float(row_logits[column + 2 * kStride]) - maximum);
+        const float e3 = __expf(to_float(row_logits[column + 3 * kStride]) - maximum);
+
+        sum0 += e0;
+        sum1 += e1;
+        sum2 += e2;
+        sum3 += e3;
+    }
+
+    float local_sum = (sum0 + sum1) + (sum2 + sum3);
+    for (; column < vocabulary_size; column += kStride) {
+        const float e = __expf(to_float(row_logits[column]) - maximum);
+        local_sum += e;
+    }
+    const float denominator = block_reduce_sum(local_sum, warp_scratch);
+    const float inv_denominator = __frcp_rn(denominator);
 
     const bpe::TokenId target = targets[row];
-    T* row_gradient = gradient + row * vocabulary_size;
-    const float scale = 1.0f / static_cast<float>(rows);
-    for (std::size_t column = threadIdx.x; column < vocabulary_size; column += blockDim.x) {
-        float value = expf(static_cast<float>(row_logits[column]) - maximum) / reductions[0];
-        if (column == target) value -= 1.0f;
-        row_gradient[column] = static_cast<T>(value * scale);
+    const bool valid_target = target < vocabulary_size;
+
+
+    if (threadIdx.x == 0 && valid_target) {
+        const float target_logit = to_float(row_logits[static_cast<std::size_t>(target)]);
+        const float row_loss = __logf(denominator) + maximum - target_logit;
+        atomicAdd(loss, row_loss * inv_rows);
+    }
+
+    column = tid;
+    for (; column + 3 * kStride < vocabulary_size; column += kUnrolledStride) {
+        float v0 = __expf(to_float(row_logits[column]) - maximum) * inv_denominator;
+        float v1 = __expf(to_float(row_logits[column + kStride]) - maximum) * inv_denominator;
+        float v2 = __expf(to_float(row_logits[column + 2 * kStride]) - maximum) * inv_denominator;
+        float v3 = __expf(to_float(row_logits[column + 3 * kStride]) - maximum) * inv_denominator;
+
+        if (valid_target) {
+            const std::size_t target_column = static_cast<std::size_t>(target);
+            if (column == target_column) v0 -= 1.0f;
+            if (column + kStride == target_column) v1 -= 1.0f;
+            if (column + 2 * kStride == target_column) v2 -= 1.0f;
+            if (column + 3 * kStride == target_column) v3 -= 1.0f;
+        }
+
+        row_gradient[column] = from_float<T>(v0 * inv_rows);
+        row_gradient[column + kStride] = from_float<T>(v1 * inv_rows);
+        row_gradient[column + 2 * kStride] = from_float<T>(v2 * inv_rows);
+        row_gradient[column + 3 * kStride] = from_float<T>(v3 * inv_rows);
+    }
+
+    for (; column < vocabulary_size; column += kStride) {
+        float value = __expf(to_float(row_logits[column]) - maximum) * inv_denominator;
+        if (valid_target && column == static_cast<std::size_t>(target)) value -= 1.0f;
+        row_gradient[column] = from_float<T>(value * inv_rows);
     }
 }
 
@@ -104,18 +193,26 @@ void validate(const Tensor& loss, const Tensor& gradient, const Tensor& logits,
         gradient.dtype() != logits.dtype() || gradient.shape() != logits.shape()) {
         throw std::invalid_argument("cross_entropy: invalid gradient or target count");
     }
-    if (loss.device_type() != DeviceType::CUDA || loss.dtype() != Dtype::F32 || loss.shape() != std::vector<std::size_t>{1}) {
+    if (loss.device_type() != DeviceType::CUDA || loss.dtype() != Dtype::F32 ||
+        loss.shape() != std::vector<std::size_t>{1}) {
         throw std::invalid_argument("cross_entropy: loss must be a CUDA F32 tensor with shape [1]");
     }
 }
 
 template <typename T>
-void launch(Tensor& loss, Tensor& gradient, const Tensor& logits, const bpe::TokenId* targets,
-            const std::size_t rows, const std::size_t vocabulary_size, cudaStream_t stream) {
-    cross_entropy_loss_kernel<T><<<static_cast<unsigned>(rows), kThreads, 0, stream>>>(
-        static_cast<float*>(loss.raw_data()), static_cast<const T*>(logits.raw_data()), targets, rows, vocabulary_size);
-    cross_entropy_gradient_kernel<T><<<static_cast<unsigned>(rows), kThreads, 0, stream>>>(
-        static_cast<T*>(gradient.raw_data()), static_cast<const T*>(logits.raw_data()), targets, rows, vocabulary_size);
+void launch(Tensor& loss, Tensor& gradient, const Tensor& logits,
+            const bpe::TokenId* targets, const std::size_t rows,
+            const std::size_t vocabulary_size, cudaStream_t stream) {
+    const float inv_rows = 1.0f / static_cast<float>(rows);
+
+    cross_entropy_fused_kernel<T><<<static_cast<unsigned>(rows), kThreads, 0, stream>>>(
+        static_cast<float*>(loss.raw_data()),
+        static_cast<T*>(gradient.raw_data()),
+        static_cast<const T*>(logits.raw_data()),
+        targets,
+        rows,
+        vocabulary_size,
+        inv_rows);
 }
 
 } // namespace
@@ -124,14 +221,25 @@ void cross_entropy_forward_backward(Tensor& loss, Tensor& gradient, const Tensor
                                     const bpe::TokenId* device_targets,
                                     const std::size_t target_count, cudaStream_t stream) {
     validate(loss, gradient, logits, device_targets, target_count);
+
     CUDA_CHECK(cudaMemsetAsync(loss.raw_data(), 0, sizeof(float), stream));
+
     const auto rows = logits.size(0);
     const auto vocabulary_size = logits.size(1);
+
     switch (logits.dtype()) {
-        case Dtype::F32: launch<float>(loss, gradient, logits, device_targets, rows, vocabulary_size, stream); break;
-        case Dtype::F16: launch<__half>(loss, gradient, logits, device_targets, rows, vocabulary_size, stream); break;
-        case Dtype::BF16: launch<__nv_bfloat16>(loss, gradient, logits, device_targets, rows, vocabulary_size, stream); break;
-        default: throw std::invalid_argument("cross_entropy: unsupported logits dtype");
+        case Dtype::F32:
+            launch<float>(loss, gradient, logits, device_targets, rows, vocabulary_size, stream);
+            break;
+        case Dtype::F16:
+            launch<__half>(loss, gradient, logits, device_targets, rows, vocabulary_size, stream);
+            break;
+        case Dtype::BF16:
+            launch<__nv_bfloat16>(loss, gradient, logits, device_targets, rows, vocabulary_size, stream);
+            break;
+        default:
+            throw std::invalid_argument("cross_entropy: unsupported logits dtype");
     }
+
     CUDA_CHECK(cudaGetLastError());
 }

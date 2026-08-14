@@ -12,6 +12,8 @@
 
 #include <limits>
 #include <stdexcept>
+#include <cstdint>
+#include <unordered_map>
 
 namespace {
     __forceinline__ __device__ float warp_reduce_sum(float value) {
@@ -46,41 +48,34 @@ namespace {
 
     template<typename T>
     __launch_bounds__(256)
-    __global__ void rmsnorm_inv_rms_kernel(
-        float * __restrict__ inv_rms,
-        const T * __restrict__ input,
-        const int hidden,
-        const float inverse_hidden,
-        const float epsilon
-    ) {
-        const std::size_t row_offset = static_cast<std::size_t>(blockIdx.x) * hidden;
-        float sum_squares = 0.0f;
-        for (int index = static_cast<int>(threadIdx.x); index < hidden; index += static_cast<int>(blockDim.x)) {
-            const auto x = static_cast<float>(input[row_offset + index]);
-            sum_squares = fmaf(x, x, sum_squares);
-        }
-        const float total = block_reduce_sum(sum_squares);
-        if (threadIdx.x == 0) {
-            inv_rms[blockIdx.x] = rsqrtf(total * inverse_hidden + epsilon);
-        }
-    }
-
-    template<typename T>
-    __launch_bounds__(256)
     __global__ void rmsnorm_grad_input_kernel(
         T * __restrict__ grad_input,
         const T * __restrict__ grad_output,
         const T * __restrict__ input,
         const T * __restrict__ weight,
-        const float * __restrict__ inv_rms,
+        float * __restrict__ inv_rms,
         const int hidden,
-        const float inverse_hidden
+        const float inverse_hidden,
+        const float epsilon
     ) {
         const int column = static_cast<int>(threadIdx.x);
         const std::size_t row_offset = static_cast<std::size_t>(blockIdx.x) * hidden;
         const T *row_input = input + row_offset;
         const T *row_grad_output = grad_output + row_offset;
         T *row_grad_input = grad_input + row_offset;
+
+        float sum_squares = 0.0f;
+        for (int index = column; index < hidden; index += static_cast<int>(blockDim.x)) {
+            const float x = static_cast<float>(row_input[index]);
+            sum_squares = fmaf(x, x, sum_squares);
+        }
+        __shared__ float shared_inv_rms;
+        const float square_sum = block_reduce_sum(sum_squares);
+        if (threadIdx.x == 0) {
+            shared_inv_rms = rsqrtf(square_sum * inverse_hidden + epsilon);
+            inv_rms[blockIdx.x] = shared_inv_rms;
+        }
+        __syncthreads();
 
         float weighted_dot = 0.0f;
         for (int index = column; index < hidden; index += static_cast<int>(blockDim.x)) {
@@ -90,7 +85,7 @@ namespace {
             weighted_dot = fmaf(dy_weight, x, weighted_dot);
         }
 
-        const float row_inv_rms = inv_rms[blockIdx.x];
+        const float row_inv_rms = shared_inv_rms;
         const float correction = block_reduce_sum(weighted_dot) * inverse_hidden *
                                  row_inv_rms * row_inv_rms * row_inv_rms;
 
@@ -112,17 +107,20 @@ namespace {
         const int rows,
         const int hidden
     ) {
-        const int column = static_cast<int>(blockIdx.x);
+        const int column = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                         + static_cast<int>(threadIdx.x);
+        if (column >= hidden) return;
+
+        // Adjacent lanes own adjacent columns, so every iteration issues
+        // coalesced row reads.  The former one-CTA-per-column mapping made
+        // adjacent lanes read rows separated by `hidden` elements.
         float grad = 0.0f;
-        for (int row = static_cast<int>(threadIdx.x); row < rows; row += static_cast<int>(blockDim.x)) {
+        for (int row = 0; row < rows; ++row) {
             const std::size_t row_offset = static_cast<std::size_t>(row) * hidden;
             grad = fmaf(static_cast<float>(grad_output[row_offset + column]),
                         static_cast<float>(input[row_offset + column]) * inv_rms[row], grad);
         }
-        const float total = block_reduce_sum(grad);
-        if (threadIdx.x == 0) {
-            grad_weight[column] = static_cast<T>(total);
-        }
+        grad_weight[column] = static_cast<T>(grad);
     }
 
     void validate_rmsnorm_backward(
@@ -170,15 +168,23 @@ namespace {
     ) {
         constexpr int threads = 256;
         const float inverse_hidden = 1.0f / static_cast<float>(hidden);
-        DeviceBuffer inv_rms_buffer(static_cast<std::size_t>(rows) * sizeof(float));
+        // Workspace is cached per host thread and CUDA stream.  This keeps the
+        // operation asynchronous after its first use instead of paying for a
+        // synchronizing cudaMalloc/cudaFree pair on every backward call.
+        thread_local std::unordered_map<std::uintptr_t, DeviceBuffer> inv_rms_buffers;
+        DeviceBuffer& inv_rms_buffer =
+            inv_rms_buffers[reinterpret_cast<std::uintptr_t>(stream)];
+        const std::size_t required_bytes = static_cast<std::size_t>(rows) * sizeof(float);
+        if (inv_rms_buffer.bytes() < required_bytes) {
+            inv_rms_buffer.allocate(required_bytes);
+        }
         auto *inv_rms = static_cast<float *>(inv_rms_buffer.data());
-        rmsnorm_inv_rms_kernel<T><<<rows, threads, 0, stream>>>(
-            inv_rms, static_cast<const T *>(input.raw_data()), hidden, inverse_hidden, epsilon);
         rmsnorm_grad_input_kernel<T><<<rows, threads, 0, stream>>>(
             static_cast<T *>(grad_input.raw_data()), static_cast<const T *>(grad_output.raw_data()),
             static_cast<const T *>(input.raw_data()), static_cast<const T *>(weight.raw_data()),
-            inv_rms, hidden, inverse_hidden);
-        rmsnorm_grad_weight_kernel<T><<<hidden, threads, 0, stream>>>(
+            inv_rms, hidden, inverse_hidden, epsilon);
+        const int weight_blocks = (hidden + threads - 1) / threads;
+        rmsnorm_grad_weight_kernel<T><<<weight_blocks, threads, 0, stream>>>(
             static_cast<T *>(grad_weight.raw_data()), static_cast<const T *>(grad_output.raw_data()),
             static_cast<const T *>(input.raw_data()), inv_rms, rows, hidden);
     }

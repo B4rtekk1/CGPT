@@ -3,8 +3,9 @@
  * @brief Memory-efficient CUDA backward pass for grouped-query attention.
  *
  * One CTA owns one (batch, query position, query head) row. It makes three
- * streaming passes over K/V: softmax maximum/normalizer, softmax-dot-product
- * reduction, then dQ/dK/dV. This avoids the O(Q*K) attention-probability
+ * streaming passes over K/V: online softmax maximum/normalizer,
+ * softmax-dot-product reduction, then dQ/dK/dV. This avoids the O(Q*K)
+ * attention-probability
  * workspace. K/V are shared between GQA heads, so their contributions use
  * atomics; dQ has exactly one owning CTA and needs none.
  */
@@ -23,7 +24,10 @@
 #include <stdexcept>
 
 namespace {
-constexpr int kThreads = 256;
+// One thread owns up to two dimensions for the largest supported head (D=256).
+// 128 threads avoid running four completely idle warps for the common D=128
+// model shape while retaining enough parallelism for the reductions.
+constexpr int kThreads = 128;
 
 __device__ __forceinline__ float block_sum(float value, float* scratch) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -33,7 +37,8 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     }
     if (lane == 0) scratch[warp] = value;
     __syncthreads();
-    value = threadIdx.x < 8 ? scratch[lane] : 0.0f;
+    const int warp_count = (static_cast<int>(blockDim.x) + 31) >> 5;
+    value = static_cast<int>(threadIdx.x) < warp_count ? scratch[lane] : 0.0f;
     if (warp == 0) {
         for (int offset = 16; offset > 0; offset >>= 1) {
             value += __shfl_down_sync(0xffffffffU, value, offset);
@@ -52,7 +57,8 @@ __device__ __forceinline__ float block_max(float value, float* scratch) {
     }
     if (lane == 0) scratch[warp] = value;
     __syncthreads();
-    value = static_cast<int>(threadIdx.x) < 8 ? scratch[lane] : -CUDART_INF_F;
+    const int warp_count = (static_cast<int>(blockDim.x) + 31) >> 5;
+    value = static_cast<int>(threadIdx.x) < warp_count ? scratch[lane] : -CUDART_INF_F;
     if (warp == 0) {
         for (int offset = 16; offset > 0; offset >>= 1) {
             value = fmaxf(value, __shfl_down_sync(0xffffffffU, value, offset));
@@ -91,12 +97,16 @@ __global__ void attention_backward_kernel(
         (static_cast<std::size_t>(batch) * query_sequence + query_pos) * query_heads * head_dim
         + static_cast<std::size_t>(query_head) * head_dim;
     const std::size_t kv_batch_base = static_cast<std::size_t>(batch) * key_value_sequence * kv_heads * head_dim;
-    __shared__ float reduction[8];
+    __shared__ float reduction[(kThreads + 31) / 32];
     __shared__ float max_score;
     __shared__ float normalizer;
     __shared__ float softmax_dot;
 
+    // Online log-sum-exp combines the old maximum and normalizer passes.  Only
+    // lane zero owns the scalar state, but all threads still participate in
+    // every Q.K reduction.
     float row_max = -CUDART_INF_F;
+    float row_normalizer = 0.0f;
     for (int k_pos = 0; k_pos < visible; ++k_pos) {
         const std::size_t kv_base = kv_batch_base +
             (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
@@ -104,24 +114,20 @@ __global__ void attention_backward_kernel(
         for (int d = static_cast<int>(threadIdx.x); d < head_dim; d += static_cast<int>(blockDim.x))
             dot = fmaf(static_cast<float>(query[q_base + d]), static_cast<float>(key[kv_base + d]), dot);
         dot = block_sum(dot, reduction) * scale;
-        if (static_cast<int>(threadIdx.x) == 0) row_max = fmaxf(row_max, dot);
+        if (static_cast<int>(threadIdx.x) == 0) {
+            const float new_max = fmaxf(row_max, dot);
+            const float previous_scale = row_max == -CUDART_INF_F
+                ? 0.0f
+                : expf(row_max - new_max);
+            row_normalizer = row_normalizer * previous_scale + expf(dot - new_max);
+            row_max = new_max;
+        }
         __syncthreads();
     }
-    if (static_cast<int>(threadIdx.x) == 0) max_score = row_max;
-    __syncthreads();
-
-    float local_normalizer = 0.0f;
-    for (int k_pos = 0; k_pos < visible; ++k_pos) {
-        const std::size_t kv_base = kv_batch_base +
-            (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
-        float dot = 0.0f;
-        for (int d = static_cast<int>(threadIdx.x); d < head_dim; d += static_cast<int>(blockDim.x))
-            dot = fmaf(static_cast<float>(query[q_base + d]), static_cast<float>(key[kv_base + d]), dot);
-        dot = block_sum(dot, reduction) * scale;
-        if (static_cast<int>(threadIdx.x) == 0) local_normalizer += expf(dot - max_score);
-        __syncthreads();
+    if (static_cast<int>(threadIdx.x) == 0) {
+        max_score = row_max;
+        normalizer = row_normalizer;
     }
-    if (threadIdx.x == 0) normalizer = local_normalizer;
     __syncthreads();
 
     float local_softmax_dot = 0.0f;

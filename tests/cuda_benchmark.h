@@ -34,16 +34,19 @@ inline void report_cuda_benchmark(
 }
 
 template <typename Launch>
-void benchmark_cuda_launches(const char* name, Launch&& launch) {
-    constexpr int kWarmupIterations = 100;
-    constexpr int kMeasuredIterations = 10000;
+void benchmark_cuda_launches(
+    const char* name,
+    Launch&& launch,
+    const int measured_iterations = 10000,
+    const int warmup_iterations = 100
+) {
 
     cudaStream_t stream = nullptr;
     cudaEvent_t start = nullptr;
     cudaEvent_t stop = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     try {
-        for (int iteration = 0; iteration < kWarmupIterations; ++iteration) {
+        for (int iteration = 0; iteration < warmup_iterations; ++iteration) {
             launch(stream);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -51,7 +54,7 @@ void benchmark_cuda_launches(const char* name, Launch&& launch) {
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
         CUDA_CHECK(cudaEventRecord(start, stream));
-        for (int iteration = 0; iteration < kMeasuredIterations; ++iteration) {
+        for (int iteration = 0; iteration < measured_iterations; ++iteration) {
             launch(stream);
         }
         CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -61,9 +64,9 @@ void benchmark_cuda_launches(const char* name, Launch&& launch) {
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
         report_cuda_benchmark(
             name,
-            elapsed_ms / static_cast<float>(kMeasuredIterations),
-            kMeasuredIterations,
-            kWarmupIterations);
+            elapsed_ms / static_cast<float>(measured_iterations),
+            measured_iterations,
+            warmup_iterations);
     } catch (...) {
         if (stop != nullptr) {
             cudaEventDestroy(stop);

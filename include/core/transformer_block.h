@@ -62,6 +62,7 @@ struct TransformerBlockGradients {
 /** Temporary CUDA buffers used by transformer_block_backward. */
 struct TransformerBlockBackwardWorkspace {
     Tensor grad_attention_norm_input;
+    Tensor attention_norm_output;
     Tensor grad_ffn_norm_input;
     Tensor grad_residual;
     Tensor grad_attention_projection;
@@ -74,7 +75,9 @@ struct TransformerBlockBackwardWorkspace {
     Tensor grad_gate;
     Tensor grad_up;
     Tensor grad_activated;
-    Tensor scratch_bias;
+    Tensor hidden_bias;
+    Tensor intermediate_bias;
+    Tensor kv_bias;
 
     TransformerBlockBackwardWorkspace(const TransformerBlockOptions& options,
         std::size_t batch_size, std::size_t sequence_length, Dtype dtype = Dtype::F16);

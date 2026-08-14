@@ -5,6 +5,15 @@ include(CTest)
 enable_testing()
 find_package(CUDAToolkit REQUIRED)
 
+# CUDA::cupti is a dynamic library on Windows. Keep its runtime DLL next to
+# every test executable so the run_all child processes do not depend on PATH.
+file(GLOB CGPT_CUPTI_RUNTIME_DLLS
+        "${CUDAToolkit_CUPTI_INCLUDE_DIR}/../lib64/cupti64_*.dll")
+if (NOT CGPT_CUPTI_RUNTIME_DLLS)
+    message(FATAL_ERROR "Could not locate the CUPTI runtime DLL")
+endif()
+list(GET CGPT_CUPTI_RUNTIME_DLLS 0 CGPT_CUPTI_RUNTIME_DLL)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
@@ -60,8 +69,11 @@ if (MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 function(add_cgpt_test name source dependency)
-    add_executable(${name} ${source})
-    target_link_libraries(${name} PRIVATE ${dependency})
+    add_executable(${name} ${source} tests/cuda_kernel_profiler.cpp)
+    target_link_libraries(${name} PRIVATE ${dependency} CUDA::cudart CUDA::cupti)
+    add_custom_command(TARGET ${name} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CGPT_CUPTI_RUNTIME_DLL}" $<TARGET_FILE_DIR:${name}>)
     add_test(NAME ${name} COMMAND ${name})
     set_target_properties(${name} PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
@@ -94,6 +106,8 @@ add_dependencies(run_all_tests
         flash_attention_test embedding_test cross_entropy_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test
         bpe_tokenizer_test bpe_tokenizer_100mb_test)
 add_custom_target(run_all
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CGPT_CUPTI_RUNTIME_DLL}" $<TARGET_FILE_DIR:run_all_tests>
         COMMAND $<TARGET_FILE:run_all_tests>
                 rmsnorm_test $<TARGET_FILE:rmsnorm_test>
                 linear_test $<TARGET_FILE:linear_test>
@@ -123,6 +137,10 @@ add_custom_target(run_all
 set_tests_properties(
         rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
+
+# The cross-entropy benchmark processes a GPT-2-sized vocabulary and needs
+# slightly longer than the standard test timeout on supported GPUs.
+set_tests_properties(cross_entropy_test PROPERTIES TIMEOUT 60)
 
 set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES
         TIMEOUT 900

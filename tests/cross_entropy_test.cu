@@ -1,5 +1,6 @@
 #include "core/cuda_check.h"
 #include "ops/cross_entropy.h"
+#include "cuda_benchmark.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -49,10 +50,24 @@ void test_validation() {
     throw std::runtime_error("Cross entropy: accepted invalid target count");
 }
 
+void benchmark_kernel() {
+    constexpr std::size_t kRows = 512;
+    constexpr std::size_t kVocabularySize = 50'257;
+
+    Tensor logits({kRows, kVocabularySize});
+    Tensor gradient({kRows, kVocabularySize});
+    Tensor loss({1});
+    DeviceTargets targets(std::vector<bpe::TokenId>(kRows, 0));
+
+    test::benchmark_cuda_launches("Cross entropy kernel", [&](cudaStream_t stream) {
+        cross_entropy_forward_backward(loss, gradient, logits, targets.get(), kRows, stream);
+    }, 1000, 50);
+}
+
 } // namespace
 
 int main() {
-    try { test_loss_and_gradient(); test_validation(); }
+    try { test_loss_and_gradient(); test_validation(); benchmark_kernel(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return EXIT_FAILURE; }
     std::cout << "Cross entropy tests passed.\n";
     return EXIT_SUCCESS;
