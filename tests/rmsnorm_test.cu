@@ -108,7 +108,7 @@ std::vector<float> rmsnorm_reference(
             sum_squares += static_cast<double>(value) * value;
         }
 
-        const float rms = static_cast<float>(std::sqrt(
+        const auto rms = static_cast<float>(std::sqrt(
             sum_squares / static_cast<double>(hidden) + epsilon
         ));
 

@@ -26,15 +26,34 @@ void test_update_and_state(DeviceType device, Dtype dtype, float tolerance) {
     AdamWState state = AdamWState::for_parameter(parameter);
     AdamWOptions options{.learning_rate = 0.1f, .beta1 = 0.9f, .beta2 = 0.999f, .epsilon = 1.0e-8f, .weight_decay = 0.01f};
 
-    adamw_step(parameter, gradient, state, options);
+    if (!adamw_step(parameter, gradient, state, options)) throw std::runtime_error("AdamW: valid update was skipped");
     expect_close(parameter, {0.899f, -1.898f}, tolerance);
     expect_close(state.first_moment, {0.01f, -0.02f}, tolerance);
     expect_close(state.second_moment, {0.00001f, 0.00004f}, tolerance);
     if (state.step != 1) throw std::runtime_error("AdamW: step counter was not updated");
 
-    adamw_step(parameter, gradient, state, options);
+    if (!adamw_step(parameter, gradient, state, options)) throw std::runtime_error("AdamW: valid update was skipped");
     expect_close(parameter, {0.798101f, -1.796102f}, tolerance);
     if (state.step != 2) throw std::runtime_error("AdamW: step counter was not updated twice");
+}
+
+void test_numerical_stability(DeviceType device, Dtype dtype, float tolerance) {
+    Tensor parameter({2}, device, dtype);
+    Tensor gradient({2}, device, dtype);
+    parameter.copy_from_host(std::vector<float>{1.0f, -1.0f});
+    gradient.copy_from_host(std::vector<float>{8.0f, 0.0f});
+    AdamWState state = AdamWState::for_parameter(parameter);
+    AdamWOptions options{.learning_rate = 0.1f, .weight_decay = 0.0f, .loss_scale = 4.0f, .max_grad_norm = 1.0f};
+    if (!adamw_step(parameter, gradient, state, options)) throw std::runtime_error("AdamW: stable update was skipped");
+    // After unscaling, norm is 2 and clipping reduces the effective gradient to 1.
+    expect_close(parameter, {0.9f, -1.0f}, tolerance);
+    expect_close(state.master_parameter, {0.9f, -1.0f}, 2.0e-6f);
+
+    const std::vector<float> before = [&] { std::vector<float> result(2); parameter.copy_to_host(result); return result; }();
+    gradient.copy_from_host(std::vector<float>{std::numeric_limits<float>::infinity(), 0.0f});
+    if (adamw_step(parameter, gradient, state, options)) throw std::runtime_error("AdamW: accepted an infinite gradient");
+    expect_close(parameter, before, tolerance);
+    if (state.step != 1) throw std::runtime_error("AdamW: advanced step after non-finite gradient");
 }
 
 void test_validation() {
@@ -42,7 +61,7 @@ void test_validation() {
     Tensor gradient({2}, DeviceType::CPU);
     AdamWState state = AdamWState::for_parameter(parameter);
     try {
-        adamw_step(parameter, gradient, state);
+        static_cast<void>(adamw_step(parameter, gradient, state));
         throw std::runtime_error("AdamW accepted incompatible tensors");
     } catch (const std::invalid_argument&) {
     }
@@ -58,6 +77,12 @@ int main() {
         test_update_and_state(DeviceType::CUDA, Dtype::F32, 2.0e-6f);
         test_update_and_state(DeviceType::CUDA, Dtype::F16, 2.0e-3f);
         test_update_and_state(DeviceType::CUDA, Dtype::BF16, 1.0e-2f);
+        test_numerical_stability(DeviceType::CPU, Dtype::F32, 2.0e-6f);
+        test_numerical_stability(DeviceType::CPU, Dtype::F16, 2.0e-3f);
+        test_numerical_stability(DeviceType::CPU, Dtype::BF16, 1.0e-2f);
+        test_numerical_stability(DeviceType::CUDA, Dtype::F32, 2.0e-6f);
+        test_numerical_stability(DeviceType::CUDA, Dtype::F16, 2.0e-3f);
+        test_numerical_stability(DeviceType::CUDA, Dtype::BF16, 1.0e-2f);
         test_validation();
         std::cout << "AdamW tests passed.\n";
     } catch (const std::exception& error) {

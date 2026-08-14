@@ -1,8 +1,9 @@
 #pragma once
 
-#include <cstdint>
-
 #include "core/tensor.h"
+
+#include <cstdint>
+#include <limits>
 
 /** Settings for decoupled Adam weight decay (AdamW). */
 struct AdamWOptions {
@@ -11,10 +12,15 @@ struct AdamWOptions {
     float beta2 = 0.999f;
     float epsilon = 1.0e-8f;
     float weight_decay = 1.0e-2f;
+    /** Divisor for gradients produced from a loss multiplied by this value. */
+    float loss_scale = 1.0f;
+    /** Per-tensor L2 clipping threshold; infinity disables clipping. */
+    float max_grad_norm = std::numeric_limits<float>::infinity();
 };
 
-/** Per-parameter AdamW state. Moment buffers are kept in F32. */
+/** Per-parameter AdamW state. All optimizer state and master weights use F32. */
 struct AdamWState {
+    Tensor master_parameter;
     Tensor first_moment;
     Tensor second_moment;
     std::uint64_t step = 0;
@@ -27,10 +33,12 @@ struct AdamWState {
  * Performs one AdamW update in-place and advances @p state.
  *
  * Parameters and gradients must have the same F32, F16, or BF16 dtype, shape,
- * and device. Moment buffers are always F32. The weight-decay term is
- * decoupled from the gradient, as in AdamW.
+ * and device. Moment buffers and master weights are always F32. Gradients are
+ * unscaled by @c options.loss_scale before clipping and updating. If a NaN or
+ * Inf is found, no state is changed and false is returned. The weight-decay
+ * term is decoupled from the gradient, as in AdamW.
  */
-void adamw_step(
+[[nodiscard]] bool adamw_step(
     Tensor& parameter,
     const Tensor& gradient,
     AdamWState& state,

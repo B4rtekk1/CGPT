@@ -13,7 +13,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include <cstdint>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -163,8 +162,8 @@ __global__ void reduce_bias_kernel(T* __restrict__ grad_bias, const T* __restric
         sum += static_cast<float>(grad_output[row * columns + column]);
     sum = warp_sum(sum);
     __shared__ float warp_sums[8];
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
     if (lane == 0) warp_sums[warp] = sum;
     __syncthreads();
     if (warp == 0) {

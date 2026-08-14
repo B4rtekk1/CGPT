@@ -1,10 +1,3 @@
-"""Download approximately 100 MiB of UTF-8 text for tokenizer benchmarks.
-
-The default source is the Wikimedia English Wikipedia dump. Only the required
-compressed prefix is downloaded, then it is decompressed while writing the
-requested amount of text to disk.
-"""
-
 from __future__ import annotations
 
 import argparse

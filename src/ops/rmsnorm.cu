@@ -395,7 +395,7 @@ namespace {
     /**
      * @brief Converts one packed 32-bit word to two FP16 values.
      */
-    __forceinline__ __device__ __half2 packed_u32_to_half2(unsigned int value) {
+    __forceinline__ __device__ __half2 packed_u32_to_half2(const unsigned int value) {
         union PackedHalf2 {
             unsigned int bits;
             __half2 halves;
@@ -407,7 +407,7 @@ namespace {
     /**
      * @brief Converts two FP16 values to one packed 32-bit word.
      */
-    __forceinline__ __device__ unsigned int half2_to_packed_u32(__half2 value) {
+    __forceinline__ __device__ unsigned int half2_to_packed_u32(const __half2& value) {
         union PackedHalf2 {
             unsigned int bits;
             __half2 halves;

@@ -17,7 +17,7 @@ public:
         CUDA_CHECK(cudaMemcpy(data_, values.data(), values.size() * sizeof(bpe::TokenId), cudaMemcpyHostToDevice));
     }
     ~DeviceTargets() { if (data_ != nullptr) cudaFree(data_); }
-    bpe::TokenId* get() const { return data_; }
+    [[nodiscard]] bpe::TokenId* get() const { return data_; }
 private:
     bpe::TokenId* data_ = nullptr;
 };

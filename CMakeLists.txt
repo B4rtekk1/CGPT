@@ -23,6 +23,8 @@ set(CMAKE_CUDA_ARCHITECTURES 86-real CACHE STRING "CUDA architectures")
 set(CGPT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_library(cgpt_core STATIC
+        include/data/dataset_loader.h
+        src/data/dataset_loader.cpp
         src/ops/embedding.cu
         src/ops/cross_entropy.cu
         src/ops/linear.cu
@@ -40,6 +42,7 @@ add_library(cgpt_core STATIC
         src/core/kv_cache.cu
         src/core/transformer_block.cu
         src/core/transformer_model.cu
+        src/core/weight_initialization.cu
         src/core/generation.cu
         src/core/cuda_graph.cu
         src/ops/flash_attention.cu)
@@ -97,6 +100,7 @@ add_cgpt_test(kv_cache_test tests/kv_cache_test.cu cgpt_core)
 add_cgpt_test(transformer_block_test tests/transformer_block_test.cu cgpt_core)
 add_cgpt_test(transformer_model_test tests/transformer_model_test.cu cgpt_core)
 add_cgpt_test(adamw_test tests/adamw_test.cu cgpt_core)
+add_cgpt_test(dataset_loader_test tests/dataset_loader_test.cpp cgpt_core)
 add_cgpt_test(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp cgpt_tokenizer)
 add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_tokenizer)
 
@@ -104,7 +108,7 @@ add_executable(run_all_tests tests/run_all_tests.cpp)
 add_dependencies(run_all_tests
         rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test
         flash_attention_test embedding_test cross_entropy_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test
-        bpe_tokenizer_test bpe_tokenizer_100mb_test)
+        dataset_loader_test bpe_tokenizer_test bpe_tokenizer_100mb_test)
 add_custom_target(run_all
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CGPT_CUPTI_RUNTIME_DLL}" $<TARGET_FILE_DIR:run_all_tests>
@@ -126,6 +130,7 @@ add_custom_target(run_all
                 transformer_block_test $<TARGET_FILE:transformer_block_test>
                 transformer_model_test $<TARGET_FILE:transformer_model_test>
                 adamw_test $<TARGET_FILE:adamw_test>
+                dataset_loader_test $<TARGET_FILE:dataset_loader_test>
                 bpe_tokenizer_test $<TARGET_FILE:bpe_tokenizer_test>
                 bpe_tokenizer_100mb_test $<TARGET_FILE:bpe_tokenizer_100mb_test>
         DEPENDS run_all_tests
@@ -135,7 +140,7 @@ add_custom_target(run_all
         COMMENT "Running all tests and printing the benchmark summary")
 
 set_tests_properties(
-        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test bpe_tokenizer_test
+        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test dataset_loader_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
 
 # The cross-entropy benchmark processes a GPT-2-sized vocabulary and needs
@@ -146,3 +151,9 @@ set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES
         TIMEOUT 900
         SKIP_RETURN_CODE 77
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(cgpt_train train/train.cpp)
+target_link_libraries(cgpt_train PRIVATE cgpt_core cgpt_tokenizer CUDA::cudart)
+set_target_properties(cgpt_train PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON)

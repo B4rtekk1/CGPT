@@ -303,21 +303,18 @@ void test_custom_stream() {
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-void test_backward() {
-    auto options = valid_options();
-    options.num_query_heads = 4;
-    options.num_kv_heads = 2;
-    options.head_dim = 32;
-    options.causal = true;
-    options.query_position_offset = 2;
-    options.attention_scale = 0.23F;
-    constexpr std::size_t batch = 2;
-    constexpr std::size_t query_sequence = 3;
-    constexpr std::size_t key_sequence = 5;
-    const std::vector<std::size_t> query_shape{batch, query_sequence, 4, 32};
-    const std::vector<std::size_t> key_shape{batch, key_sequence, 2, 32};
-    const auto query_values = values(batch * query_sequence * 4 * 32, 0.2F);
-    const auto key_values = values(batch * key_sequence * 2 * 32, 0.7F);
+void run_backward_case(
+    std::size_t batch, std::size_t query_sequence, std::size_t key_sequence,
+    const FlashAttentionOptions& options
+) {
+    const std::vector<std::size_t> query_shape{
+        batch, query_sequence, options.num_query_heads, options.head_dim};
+    const std::vector<std::size_t> key_shape{
+        batch, key_sequence, options.num_kv_heads, options.head_dim};
+    const auto query_values = values(
+        batch * query_sequence * options.num_query_heads * options.head_dim, 0.2F);
+    const auto key_values = values(
+        batch * key_sequence * options.num_kv_heads * options.head_dim, 0.7F);
     const auto value_values = values(key_values.size(), 1.4F);
     const auto grad_output_values = values(query_values.size(), 2.1F);
     const auto expected = attention_backward_reference(
@@ -345,6 +342,26 @@ void test_backward() {
     expect_close(actual_query, expected.query, 3.0e-2F);
     expect_close(actual_key, expected.key, 3.0e-2F);
     expect_close(actual_value, expected.value, 3.0e-2F);
+}
+
+void test_backward() {
+    auto options = valid_options();
+    options.num_query_heads = 4;
+    options.num_kv_heads = 2;
+    options.head_dim = 32;
+    options.causal = true;
+    options.query_position_offset = 2;
+    options.attention_scale = 0.23F;
+    run_backward_case(2, 3, 5, options);
+
+    // Exercises the CTA-cooperative 4:1 GQA/head_dim=128 specialization.
+    options.num_query_heads = 4;
+    options.num_kv_heads = 1;
+    options.head_dim = 128;
+    options.causal = true;
+    options.query_position_offset = 32;
+    options.attention_scale = 0.11F;
+    run_backward_case(1, 3, 35, options);
 }
 
 void benchmark_kernel() {

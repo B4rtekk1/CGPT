@@ -1,6 +1,11 @@
 build
 build-vs
 data
+# The training corpus stays ignored, but these are C++ source directories.
+!include/data/
+!include/data/**
+!src/data/
+!src/data/**
 __pycache__/
 
 ### CUDA template

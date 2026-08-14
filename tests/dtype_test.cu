@@ -1,7 +1,6 @@
 #include "core/dtype.h"
 
 #include <cassert>
-#include <cstdint>
 #include <limits>
 #include <stdexcept>
 
