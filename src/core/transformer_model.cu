@@ -44,6 +44,7 @@ TransformerBlockWorkspace make_block_workspace(
         Tensor({batch_size, sequence_length, block.num_kv_heads, block.head_dim}, dtype),
         Tensor({batch_size, sequence_length, block.num_kv_heads, block.head_dim}, dtype),
         Tensor({batch_size, sequence_length, block.num_query_heads, block.head_dim}, dtype),
+        Tensor({batch_size, sequence_length, block.num_query_heads}, Dtype::F32),
         Tensor({rows, block.hidden_size}, dtype),
         Tensor({rows, block.intermediate_size}, dtype),
         Tensor({rows, block.intermediate_size}, dtype),

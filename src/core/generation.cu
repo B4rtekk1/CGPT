@@ -94,7 +94,10 @@ std::vector<bpe::TokenId> generate_tokens(
     for (std::size_t step = 0; step < options.max_new_tokens; ++step) {
         const std::size_t begin = result.size() > options.max_context_tokens
             ? result.size() - options.max_context_tokens : 0;
-        const std::vector<bpe::TokenId> context(result.begin() + static_cast<long long>(begin), result.end());
+        // Avoid debug-iterator arithmetic here: generation is also used from
+        // the Debug build, where MSVC turns an invalid seek into a modal abort.
+        const std::vector<bpe::TokenId> context(
+            result.data() + begin, result.data() + result.size());
         Tensor logits({context.size(), model_options.vocabulary_size}, weights.token_embedding.dtype());
         TransformerModelWorkspace workspace(model_options, 1, context.size(), weights.token_embedding.dtype());
         bpe::TokenId* device_ids = nullptr;
@@ -106,8 +109,12 @@ std::vector<bpe::TokenId> generate_tokens(
             CUDA_CHECK(cudaStreamSynchronize(stream));
             std::vector<float> host_logits(logits.numel());
             logits.copy_to_host(host_logits);
-            std::vector<float> last_logits(host_logits.end() - static_cast<long long>(model_options.vocabulary_size),
-                                           host_logits.end());
+            if (host_logits.size() < model_options.vocabulary_size) {
+                throw std::runtime_error("generation logits are smaller than the vocabulary");
+            }
+            const std::size_t last_row = host_logits.size() - model_options.vocabulary_size;
+            std::vector<float> last_logits(
+                host_logits.data() + last_row, host_logits.data() + host_logits.size());
             const bpe::TokenId next = sample(last_logits, options, rng);
             result.push_back(next);
             if (options.eos_token_id && next == *options.eos_token_id) break;

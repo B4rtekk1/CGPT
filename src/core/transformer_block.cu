@@ -258,6 +258,13 @@ void transformer_block_forward(
     require_shape(workspace.attention_output,
                   {batch, sequence, options.num_query_heads, options.head_dim},
                   "attention_output");
+    require_shape(workspace.attention_logsumexp,
+                  {batch, sequence, options.num_query_heads},
+                  "attention_logsumexp");
+    if (workspace.attention_logsumexp.dtype() != Dtype::F32) {
+        throw std::invalid_argument(
+            "attention_logsumexp must use F32 storage");
+    }
     require_shape(workspace.norm, {rows, hidden_size}, "norm");
     require_shape(workspace.attention_projection, {rows, hidden_size},
                   "attention_projection");
@@ -304,8 +311,9 @@ void transformer_block_forward(
     flash_attention_options.causal = options.causal;
     flash_attention_options.query_position_offset = position_offset;
 
-    flash_gqa_attention_forward(
+    flash_gqa_attention_forward_with_lse(
         workspace.attention_output,
+        workspace.attention_logsumexp,
         workspace.query,
         workspace.key,
         workspace.value,
@@ -396,9 +404,11 @@ void transformer_block_backward(
     attention_options.head_dim = options.head_dim;
     attention_options.causal = options.causal;
     attention_options.query_position_offset = position_offset;
-    flash_gqa_attention_backward(backward.grad_query, backward.grad_key, backward.grad_value,
-        backward.grad_attention_output, forward_workspace.query, forward_workspace.key, forward_workspace.value,
-        stream, attention_options);
+    flash_gqa_attention_backward_with_lse(
+        backward.grad_query, backward.grad_key, backward.grad_value,
+        backward.grad_attention_output, forward_workspace.attention_output,
+        forward_workspace.attention_logsumexp, forward_workspace.query,
+        forward_workspace.key, forward_workspace.value, stream, attention_options);
     rope_backward(backward.grad_query_pre_rope, backward.grad_key_pre_rope, backward.grad_query,
         backward.grad_key, cos_cache, sin_cache, stream, RopeOptions{options.rotary_dim, position_offset});
 

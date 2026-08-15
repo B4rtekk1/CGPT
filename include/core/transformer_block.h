@@ -38,6 +38,8 @@ struct TransformerBlockWorkspace {
     Tensor key;
     Tensor value;
     Tensor attention_output;
+    // FP32 softmax log-sum-exp saved by the training Flash Attention API.
+    Tensor attention_logsumexp;
     Tensor attention_projection;
 
     Tensor gate;

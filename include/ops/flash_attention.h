@@ -27,3 +27,20 @@ void flash_gqa_attention_forward(
     cudaStream_t stream = nullptr,
     const FlashAttentionOptions& options = {}
     );
+
+/**
+ * Training variant of flash_gqa_attention_forward.  In addition to @p output,
+ * stores the per-row log-sum-exp softmax statistic in @p logsumexp.  The LSE
+ * tensor must be CUDA F32 with shape [batch, query_sequence, query_heads].
+ * Pass it to flash_gqa_attention_backward_with_lse to avoid recomputing the
+ * online-softmax statistics during backpropagation.
+ */
+void flash_gqa_attention_forward_with_lse(
+    Tensor& output,
+    Tensor& logsumexp,
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    cudaStream_t stream = nullptr,
+    const FlashAttentionOptions& options = {}
+    );

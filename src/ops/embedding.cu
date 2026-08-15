@@ -1,3 +1,20 @@
+/**
+ * @file embedding.cu
+ * @brief CUDA implementation of the token embedding operator.
+ *
+ * @details
+ * This translation unit gathers rows from an embedding matrix using token identifiers stored in device memory.
+ * One CUDA blok processes one token and cooperatively copies the corresponding row to the output tensor.
+ *
+ * The implementation supports FP32, FP16 and BF16 tensors. When pointer alignment and the hidden
+ * dimension allow it, the implementation selects a vectorized copy using uint4, half2 or bfloat162 values.
+ * Invalid token identifier=ers can optionally be converted to an all-zero embedding row.
+ *
+ * @note The public declaration are located in `include/ops/embedding.h`.
+ * @warning `device_token_ids` must point to CUDA_accessible memory. This file does not copy token identifiers automatically in
+ * `embedding_forward`; use embedding_upload_token_ids when needed.
+ */
+
 #include "ops/embedding.h"
 #include "core/cuda_check.h"
 

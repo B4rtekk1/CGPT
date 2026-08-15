@@ -230,6 +230,7 @@ __device__ __forceinline__ void load_kv_rows_f16(
 template <int HeadDim, int BlockM>
 __global__ void flash_gqa_f16_tensor_core_kernel(
     __half* __restrict__ output,
+    float* __restrict__ logsumexp,
     const __half* __restrict__ query,
     const __half* __restrict__ key,
     const __half* __restrict__ value,
@@ -505,6 +506,12 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
                     * query_row_stride
                 + dimension;
             output[output_offset] = __float2half_rn(result);
+            if (logsumexp != nullptr && dimension == 0) {
+                logsumexp[(static_cast<std::int64_t>(batch) * query_sequence
+                           + query_position) * num_query_heads + query_head] =
+                    denominator > 0.0F ? running_max[row] + __logf(denominator)
+                                       : -INFINITY;
+            }
         }
     }
 }
@@ -548,6 +555,7 @@ template <int HeadDim, int GroupSize>
 __global__ __launch_bounds__(128, 1)
 void flash_gqa_grouped_f16_tensor_core_kernel(
     __half* __restrict__ output,
+    float* __restrict__ logsumexp,
     const __half* __restrict__ query,
     const __half* __restrict__ key,
     const __half* __restrict__ value,
@@ -802,6 +810,12 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
                   + query_position) * num_query_heads + query_head) * HeadDim
                 + dimension;
             output[output_offset] = __float2half_rn(result);
+            if (logsumexp != nullptr && dimension == 0) {
+                logsumexp[(static_cast<std::int64_t>(batch) * query_sequence
+                           + query_position) * num_query_heads + query_head] =
+                    denominator > 0.0F ? running_max[state_row] + __logf(denominator)
+                                       : -INFINITY;
+            }
         }
     }
 }
@@ -837,6 +851,7 @@ constexpr std::size_t grouped_f16_shared_bytes() {
 template <int HeadDim, int GroupSize>
 void launch_grouped_f16(
     Tensor& output,
+    float* logsumexp,
     const Tensor& query,
     const Tensor& key,
     const Tensor& value,
@@ -877,7 +892,7 @@ void launch_grouped_f16(
            kThreads,
            shared_bytes,
            stream>>>(
-            static_cast<__half*>(output.raw_data()),
+            static_cast<__half*>(output.raw_data()), logsumexp,
             static_cast<const __half*>(query.raw_data()),
             static_cast<const __half*>(key.raw_data()),
             static_cast<const __half*>(value.raw_data()),
@@ -923,6 +938,7 @@ constexpr std::size_t tiled_f16_shared_bytes() {
 template <int HeadDim, int BlockM>
 void launch_tiled_f16(
     Tensor& output,
+    float* logsumexp,
     const Tensor& query,
     const Tensor& key,
     const Tensor& value,
@@ -962,7 +978,7 @@ void launch_tiled_f16(
            kThreads,
            shared_bytes,
            stream>>>(
-            static_cast<__half*>(output.raw_data()),
+            static_cast<__half*>(output.raw_data()), logsumexp,
             static_cast<const __half*>(query.raw_data()),
             static_cast<const __half*>(key.raw_data()),
             static_cast<const __half*>(value.raw_data()),
@@ -985,6 +1001,7 @@ void launch_tiled_f16(
  */
 void launch_tiled_f16_dispatch(
     Tensor& output,
+    float* logsumexp,
     const Tensor& query,
     const Tensor& key,
     const Tensor& value,
@@ -998,13 +1015,13 @@ void launch_tiled_f16_dispatch(
     switch (options.head_dim) {
         case 32:
             launch_tiled_f16<32, 64>(
-                output, query, key, value,
+                output, logsumexp, query, key, value,
                 batch_size, query_sequence, key_value_sequence,
                 scale, options, stream);
             break;
         case 64:
             launch_tiled_f16<64, 64>(
-                output, query, key, value,
+                output, logsumexp, query, key, value,
                 batch_size, query_sequence, key_value_sequence,
                 scale, options, stream);
             break;
@@ -1013,12 +1030,12 @@ void launch_tiled_f16_dispatch(
                 // One CTA owns all four query heads mapped to a KV head.
                 // The 16x128 K/V tiles are loaded once and reused by 4 warps.
                 launch_grouped_f16<128, 4>(
-                    output, query, key, value,
+                    output, logsumexp, query, key, value,
                     batch_size, query_sequence, key_value_sequence,
                     scale, options, stream);
             } else {
                 launch_tiled_f16<128, 64>(
-                    output, query, key, value,
+                    output, logsumexp, query, key, value,
                     batch_size, query_sequence, key_value_sequence,
                     scale, options, stream);
             }
@@ -1214,6 +1231,7 @@ void flash_gqa_attention_forward(
 
     launch_tiled_f16_dispatch(
         output,
+        nullptr,
         query,
         key,
         value,
@@ -1223,4 +1241,40 @@ void flash_gqa_attention_forward(
         scale,
         options,
         stream);
+}
+
+// Training entry point.  Besides the normal FP16 output it persists one FP32
+// log-sum-exp value per attention row: LSE = max(score) + log(sum(exp(score-max))).
+// Backward can therefore reconstruct P directly and does not need a separate
+// online-softmax statistics pass.
+void flash_gqa_attention_forward_with_lse(
+    Tensor& output, Tensor& logsumexp, const Tensor& query, const Tensor& key,
+    const Tensor& value, cudaStream_t stream, const FlashAttentionOptions& options
+) {
+    validate_options(options);
+    validate_tensor(output, "output");
+    validate_tensor(query, "query");
+    validate_tensor(key, "key");
+    validate_tensor(value, "value");
+
+    const auto& q = query.shape();
+    const auto& k = key.shape();
+    if (q.size() != 4U || k.size() != 4U || value.shape() != k || output.shape() != q
+        || logsumexp.dim() != 3 || logsumexp.size(0) != q[0]
+        || logsumexp.size(1) != q[1] || logsumexp.size(2) != q[2]
+        || q[2] != options.num_query_heads || k[2] != options.num_kv_heads
+        || q[3] != options.head_dim || k[3] != options.head_dim
+        || q[0] != k[0] || query.dtype() != Dtype::F16 || key.dtype() != Dtype::F16
+        || value.dtype() != Dtype::F16 || output.dtype() != Dtype::F16
+        || logsumexp.dtype() != Dtype::F32) {
+        throw std::invalid_argument("flash_gqa_attention_forward_with_lse: invalid tensor contract");
+    }
+    if (options.causal && options.query_position_offset + q[1] > k[1]) {
+        throw std::invalid_argument("flash_gqa_attention_forward_with_lse: causal query range exceeds K/V");
+    }
+    validate_kernel_integer_ranges(q[0], q[1], k[1], options);
+    const float scale = options.attention_scale > 0.0F ? options.attention_scale
+        : 1.0F / std::sqrt(static_cast<float>(options.head_dim));
+    launch_tiled_f16_dispatch(output, static_cast<float*>(logsumexp.raw_data()), query, key, value,
+        q[0], q[1], k[1], scale, options, stream);
 }

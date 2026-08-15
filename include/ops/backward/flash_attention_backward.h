@@ -22,3 +22,23 @@ void flash_gqa_attention_backward(
     const FlashAttentionOptions& options = {},
     bool accumulate_grads = false
     );
+
+/**
+ * Backpropagates attention using the output and LSE statistics saved by
+ * flash_gqa_attention_forward_with_lse.  This is the preferred training API:
+ * it avoids a separate softmax-statistics pass in the backward kernel.
+ */
+void flash_gqa_attention_backward_with_lse(
+    Tensor& grad_query,
+    Tensor& grad_key,
+    Tensor& grad_value,
+    const Tensor& grad_output,
+    const Tensor& output,
+    const Tensor& logsumexp,
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    cudaStream_t stream = nullptr,
+    const FlashAttentionOptions& options = {},
+    bool accumulate_grads = false
+    );

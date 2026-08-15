@@ -342,6 +342,24 @@ void run_backward_case(
     expect_close(actual_query, expected.query, 3.0e-2F);
     expect_close(actual_key, expected.key, 3.0e-2F);
     expect_close(actual_value, expected.value, 3.0e-2F);
+
+    // The training API saves LSE in forward and consumes it in backward.
+    // Compare this path with the same FP32 reference as the legacy backward.
+    Tensor output(query_shape, Dtype::F16);
+    Tensor logsumexp(
+        {batch, query_sequence, options.num_query_heads}, Dtype::F32);
+    flash_gqa_attention_forward_with_lse(
+        output, logsumexp, query, key, value, nullptr, options);
+    flash_gqa_attention_backward_with_lse(
+        grad_query, grad_key, grad_value, grad_output, output, logsumexp,
+        query, key, value, nullptr, options);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    grad_query.copy_to_host(actual_query);
+    grad_key.copy_to_host(actual_key);
+    grad_value.copy_to_host(actual_value);
+    expect_close(actual_query, expected.query, 3.0e-2F);
+    expect_close(actual_key, expected.key, 3.0e-2F);
+    expect_close(actual_value, expected.value, 3.0e-2F);
 }
 
 void test_backward() {
@@ -389,6 +407,13 @@ void benchmark_kernel() {
         flash_gqa_attention_forward(output, query, key, value, stream, options);
     }, 1000, 50);
 
+    Tensor logsumexp(
+        {kBatchSize, kQuerySequence, options.num_query_heads}, Dtype::F32);
+    test::benchmark_cuda_launches("Flash attention LSE forward kernel", [&](cudaStream_t stream) {
+        flash_gqa_attention_forward_with_lse(
+            output, logsumexp, query, key, value, stream, options);
+    }, 1000, 50);
+
     Tensor grad_output(query_shape, Dtype::F16);
     Tensor grad_query(query_shape, Dtype::F16);
     Tensor grad_key(key_value_shape, Dtype::F16);
@@ -396,6 +421,12 @@ void benchmark_kernel() {
     test::benchmark_cuda_launches("Flash attention backward kernel", [&](cudaStream_t stream) {
         flash_gqa_attention_backward(
             grad_query, grad_key, grad_value, grad_output,
+            query, key, value, stream, options);
+    }, 20, 5);
+
+    test::benchmark_cuda_launches("Flash attention LSE backward kernel", [&](cudaStream_t stream) {
+        flash_gqa_attention_backward_with_lse(
+            grad_query, grad_key, grad_value, grad_output, output, logsumexp,
             query, key, value, stream, options);
     }, 20, 5);
 }

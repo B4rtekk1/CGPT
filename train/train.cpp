@@ -1,4 +1,5 @@
 #include "core/cuda_check.h"
+#include "core/generation.h"
 #include "core/transformer_model.h"
 #include "core/weight_initialization.h"
 #include "data/dataset_loader.h"
@@ -29,6 +30,9 @@ struct Arguments {
     std::size_t sequence_length = 1024;
     std::size_t epochs = 10;
     std::size_t max_steps = 0; // 0 means all batches from every requested epoch.
+    float learning_rate = 1.0e-4F;
+    std::string prompt = "The";
+    std::size_t generate_tokens = 64;
 };
 
 Arguments parse_arguments(int argc, char** argv) {
@@ -46,13 +50,18 @@ Arguments parse_arguments(int argc, char** argv) {
         else if (option == "--sequence-length") args.sequence_length = std::stoull(value());
         else if (option == "--epochs") args.epochs = std::stoull(value());
         else if (option == "--max-steps") args.max_steps = std::stoull(value());
+        else if (option == "--learning-rate") args.learning_rate = std::stof(value());
+        else if (option == "--prompt") args.prompt = value();
+        else if (option == "--generate-tokens") args.generate_tokens = std::stoull(value());
         else if (option == "--help") {
             std::cout << "Usage: cgpt_train [--input PATH] [--tokenizer PATH] [--vocab-size N] "
-                         "[--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N]\n";
+                         "[--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N] "
+                         "[--learning-rate N] [--prompt TEXT] [--generate-tokens N]\n";
             std::exit(EXIT_SUCCESS);
         } else throw std::invalid_argument("Unknown option: " + option);
     }
-    if (args.vocab_size < 512 || args.batch_size == 0 || args.sequence_length < 2 || args.epochs == 0)
+    if (args.vocab_size < 512 || args.batch_size == 0 || args.sequence_length < 2 || args.epochs == 0 ||
+        !std::isfinite(args.learning_rate) || args.learning_rate <= 0.0F)
         throw std::invalid_argument("Invalid training dimensions");
     return args;
 }
@@ -101,16 +110,28 @@ struct ModelStorage {
 };
 
 void append_parameters(ModelStorage& model, std::vector<std::pair<Tensor*, Tensor*>>& result) {
-    result = {{&model.embedding, &model.g_embedding}, {&model.final_norm, &model.g_final_norm}, {&model.lm_head, &model.g_lm_head}};
+    result.clear();
+    result.reserve(3 + model.layers.size() * 9);
+    result.emplace_back(&model.embedding, &model.g_embedding);
+    result.emplace_back(&model.final_norm, &model.g_final_norm);
+    result.emplace_back(&model.lm_head, &model.g_lm_head);
     for (auto& l : model.layers) {
-        result.insert(result.end(), {{&l.attention_norm, &l.g_attention_norm}, {&l.q, &l.g_q}, {&l.k, &l.g_k}, {&l.v, &l.g_v},
-            {&l.o, &l.g_o}, {&l.ffn_norm, &l.g_ffn_norm}, {&l.gate, &l.g_gate}, {&l.up, &l.g_up}, {&l.down, &l.g_down}});
+        result.emplace_back(&l.attention_norm, &l.g_attention_norm);
+        result.emplace_back(&l.q, &l.g_q);
+        result.emplace_back(&l.k, &l.g_k);
+        result.emplace_back(&l.v, &l.g_v);
+        result.emplace_back(&l.o, &l.g_o);
+        result.emplace_back(&l.ffn_norm, &l.g_ffn_norm);
+        result.emplace_back(&l.gate, &l.g_gate);
+        result.emplace_back(&l.up, &l.g_up);
+        result.emplace_back(&l.down, &l.g_down);
     }
 }
 
 std::pair<Tensor, Tensor> rotary_cache(std::size_t sequence_length, std::size_t rotary_dim) {
-    std::vector<float> cosine(sequence_length * (rotary_dim / 2));
-    std::vector<float> sine(cosine.size());
+    const std::size_t cache_size = sequence_length * (rotary_dim / 2);
+    std::vector<float> cosine(cache_size);
+    std::vector<float> sine(cache_size);
     for (std::size_t pos = 0; pos < sequence_length; ++pos) for (std::size_t i = 0; i < rotary_dim / 2; ++i) {
         const float theta = static_cast<float>(pos) / std::pow(10000.0F, 2.0F * static_cast<float>(i) / static_cast<float>(rotary_dim));
         cosine[pos * (rotary_dim / 2) + i] = std::cos(theta); sine[pos * (rotary_dim / 2) + i] = std::sin(theta);
@@ -154,6 +175,10 @@ int main(int argc, char** argv) {
         data::DeviceBatch device_batch;
         std::vector<std::pair<Tensor*, Tensor*>> parameters; append_parameters(model, parameters);
         std::vector<AdamWState> optimizer; for (const auto& [parameter, gradient] : parameters) optimizer.push_back(AdamWState::for_parameter(*parameter));
+        AdamWOptions optimizer_options;
+        optimizer_options.learning_rate = args.learning_rate;
+        optimizer_options.weight_decay = 0.01F;
+        optimizer_options.max_grad_norm = 1.0F;
         const CublasLtContext cublas;
         ProgressBar progress(total_steps, "Training");
         data::Batch batch; std::size_t step = 0;
@@ -167,13 +192,23 @@ int main(int argc, char** argv) {
                 cross_entropy_forward_backward(loss, grad_logits, logits, device_targets, batch.token_count());
                 transformer_model_backward(grad_logits, device_inputs, batch.batch_size, batch.sequence_length,
                     model.weights(), model.gradients(), forward_workspace, backward_workspace, cos_cache, sin_cache, cublas, nullptr, model.options);
-                for (std::size_t i = 0; i < parameters.size(); ++i) if (!adamw_step(*parameters[i].first, *parameters[i].second, optimizer[i])) throw std::runtime_error("Non-finite gradient at step " + std::to_string(step));
+                for (std::size_t i = 0; i < parameters.size(); ++i)
+                    if (!adamw_step(*parameters[i].first, *parameters[i].second, optimizer[i], optimizer_options))
+                        throw std::runtime_error("Non-finite gradient at step " + std::to_string(step));
                 ++step; progress.update(step);
                 if (step % 50 == 0 || step == total_steps) { std::vector<float> host_loss(1); loss.copy_to_host(host_loss); std::cout << " loss=" << host_loss[0] << std::flush; }
             }
             if (epoch + 1 < args.epochs) loader.reset();
         }
         progress.finish();
+        GenerationOptions generation_options;
+        generation_options.max_new_tokens = args.generate_tokens;
+        generation_options.max_context_tokens = args.sequence_length;
+        generation_options.temperature = 0.8F;
+        generation_options.top_k = 40;
+        generation_options.seed = 42;
+        std::cout << "\nGenerated text:\n" << generate_text(tokenizer, args.prompt, model.weights(), cos_cache,
+            sin_cache, cublas, model.options, generation_options) << '\n';
         std::cout << "Completed " << step << " optimizer steps. Tokenizer saved to " << args.tokenizer_output << '\n';
         return EXIT_SUCCESS;
     } catch (const std::exception& error) { std::cerr << "Training failed: " << error.what() << '\n'; return EXIT_FAILURE; }

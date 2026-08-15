@@ -18,7 +18,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_ARCHITECTURES 86-real CACHE STRING "CUDA architectures")
+# This project is profiled and deployed on the local RTX 3050 Laptop GPU
+# (Ampere, SM86).  FORCE prevents an old build-directory cache from silently
+# compiling SM75 PTX, which disables Ampere-specific code generation.
+set(CMAKE_CUDA_ARCHITECTURES 86-real CACHE STRING "CUDA architectures" FORCE)
 
 set(CGPT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

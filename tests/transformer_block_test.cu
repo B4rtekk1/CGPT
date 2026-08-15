@@ -184,6 +184,7 @@ struct BlockFixture {
         Tensor{{kBatch, kSequence, kKvHeads, kHeadDim}, Dtype::F16},
         Tensor{{kBatch, kSequence, kKvHeads, kHeadDim}, Dtype::F16},
         Tensor{{kBatch, kSequence, kQueryHeads, kHeadDim}, Dtype::F16},
+        Tensor{{kBatch, kSequence, kQueryHeads}, Dtype::F32},
         Tensor{{kBatch * kSequence, kHidden}, Dtype::F16},
         Tensor{{kBatch * kSequence, kIntermediate}, Dtype::F16},
         Tensor{{kBatch * kSequence, kIntermediate}, Dtype::F16},
@@ -330,7 +331,7 @@ void benchmark_kernel() {
     Tensor input({batch * sequence, hidden}, Dtype::F16), output({batch * sequence, hidden}, Dtype::F16);
     Tensor norm({hidden}, Dtype::F16), q({hidden, hidden}, Dtype::F16), k({kv_heads * head_dim, hidden}, Dtype::F16), v({kv_heads * head_dim, hidden}, Dtype::F16), o({hidden, hidden}, Dtype::F16), gate({intermediate, hidden}, Dtype::F16), up({intermediate, hidden}, Dtype::F16), down({hidden, intermediate}, Dtype::F16), cos({sequence, head_dim / 2}, Dtype::F16), sin({sequence, head_dim / 2}, Dtype::F16);
     TransformerBlockWeights weights{norm, q, k, v, o, norm, gate, up, down};
-    TransformerBlockWorkspace workspace{Tensor({batch * sequence, hidden}, Dtype::F16), Tensor({batch, sequence, query_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, kv_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, kv_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, query_heads, head_dim}, Dtype::F16), Tensor({batch * sequence, hidden}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, hidden}, Dtype::F16)};
+    TransformerBlockWorkspace workspace{Tensor({batch * sequence, hidden}, Dtype::F16), Tensor({batch, sequence, query_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, kv_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, kv_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, query_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, query_heads}, Dtype::F32), Tensor({batch * sequence, hidden}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, hidden}, Dtype::F16)};
     const CublasLtContext context;
     test::benchmark_cuda_launches("Transformer block", [&](cudaStream_t stream) { transformer_block_forward(output, input, weights, workspace, cos, sin, context, stream, options); });
 }
