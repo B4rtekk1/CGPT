@@ -10,13 +10,30 @@
 #include "dtype.h"
 #include "device_buffer.h"
 
+/** @brief Memory location used by a tensor. */
 enum class DeviceType {
+    /** @brief Host CPU memory. */
     CPU,
+    /** @brief CUDA device memory. */
     CUDA
 };
 
+/**
+ * @brief Owning contiguous tensor supporting CPU and CUDA storage.
+ *
+ * CUDA storage is managed through `DeviceBuffer`, while CPU storage is held
+ * in a byte vector. The tensor shape, data type, and device type are stored as
+ * metadata alongside the allocation.
+ */
 class Tensor {
 public:
+    /**
+     * @brief Constructs a tensor with the requested shape and storage type.
+     * @param shape Tensor dimensions. Every dimension must be non-zero.
+     * @param device_type Memory location for the tensor.
+     * @param dtype Floating-point storage data type.
+     * @throws std::invalid_argument If the device, data type, or shape is invalid.
+     */
     explicit Tensor(
         std::vector<std::size_t> shape,
         const DeviceType device_type = DeviceType::CUDA,
@@ -33,12 +50,14 @@ public:
                             ? dtype_bytes(element_count_, dtype_)
                             : 0) {}
 
+    /** @brief Constructs a tensor with the data type argument before the device. */
     explicit Tensor(
         std::vector<std::size_t> shape,
         Dtype dtype,
         DeviceType device_type = DeviceType::CUDA
     ) : Tensor(std::move(shape), device_type, dtype) {}
 
+    /** @brief Creates a deep copy of another tensor. */
     Tensor(const Tensor& other)
         : shape_(other.shape_),
           device_type_(other.device_type_),
@@ -55,6 +74,7 @@ public:
         }
     }
 
+    /** @brief Replaces this tensor with a deep copy of another tensor. */
     Tensor& operator=(const Tensor& other) {
         if (this == &other) {
             return *this;
@@ -65,6 +85,7 @@ public:
         return *this;
     }
 
+    /** @brief Transfers tensor storage from another tensor. */
     Tensor(Tensor&& other) noexcept
         : shape_(std::move(other.shape_)),
           device_type_(other.device_type_),
@@ -73,6 +94,7 @@ public:
           storage_(std::move(other.storage_)),
           host_storage_(std::move(other.host_storage_)) {}
 
+    /** @brief Transfers tensor storage from another tensor. */
     Tensor& operator=(Tensor&& other) noexcept {
         if (this != &other) {
             shape_ = std::move(other.shape_);
@@ -85,52 +107,73 @@ public:
         return *this;
     }
 
+    /**
+     * @brief Returns a mutable F32 data pointer.
+     * @throws std::logic_error If the tensor data type is not F32.
+     */
     [[nodiscard]] float* data() {
         require_f32_data();
         return static_cast<float*>(raw_data());
     }
 
+    /**
+     * @brief Returns a const F32 data pointer.
+     * @throws std::logic_error If the tensor data type is not F32.
+     */
     [[nodiscard]] const float* data() const {
         require_f32_data();
         return static_cast<const float*>(raw_data());
     }
 
+    /** @brief Returns a mutable pointer to the raw storage. */
     [[nodiscard]] void* raw_data() noexcept {
         return device_type_ == DeviceType::CUDA
             ? storage_.data()
             : static_cast<void*>(host_storage_.data());
     }
 
+    /** @brief Returns a const pointer to the raw storage. */
     [[nodiscard]] const void* raw_data() const noexcept {
         return device_type_ == DeviceType::CUDA
             ? storage_.data()
             : static_cast<const void*>(host_storage_.data());
     }
 
+    /** @brief Returns the tensor shape. */
     [[nodiscard]] const std::vector<std::size_t>& shape() const noexcept {
         return shape_;
     }
 
+    /** @brief Returns the total number of tensor elements. */
     [[nodiscard]] std::size_t numel() const noexcept {
         return element_count_;
     }
 
+    /** @brief Returns the storage size in bytes. */
     [[nodiscard]] std::size_t nbytes() const noexcept {
         return element_count_ * dtype_size(dtype_);
     }
 
+    /** @brief Returns the number of tensor dimensions. */
     [[nodiscard]] std::size_t dim() const noexcept {
         return shape_.size();
     }
 
+    /** @brief Returns the tensor memory location. */
     [[nodiscard]] DeviceType device_type() const noexcept {
         return device_type_;
     }
 
+    /** @brief Returns the tensor storage data type. */
     [[nodiscard]] Dtype dtype() const noexcept {
         return dtype_;
     }
 
+    /**
+     * @brief Returns the size of one tensor axis.
+     * @param axis Zero-based axis index.
+     * @throws std::out_of_range If @p axis is outside the tensor rank.
+     */
     [[nodiscard]] std::size_t size(std::size_t axis) const {
         if (axis >= shape_.size()) {
             throw std::out_of_range("Tensor axis out of range");
@@ -158,12 +201,14 @@ public:
         shape_ = std::move(new_shape);
     }
 
+    /** @brief Creates an uninitialized tensor. */
     [[nodiscard]] static Tensor empty(
         std::vector<std::size_t> shape,
         DeviceType device_type = DeviceType::CUDA,
         Dtype dtype = Dtype::F32
         );
 
+    /** @brief Creates a zero-initialized tensor. */
     [[nodiscard]] static Tensor zeros(
         std::vector<std::size_t> shape,
         DeviceType device_type = DeviceType::CUDA,
@@ -171,6 +216,7 @@ public:
         Dtype dtype = Dtype::F32
         );
 
+    /** @brief Creates a one-initialized tensor. */
     [[nodiscard]] static Tensor ones(
         std::vector<std::size_t> shape,
         DeviceType device_type = DeviceType::CUDA,
@@ -178,6 +224,7 @@ public:
         Dtype dtype = Dtype::F32
         );
 
+    /** @brief Creates a tensor initialized to one scalar value. */
     [[nodiscard]] static Tensor full(
         std::vector<std::size_t> shape,
         float value,
@@ -186,6 +233,7 @@ public:
         Dtype dtype = Dtype::F32
         );
 
+    /** @brief Creates a two-dimensional identity matrix. */
     [[nodiscard]] static Tensor eye(
         std::size_t rows,
         std::size_t columns,
@@ -194,7 +242,16 @@ public:
         Dtype dtype = Dtype::F32
         );
 
+    /**
+     * @brief Copies F32 values from host memory into the tensor.
+     * @param source Host values whose size must match `numel()`.
+     */
     void copy_from_host(std::span<const float> source);
+
+    /**
+     * @brief Copies F32 tensor values into host memory.
+     * @param destination Destination span whose size must match `numel()`.
+     */
     void copy_to_host(std::span<float> destination) const;
 
 private:
