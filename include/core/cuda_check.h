@@ -4,7 +4,18 @@
 #include <cstdio>
 #include <cstdlib>
 
-/// Helper function to print an error message and exit the program when a CUDA runtime API call fails.
+/**
+ * @brief Reports a failed CUDA Runtime API call and terminates the process.
+ *
+ * The diagnostic includes the failed expression, CUDA's human-readable error
+ * message, and the source location at which the check was performed.
+ *
+ * @param error CUDA error code returned by the failed call.
+ * @param expression String representation of the checked expression.
+ * @param file Source file containing the check.
+ * @param line Source line containing the check.
+ * @note This function never returns.
+ */
 [[noreturn]] inline void cuda_check_fail(
     cudaError_t error,
     const char* expression,
@@ -26,7 +37,10 @@
     std::exit(EXIT_FAILURE);
 }
 
-/// Macro to check the return value of a CUDA runtime API call.
+/**
+ * @brief Checks a CUDA Runtime API result and terminates on failure.
+ * @param expr CUDA Runtime API expression returning `cudaError_t`.
+ */
 #define CUDA_CHECK(expr)                                              \
     do {                                                              \
         const cudaError_t _cuda_error = (expr);                       \
@@ -35,7 +49,10 @@
         }                                                             \
     } while (false)
 
-/// Macro to check the return value of a cuBLAS API call.
+/**
+ * @brief Checks a cuBLAS API result and terminates on failure.
+ * @param expr cuBLAS API expression returning `cublasStatus_t`.
+ */
 #define CUBLAS_CHECK(expr)                                             \
     do {                                                               \
         const cublasStatus_t _cublas_status = (expr);                  \

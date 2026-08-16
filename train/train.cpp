@@ -11,6 +11,7 @@
 #include "utils/progress_bar.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +19,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -173,7 +175,26 @@ int main(int argc, char** argv) {
         tokenizer.save(args.tokenizer_output);
 
         ProgressBar tokenization_bar(text.size(), "Tokenizing", static_cast<double>(kMiB), "MiB/s");
-        const std::vector<bpe::TokenId> tokens = tokenizer.encode(text);
+        const std::size_t worker_count = std::max<std::size_t>(
+            1, std::thread::hardware_concurrency());
+        const std::size_t chunk_size = std::max<std::size_t>(
+            1, (text.size() + worker_count - 1) / worker_count);
+        std::vector<std::string> chunks;
+        chunks.reserve(worker_count);
+        for (std::size_t begin = 0; begin < text.size();) {
+            std::size_t end = std::min(text.size(), begin + chunk_size);
+            if (end < text.size()) {
+                const std::size_t newline = text.find('\n', end);
+                if (newline != std::string::npos) end = newline + 1;
+            }
+            chunks.emplace_back(text.substr(begin, end - begin));
+            begin = end;
+        }
+        const std::vector<std::vector<bpe::TokenId>> encoded_chunks =
+            tokenizer.encode_batch(chunks, worker_count);
+        std::vector<bpe::TokenId> tokens;
+        for (const auto& chunk : encoded_chunks)
+            tokens.insert(tokens.end(), chunk.begin(), chunk.end());
         tokenization_bar.update(text.size()); tokenization_bar.finish();
         std::cout << "Vocabulary: " << tokenizer.vocab_size() << ", tokens: " << tokens.size() << '\n';
 
@@ -193,6 +214,11 @@ int main(int argc, char** argv) {
         data::DeviceBatch device_batch;
         std::vector<std::pair<Tensor*, Tensor*>> parameters; append_parameters(model, parameters);
         std::vector<AdamWState> optimizer; for (const auto& [parameter, gradient] : parameters) optimizer.push_back(AdamWState::for_parameter(*parameter));
+        std::vector<AdamWBatchEntry> optimizer_entries;
+        optimizer_entries.reserve(parameters.size());
+        for (std::size_t i = 0; i < parameters.size(); ++i)
+            optimizer_entries.push_back({parameters[i].first, parameters[i].second, &optimizer[i]});
+        AdamWWorkspace optimizer_workspace;
         AdamWOptions optimizer_options;
         optimizer_options.learning_rate = args.learning_rate;
         optimizer_options.weight_decay = 0.01F;
@@ -202,20 +228,22 @@ int main(int argc, char** argv) {
         const cudaStream_t cuda_stream = stream.get();
         CudaGraph training_graph;
         ProgressBar progress(total_steps, "Training");
-        data::Batch batch;
+        std::array<data::Batch, 2> host_batches;
+        std::size_t host_batch_index = 0;
+        data::Batch& captured_batch = host_batches[host_batch_index];
         std::size_t step = 0;
 
         // All batches have the configured fixed shape (drop_last=true).  Allocate
         // the device buffers and tune cuBLASLt plans before capture, so graph
         // replay contains only steady-state GPU work.
-        if (!loader.next(batch)) throw std::runtime_error("Not enough tokens for one batch");
-        data::upload_batch(batch, device_batch, cuda_stream);
+        if (!loader.next(captured_batch)) throw std::runtime_error("Not enough tokens for one batch");
+        data::upload_batch(captured_batch, device_batch, cuda_stream);
         const auto* const captured_inputs = static_cast<const bpe::TokenId*>(device_batch.input_ids.data());
         const auto* const captured_targets = static_cast<const bpe::TokenId*>(device_batch.target_ids.data());
         const auto enqueue_model_step = [&] {
             transformer_model_forward(logits, captured_inputs, args.batch_size, args.sequence_length,
                 model.weights(), forward_workspace, cos_cache, sin_cache, cublas, cuda_stream, model.options);
-            cross_entropy_forward_backward(loss, grad_logits, logits, captured_targets, batch.token_count(), cuda_stream);
+            cross_entropy_forward_backward(loss, grad_logits, logits, captured_targets, captured_batch.token_count(), cuda_stream);
             transformer_model_backward(grad_logits, captured_inputs, args.batch_size, args.sequence_length,
                 model.weights(), model.gradients(), forward_workspace, backward_workspace, cos_cache, sin_cache,
                 cublas, cuda_stream, model.options);
@@ -230,22 +258,25 @@ int main(int argc, char** argv) {
                 if (device_batch.input_ids.data() != captured_inputs || device_batch.target_ids.data() != captured_targets)
                     throw std::runtime_error("Training batch storage changed after CUDA graph capture");
                 training_graph.launch(cuda_stream);
-                for (std::size_t i = 0; i < parameters.size(); ++i)
-                    if (!adamw_step(*parameters[i].first, *parameters[i].second, optimizer[i], optimizer_options, cuda_stream))
-                        throw std::runtime_error("Non-finite gradient at step " + std::to_string(step));
+                adamw_step_many_async(optimizer_entries, optimizer_options, optimizer_workspace, cuda_stream);
                 ++step; progress.update(step);
                 if (step % 50 == 0 || step == total_steps) {
-                    CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+                    if (!adamw_check(optimizer_workspace, cuda_stream))
+                        throw std::runtime_error("Non-finite gradient at step " + std::to_string(step));
                     std::vector<float> host_loss(1); loss.copy_to_host(host_loss);
                     std::cout << " loss=" << host_loss[0] << std::flush;
                 }
-                if (step < total_steps && !loader.next(batch)) break;
-                if (step < total_steps) data::upload_batch(batch, device_batch, cuda_stream);
+                if (step < total_steps) {
+                    host_batch_index ^= 1U;
+                    if (!loader.next(host_batches[host_batch_index])) break;
+                    data::upload_batch(host_batches[host_batch_index], device_batch, cuda_stream);
+                }
             } while (step < total_steps);
             if (epoch + 1 < args.epochs && step < total_steps) {
                 loader.reset();
-                if (!loader.next(batch)) break;
-                data::upload_batch(batch, device_batch, cuda_stream);
+                host_batch_index ^= 1U;
+                if (!loader.next(host_batches[host_batch_index])) break;
+                data::upload_batch(host_batches[host_batch_index], device_batch, cuda_stream);
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(cuda_stream));

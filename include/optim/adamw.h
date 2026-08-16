@@ -1,9 +1,12 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/device_buffer.h"
 
 #include <cstdint>
 #include <limits>
+#include <span>
+#include <vector>
 
 /** Settings for decoupled Adam weight decay (AdamW). */
 struct AdamWOptions {
@@ -28,6 +31,49 @@ struct AdamWState {
     [[nodiscard]] static AdamWState for_parameter(
         const Tensor& parameter, cudaStream_t stream = nullptr);
 };
+
+struct AdamWBatchEntry {
+    Tensor* parameter = nullptr;
+    const Tensor* gradient = nullptr;
+    AdamWState* state = nullptr;
+};
+
+/** Reusable device-side reductions for a batched AdamW update. */
+class AdamWWorkspace {
+public:
+    AdamWWorkspace();
+    AdamWWorkspace(const AdamWWorkspace&) = delete;
+    AdamWWorkspace& operator=(const AdamWWorkspace&) = delete;
+    AdamWWorkspace(AdamWWorkspace&&) noexcept = default;
+    AdamWWorkspace& operator=(AdamWWorkspace&&) noexcept = default;
+
+private:
+    friend void adamw_step_many_async(std::span<const AdamWBatchEntry>,
+                                      const AdamWOptions&, AdamWWorkspace&, cudaStream_t);
+    friend bool adamw_check(const AdamWWorkspace&, cudaStream_t);
+    DeviceBuffer non_finite_;
+    DeviceBuffer squared_norm_;
+};
+
+/**
+ * Enqueues one global-norm AdamW update for all entries.  The function
+ * synchronizes the preceding gradient-statistics phase to reject NaN/Inf
+ * gradients before changing host-side step counters; the parameter-update
+ * kernels themselves remain asynchronous.  The caller must keep entries and
+ * tensors alive until stream work completes.
+ *
+ * When the batch contains a NaN or Inf, no update is enqueued and no state
+ * counter is advanced.  Use adamw_check() to retrieve that result.
+ */
+void adamw_step_many_async(
+    std::span<const AdamWBatchEntry> entries,
+    const AdamWOptions& options,
+    AdamWWorkspace& workspace,
+    cudaStream_t stream = nullptr);
+
+/** Synchronizes the stream and reports whether the last batch was finite. */
+[[nodiscard]] bool adamw_check(const AdamWWorkspace& workspace,
+                               cudaStream_t stream = nullptr);
 
 /**
  * Performs one AdamW update in-place and advances @p state.

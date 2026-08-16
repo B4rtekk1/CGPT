@@ -67,6 +67,29 @@ void test_validation() {
     }
 }
 
+void test_batched_non_finite_gradient() {
+    Tensor parameter({2}, DeviceType::CUDA, Dtype::F32);
+    Tensor gradient({2}, DeviceType::CUDA, Dtype::F32);
+    parameter.copy_from_host(std::vector<float>{1.0f, -1.0f});
+    gradient.copy_from_host(std::vector<float>{std::numeric_limits<float>::infinity(), 0.0f});
+    AdamWState state = AdamWState::for_parameter(parameter);
+    AdamWWorkspace workspace;
+    const AdamWBatchEntry entry{&parameter, &gradient, &state};
+
+    gradient.copy_from_host(std::vector<float>{1.0f, 0.0f});
+    AdamWOptions options{.learning_rate = 0.1f, .weight_decay = 0.0f};
+    adamw_step_many_async(std::span<const AdamWBatchEntry>(&entry, 1), options, workspace);
+    if (!adamw_check(workspace)) throw std::runtime_error("AdamW batch skipped a finite gradient");
+    expect_close(parameter, {0.9f, -1.0f});
+    if (state.step != 1) throw std::runtime_error("AdamW batch did not advance step after a finite gradient");
+
+    gradient.copy_from_host(std::vector<float>{std::numeric_limits<float>::infinity(), 0.0f});
+    adamw_step_many_async(std::span<const AdamWBatchEntry>(&entry, 1), {}, workspace);
+    if (adamw_check(workspace)) throw std::runtime_error("AdamW batch accepted an infinite gradient");
+    expect_close(parameter, {0.9f, -1.0f});
+    if (state.step != 1) throw std::runtime_error("AdamW batch advanced step after non-finite gradient");
+}
+
 } // namespace
 
 int main() {
@@ -84,6 +107,7 @@ int main() {
         test_numerical_stability(DeviceType::CUDA, Dtype::F16, 2.0e-3f);
         test_numerical_stability(DeviceType::CUDA, Dtype::BF16, 1.0e-2f);
         test_validation();
+        test_batched_non_finite_gradient();
         std::cout << "AdamW tests passed.\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

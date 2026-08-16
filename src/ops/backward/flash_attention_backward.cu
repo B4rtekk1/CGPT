@@ -575,7 +575,8 @@ namespace {
     // Consequently the latter has no global atomics.
     constexpr int kTcTile = 16;
 
-    __global__ __launch_bounds__(32, 4)
+    // Higher min-blocks-per-SM for better occupancy on laptop Ampere (16 SMs).
+    __global__ __launch_bounds__(32, 6)
     void attention_backward_lse_dq_wmma(
         __half * __restrict__ grad_query, const __half * __restrict__ grad_output,
         const __half * __restrict__ output, const float * __restrict__ lse,
@@ -692,7 +693,7 @@ namespace {
         }
     }
 
-    __global__ __launch_bounds__(32, 4)
+    __global__ __launch_bounds__(32, 6)
     void attention_backward_lse_dkv_wmma(
         __half * __restrict__ grad_key, __half * __restrict__ grad_value, const __half * __restrict__ grad_output,
         const __half * __restrict__ output, const float * __restrict__ lse, const __half * __restrict__ query,

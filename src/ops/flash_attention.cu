@@ -45,17 +45,17 @@ namespace {
 constexpr int kWarpSize = 32;
 
 /// Number of K/V rows processed per iteration by the generic per-head kernel.
-///
-/// Matches kWarpSize so that every lane does useful work during the
-/// per-row online-softmax reduction below (a lane range of kBlockN < 32
-/// left half the warp idle during warp_reduce_max/warp_reduce_sum). This
-/// also halves the number of K/V tile loads and __syncthreads() rounds
-/// compared to kBlockN == 16, mirroring the tiling already used by
-/// kGroupedBlockN in the grouped GQA specialization below.
+/// 32 keeps all lanes busy in the warp reductions and reduces the number of
+/// tile loads vs 16. On low-SM laptop GPUs (RTX 3050 class) this is a good
+/// compromise between arithmetic intensity and occupancy.
 constexpr int kBlockN = 32;
 
 /// Number of K/V rows processed per iteration by the grouped 4:1 GQA kernel.
 constexpr int kGroupedBlockN = 32;
+
+// Prefer smaller query tiles on consumer Ampere (few SMs, limited registers).
+// BlockM=32 gives higher occupancy than 64 while still using full WMMA 16x16.
+constexpr int kPreferredBlockM = 32;
 
 /**
  * @brief Computes a warp-wide sum using shuffle-down instructions.
@@ -1044,27 +1044,28 @@ void launch_tiled_f16_dispatch(
 ) {
     switch (options.head_dim) {
         case 32:
-            launch_tiled_f16<32, 64>(
+            // Smaller BlockM improves occupancy on RTX 3050-class GPUs.
+            launch_tiled_f16<32, 32>(
                 output, logsumexp, query, key, value,
                 batch_size, query_sequence, key_value_sequence,
                 scale, options, stream);
             break;
         case 64:
-            launch_tiled_f16<64, 64>(
+            launch_tiled_f16<64, 32>(
                 output, logsumexp, query, key, value,
                 batch_size, query_sequence, key_value_sequence,
                 scale, options, stream);
             break;
         case 128:
             if (options.num_query_heads / options.num_kv_heads == 4U) {
-                // One CTA owns all four query heads mapped to a KV head.
-                // The 16x128 K/V tiles are loaded once and reused by 4 warps.
+                // Preferred path: one CTA owns the whole GQA group of 4 heads.
+                // K/V loaded once and reused by 4 warps.
                 launch_grouped_f16<128, 4>(
                     output, logsumexp, query, key, value,
                     batch_size, query_sequence, key_value_sequence,
                     scale, options, stream);
             } else {
-                launch_tiled_f16<128, 64>(
+                launch_tiled_f16<128, 32>(
                     output, logsumexp, query, key, value,
                     batch_size, query_sequence, key_value_sequence,
                     scale, options, stream);

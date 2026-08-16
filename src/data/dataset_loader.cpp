@@ -3,11 +3,13 @@
 #include "core/cuda_check.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <utility>
 
 namespace data {
 namespace {
@@ -51,10 +53,64 @@ std::span<const bpe::TokenId> TokenDataset::tokens() const noexcept { return tok
 std::size_t TokenDataset::size() const noexcept { return tokens_.size(); }
 bool TokenDataset::empty() const noexcept { return tokens_.empty(); }
 
+Batch::~Batch() {
+    wait_until_reusable();
+    if (upload_complete_ != nullptr) static_cast<void>(cudaEventDestroy(upload_complete_));
+}
+
+Batch::Batch(const Batch& other) {
+    other.wait_until_reusable();
+    input_ids = other.input_ids;
+    target_ids = other.target_ids;
+    batch_size = other.batch_size;
+    sequence_length = other.sequence_length;
+}
+
+Batch& Batch::operator=(const Batch& other) {
+    if (this != &other) {
+        wait_until_reusable();
+        other.wait_until_reusable();
+        input_ids = other.input_ids;
+        target_ids = other.target_ids;
+        batch_size = other.batch_size;
+        sequence_length = other.sequence_length;
+    }
+    return *this;
+}
+
+Batch::Batch(Batch&& other) noexcept
+    : input_ids(std::move(other.input_ids)), target_ids(std::move(other.target_ids)),
+      batch_size(other.batch_size), sequence_length(other.sequence_length),
+      upload_complete_(std::exchange(other.upload_complete_, nullptr)) {}
+
+Batch& Batch::operator=(Batch&& other) noexcept {
+    if (this != &other) {
+        wait_until_reusable();
+        if (upload_complete_ != nullptr) static_cast<void>(cudaEventDestroy(upload_complete_));
+        input_ids = std::move(other.input_ids);
+        target_ids = std::move(other.target_ids);
+        batch_size = other.batch_size;
+        sequence_length = other.sequence_length;
+        upload_complete_ = std::exchange(other.upload_complete_, nullptr);
+    }
+    return *this;
+}
+
+void Batch::wait_until_reusable() const {
+    if (upload_complete_ != nullptr) CUDA_CHECK(cudaEventSynchronize(upload_complete_));
+}
+
+void Batch::mark_upload_complete(const cudaStream_t stream) const {
+    if (upload_complete_ == nullptr)
+        CUDA_CHECK(cudaEventCreateWithFlags(&upload_complete_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(upload_complete_, stream));
+}
+
 std::size_t Batch::token_count() const noexcept { return batch_size * sequence_length; }
 bool Batch::empty() const noexcept { return token_count() == 0; }
 
 void upload_batch(const Batch& batch, DeviceBatch& destination, const cudaStream_t stream) {
+    batch.wait_until_reusable();
     const std::size_t count = batch.token_count();
     if (batch.input_ids.size() != count || batch.target_ids.size() != count) {
         throw std::invalid_argument("Batch buffers do not match its declared shape");
@@ -68,6 +124,7 @@ void upload_batch(const Batch& batch, DeviceBatch& destination, const cudaStream
         CUDA_CHECK(cudaMemcpyAsync(destination.target_ids.data(), batch.target_ids.data(), bytes,
                                    cudaMemcpyHostToDevice, stream));
     }
+    batch.mark_upload_complete(stream);
     destination.batch_size = batch.batch_size;
     destination.sequence_length = batch.sequence_length;
 }
@@ -83,49 +140,59 @@ DatasetLoader::DatasetLoader(TokenDataset dataset, const DataLoaderConfig &confi
 void DatasetLoader::initialize() {
     if (!dataset_) throw std::invalid_argument("DatasetLoader dataset cannot be null");
     validate_config(config_);
-    const std::size_t samples = dataset_->size() > 0
+    sample_count_ = dataset_->size() > 0
         ? (dataset_->size() - 1) / config_.sequence_length : 0;
-    sample_indices_.resize(samples);
-    std::iota(sample_indices_.begin(), sample_indices_.end(), 0);
-    if (config_.shuffle) shuffle_indices();
+    sequential_ = !config_.shuffle;
+    if (sequential_) {
+        // The common validation/evaluation path does not need an index array:
+        // sample i always starts at i * sequence_length.
+        sample_indices_.clear();
+    } else {
+        sample_indices_.resize(sample_count_);
+        std::iota(sample_indices_.begin(), sample_indices_.end(), 0);
+        shuffle_indices();
+    }
 }
 
 bool DatasetLoader::has_next() const noexcept {
-    return next_sample_ < sample_indices_.size() &&
-        (!config_.drop_last || sample_indices_.size() - next_sample_ >= config_.batch_size);
+    return next_sample_ < sample_count_ &&
+        (!config_.drop_last || sample_count_ - next_sample_ >= config_.batch_size);
 }
 
-std::size_t DatasetLoader::sample_count() const noexcept { return sample_indices_.size(); }
+std::size_t DatasetLoader::sample_count() const noexcept { return sample_count_; }
 std::size_t DatasetLoader::batch_count() const noexcept {
-    return config_.drop_last ? sample_indices_.size() / config_.batch_size
-                             : sample_indices_.size() / config_.batch_size +
-                                   (sample_indices_.size() % config_.batch_size != 0);
+    return config_.drop_last ? sample_count_ / config_.batch_size
+                             : sample_count_ / config_.batch_size +
+                                   (sample_count_ % config_.batch_size != 0);
 }
 std::size_t DatasetLoader::epoch() const noexcept { return epoch_; }
 
 bool DatasetLoader::next(Batch& batch) {
     if (!has_next()) return false;
-    const std::size_t current_batch = std::min(config_.batch_size, sample_indices_.size() - next_sample_);
+    batch.wait_until_reusable();
+    const std::size_t current_batch = std::min(config_.batch_size, sample_count_ - next_sample_);
     const std::size_t token_count = current_batch * config_.sequence_length;
     // Avoid touching the buffers when the steady-state batch shape is unchanged.
     if (batch.input_ids.size() != token_count) batch.input_ids.resize(token_count);
     if (batch.target_ids.size() != token_count) batch.target_ids.resize(token_count);
     const auto tokens = dataset_->tokens();
-    const bool contiguous = std::all_of(sample_indices_.begin() + next_sample_ + 1,
-                                        sample_indices_.begin() + next_sample_ + current_batch,
-                                        [this, item = next_sample_](const std::size_t index) mutable {
-                                            return index == sample_indices_[item++] + 1;
-                                        });
-    if (contiguous) {
-        const std::size_t start = sample_indices_[next_sample_] * config_.sequence_length;
-        std::copy_n(tokens.data() + start, token_count, batch.input_ids.data());
-        std::copy_n(tokens.data() + start + 1, token_count, batch.target_ids.data());
+
+    if (sequential_) {
+        const std::size_t start = next_sample_ * config_.sequence_length;
+        // Both arrays are trivially copyable and non-overlapping.  This is the
+        // hot path for non-shuffled loaders and lets the standard library use
+        // the platform's bulk-copy implementation.
+        std::memcpy(batch.input_ids.data(), tokens.data() + start,
+                    token_count * sizeof(bpe::TokenId));
+        std::memcpy(batch.target_ids.data(), tokens.data() + start + 1,
+                    token_count * sizeof(bpe::TokenId));
     } else {
         for (std::size_t item = 0; item < current_batch; ++item) {
-        const std::size_t start = sample_indices_[next_sample_ + item] * config_.sequence_length;
-        const std::size_t destination = item * config_.sequence_length;
-        std::copy_n(tokens.data() + start, config_.sequence_length, batch.input_ids.data() + destination);
-        std::copy_n(tokens.data() + start + 1, config_.sequence_length, batch.target_ids.data() + destination);
+            const std::size_t start = sample_indices_[next_sample_ + item] * config_.sequence_length;
+            const std::size_t destination = item * config_.sequence_length;
+            const std::size_t bytes = config_.sequence_length * sizeof(bpe::TokenId);
+            std::memcpy(batch.input_ids.data() + destination, tokens.data() + start, bytes);
+            std::memcpy(batch.target_ids.data() + destination, tokens.data() + start + 1, bytes);
         }
     }
     next_sample_ += current_batch;
@@ -143,7 +210,7 @@ std::optional<Batch> DatasetLoader::next() {
 void DatasetLoader::reset() {
     next_sample_ = 0;
     ++epoch_;
-    if (config_.shuffle) shuffle_indices();
+    if (!sequential_) shuffle_indices();
 }
 
 void DatasetLoader::shuffle_indices() {
