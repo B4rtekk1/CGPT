@@ -10,7 +10,10 @@
 
 namespace {
 
-constexpr int kThreads = 256;
+// The benchmark uses a wide GPT vocabulary (50k+ values per row). 512
+// threads gives the reduction and the exp pass twice as many independent
+// memory/math lanes, which is useful here despite the extra reduction warp.
+constexpr int kThreads = 512;
 constexpr int kWarpSize = 32;
 constexpr int kWarps = kThreads / kWarpSize;
 static_assert(kThreads % kWarpSize == 0);

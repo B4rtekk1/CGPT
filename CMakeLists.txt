@@ -50,6 +50,12 @@ add_library(cgpt_core STATIC
         src/core/cuda_graph.cu
         src/ops/flash_attention.cu)
 
+# Cross entropy is dominated by exp/log latency over a very wide vocabulary.
+# Keep the relaxed intrinsics scoped to this numerically-stable kernel; the
+# max-subtracted softmax still bounds exp's input to <= 0.
+set_source_files_properties(src/ops/cross_entropy.cu PROPERTIES
+        COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
+
 target_include_directories(cgpt_core PUBLIC
         ${CGPT_INCLUDE_DIR}
         ${CGPT_INCLUDE_DIR}/core)

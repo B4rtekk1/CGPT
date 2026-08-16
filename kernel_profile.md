@@ -1,25 +1,25 @@
 ﻿# Kernel profile
 
-- Date: 2026-08-16 11:14:24
+- Date: 2026-08-16 12:08:29
 - GPU memory peak reference: 192 GB/s
 - Raw log: `kernel_profile.log`
 
 | Kernel | Average ms | Launches/s | GB/s | % of 192 GB/s |
 |---|---:|---:|---:|---:|
-| RMSNorm kernel | 0,0495 | 20 196,3 | 169,6 | 88,3% |
-| RMSNorm BF16 kernel | 0,0510 | 19 609,8 | 164,7 | 85,8% |
-| RMSNorm backward kernel | 0,1348 | 7 418,8 | 93,5 | 48,7% |
-| RMSNorm BF16 backward kernel | 0,1441 | 6 941,5 | 87,5 | 45,6% |
-| Linear kernel | 1,0746 | 930,5 | 39,0 | 20,3% |
-| SwiGLU kernel | 0,0731 | 13 688,9 | 172,2 | 89,7% |
-| RoPE kernel | 0,0688 | 14 537,4 | 154,3 | 80,4% |
-| RoPE backward kernel | 0,0648 | 15 436,6 | 163,9 | 85,4% |
-| RoPE BF16 kernel | 0,0664 | 15 062,1 | 159,9 | 83,3% |
-| RoPE BF16 backward kernel | 0,0646 | 15 487,8 | 164,4 | 85,6% |
-| Flash attention kernel | 2,8086 | 356,0 | 3,7 | 1,9% |
-| Flash attention LSE forward kernel | 2,8011 | 357,0 | 3,8 | 2,0% |
-| Flash attention backward kernel | 55,0760 | 18,2 | 0,3 | 0,2% |
-| Flash attention LSE backward kernel | 131,8454 | 7,6 | 0,2 | 0,1% |
-| Embedding kernel | 0,0493 | 20 291,8 | 170,2 | 88,7% |
-| Embedding backward kernel | 0,0762 | 13 122,8 | 165,1 | 86,0% |
-| Cross entropy kernel | 3,1798 | 314,5 | 64,7 | 33,7% |
+| RMSNorm kernel | 0,0501 | 19 944,2 | 167,5 | 87,2% |
+| RMSNorm BF16 kernel | 0,0535 | 18 700,3 | 157,0 | 81,8% |
+| RMSNorm backward kernel | 0,1248 | 8 013,6 | 101,0 | 52,6% |
+| RMSNorm BF16 backward kernel | 0,1254 | 7 973,7 | 100,5 | 52,3% |
+| Linear kernel | 1,0567 | 946,3 | 39,7 | 20,7% |
+| SwiGLU kernel | 0,0731 | 13 675,2 | 172,1 | 89,6% |
+| RoPE kernel | 0,0638 | 15 671,8 | 166,4 | 86,7% |
+| RoPE backward kernel | 0,0641 | 15 595,8 | 165,6 | 86,2% |
+| RoPE BF16 kernel | 0,0654 | 15 291,7 | 162,4 | 84,6% |
+| RoPE BF16 backward kernel | 0,0636 | 15 729,0 | 167,0 | 87,0% |
+| Flash attention kernel | 2,7801 | 359,7 | 3,8 | 2,0% |
+| Flash attention LSE forward kernel | 2,8119 | 355,6 | 3,8 | 2,0% |
+| Flash attention backward kernel | 55,0967 | 18,1 | 0,3 | 0,2% |
+| Flash attention LSE backward kernel | 41,2009 | 24,3 | 0,5 | 0,3% |
+| Embedding kernel | 0,0492 | 20 323,6 | 170,5 | 88,8% |
+| Embedding backward kernel | 0,0750 | 13 339,6 | 167,9 | 87,4% |
+| Cross entropy kernel | 3,1807 | 314,4 | 64,7 | 33,7% |

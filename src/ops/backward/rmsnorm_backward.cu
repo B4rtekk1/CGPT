@@ -215,6 +215,66 @@ namespace {
 
     template<typename T>
     __launch_bounds__(256)
+    __global__ void rmsnorm_grad_input_cached_kernel(
+        T * __restrict__ grad_input,
+        const T * __restrict__ grad_output,
+        const T * __restrict__ input,
+        const T * __restrict__ weight,
+        float * __restrict__ inv_rms,
+        const int hidden,
+        const float inverse_hidden,
+        const float epsilon
+    ) {
+        constexpr int kThreads = 256;
+        const int tid = static_cast<int>(threadIdx.x);
+        const std::size_t row_offset = static_cast<std::size_t>(blockIdx.x) * hidden;
+        const T *row_input = input + row_offset;
+        const T *row_grad_output = grad_output + row_offset;
+        T *row_grad_input = grad_input + row_offset;
+
+        float x_values[4];
+        float dy_values[4];
+        float weight_values[4];
+        float sum_squares = 0.0f;
+        float weighted_dot = 0.0f;
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            const int index = tid + item * kThreads;
+            float x = 0.0f;
+            float dy = 0.0f;
+            float scale = 0.0f;
+            if (index < hidden) {
+                x = static_cast<float>(row_input[index]);
+                dy = static_cast<float>(row_grad_output[index]);
+                scale = static_cast<float>(weight[index]);
+                sum_squares = fmaf(x, x, sum_squares);
+                weighted_dot = fmaf(dy * scale, x, weighted_dot);
+            }
+            x_values[item] = x;
+            dy_values[item] = dy;
+            weight_values[item] = scale;
+        }
+
+        const float row_inv_rms = block_reduce_rms(sum_squares, inverse_hidden, epsilon);
+        if (tid == 0) {
+            inv_rms[blockIdx.x] = row_inv_rms;
+        }
+        const float correction = block_reduce_sum(weighted_dot) * inverse_hidden *
+                                 row_inv_rms * row_inv_rms * row_inv_rms;
+
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            const int index = tid + item * kThreads;
+            if (index < hidden) {
+                row_grad_input[index] = static_cast<T>(
+                    fmaf(-x_values[item], correction,
+                         dy_values[item] * weight_values[item] * row_inv_rms));
+            }
+        }
+    }
+
+    template<typename T>
+    __launch_bounds__(256)
     __global__ void rmsnorm_grad_input_kernel(
         T * __restrict__ grad_input,
         const T * __restrict__ grad_output,
@@ -232,9 +292,16 @@ namespace {
         T *row_grad_input = grad_input + row_offset;
 
         float sum_squares = 0.0f;
-        for (int index = column; index < hidden; index += static_cast<int>(blockDim.x)) {
-            const float x = static_cast<float>(row_input[index]);
-            sum_squares = fmaf(x, x, sum_squares);
+        const int stride = static_cast<int>(blockDim.x);
+        for (int index = column; index < hidden; index += stride * 4) {
+#pragma unroll
+            for (int unroll = 0; unroll < 4; ++unroll) {
+                const int current = index + unroll * stride;
+                if (current < hidden) {
+                    const float x = static_cast<float>(row_input[current]);
+                    sum_squares = fmaf(x, x, sum_squares);
+                }
+            }
         }
         __shared__ float shared_inv_rms;
         const float square_sum = block_reduce_sum(sum_squares);
@@ -245,22 +312,35 @@ namespace {
         __syncthreads();
 
         float weighted_dot = 0.0f;
-        for (int index = column; index < hidden; index += static_cast<int>(blockDim.x)) {
-            const auto x = static_cast<float>(row_input[index]);
-            const float dy_weight = static_cast<float>(row_grad_output[index]) *
-                                    static_cast<float>(weight[index]);
-            weighted_dot = fmaf(dy_weight, x, weighted_dot);
+        for (int index = column; index < hidden; index += stride * 4) {
+#pragma unroll
+            for (int unroll = 0; unroll < 4; ++unroll) {
+                const int current = index + unroll * stride;
+                if (current < hidden) {
+                    const float x = static_cast<float>(row_input[current]);
+                    const float dy_weight = static_cast<float>(row_grad_output[current]) *
+                                            static_cast<float>(weight[current]);
+                    weighted_dot = fmaf(dy_weight, x, weighted_dot);
+                }
+            }
         }
 
         const float row_inv_rms = shared_inv_rms;
         const float correction = block_reduce_sum(weighted_dot) * inverse_hidden *
                                  row_inv_rms * row_inv_rms * row_inv_rms;
 
-        for (int index = column; index < hidden; index += static_cast<int>(blockDim.x)) {
-            const auto x = static_cast<float>(row_input[index]);
-            const float dy_weight = static_cast<float>(row_grad_output[index]) *
-                                    static_cast<float>(weight[index]);
-            row_grad_input[index] = static_cast<T>(fmaf(-x, correction, dy_weight * row_inv_rms));
+        for (int index = column; index < hidden; index += stride * 4) {
+#pragma unroll
+            for (int unroll = 0; unroll < 4; ++unroll) {
+                const int current = index + unroll * stride;
+                if (current < hidden) {
+                    const float x = static_cast<float>(row_input[current]);
+                    const float dy_weight = static_cast<float>(row_grad_output[current]) *
+                                            static_cast<float>(weight[current]);
+                    row_grad_input[current] = static_cast<T>(
+                        fmaf(-x, correction, dy_weight * row_inv_rms));
+                }
+            }
         }
     }
 
@@ -359,6 +439,11 @@ namespace {
                     static_cast<const T *>(input.raw_data()),
                     static_cast<const T *>(weight.raw_data()),
                     inv_rms, epsilon);
+            } else if (hidden <= 1024) {
+                rmsnorm_grad_input_cached_kernel<T><<<rows, threads, 0, stream>>>(
+                    static_cast<T *>(grad_input.raw_data()), static_cast<const T *>(grad_output.raw_data()),
+                    static_cast<const T *>(input.raw_data()), static_cast<const T *>(weight.raw_data()),
+                    inv_rms, hidden, inverse_hidden, epsilon);
             } else {
                 rmsnorm_grad_input_kernel<T><<<rows, threads, 0, stream>>>(
                     static_cast<T *>(grad_input.raw_data()),
@@ -367,6 +452,11 @@ namespace {
                     static_cast<const T *>(weight.raw_data()),
                     inv_rms, hidden, inverse_hidden, epsilon);
             }
+        } else if (hidden <= 1024) {
+            rmsnorm_grad_input_cached_kernel<T><<<rows, threads, 0, stream>>>(
+                static_cast<T *>(grad_input.raw_data()), static_cast<const T *>(grad_output.raw_data()),
+                static_cast<const T *>(input.raw_data()), static_cast<const T *>(weight.raw_data()),
+                inv_rms, hidden, inverse_hidden, epsilon);
         } else {
             rmsnorm_grad_input_kernel<T><<<rows, threads, 0, stream>>>(
                 static_cast<T *>(grad_input.raw_data()),

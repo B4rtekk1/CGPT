@@ -75,8 +75,6 @@ public:
 
     DatasetLoader(TokenDataset dataset, const DataLoaderConfig &config);
 
-    explicit DatasetLoader(TokenDataset dataset, DataLoaderConfig config = {});
-
     [[nodiscard]] bool has_next() const noexcept;
     [[nodiscard]] std::size_t sample_count() const noexcept;
     [[nodiscard]] std::size_t batch_count() const noexcept;
