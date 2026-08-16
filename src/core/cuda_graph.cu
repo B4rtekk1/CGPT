@@ -67,6 +67,9 @@ void CudaGraph::capture(
     if (!capture_body) {
         throw std::invalid_argument("CudaGraph::capture: capture callback is empty");
     }
+    if (stream == nullptr) {
+        throw std::invalid_argument("CudaGraph::capture: stream must not be null");
+    }
 
     reset();
 

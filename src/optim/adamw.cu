@@ -72,15 +72,40 @@ namespace {
      * @param squared_norm Squared gradient norm accumulator.
      */
     __global__ void gradient_statistics_kernel(
-        const T* gradient, std::size_t count, float loss_scale, unsigned int* non_finite, float* squared_norm) {
+        const T* __restrict__ gradient, std::size_t count, float loss_scale,
+        unsigned int* __restrict__ non_finite, float* __restrict__ squared_norm) {
+        // Accumulate in shared memory first.  A global atomic for every element
+        // serializes this otherwise bandwidth-bound kernel, especially for
+        // large tensors.  One atomic per block keeps the result in float while
+        // reducing the number of global atomics by roughly blockDim.x.
+        __shared__ float block_sum[256];
+        __shared__ unsigned int block_has_non_finite;
+
+        if (threadIdx.x == 0) block_has_non_finite = 0;
+        __syncthreads();
+
         const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (index >= count) return;
-        const float grad = static_cast<float>(gradient[index]) / loss_scale;
-        if (!isfinite(grad)) {
-            atomicExch(non_finite, 1U);
-            return;
+        float contribution = 0.0f;
+        if (index < count) {
+            const float grad = static_cast<float>(gradient[index]) / loss_scale;
+            if (isfinite(grad)) {
+                contribution = grad * grad;
+            } else {
+                atomicExch(&block_has_non_finite, 1U);
+            }
         }
-        atomicAdd(squared_norm, grad * grad);
+        block_sum[threadIdx.x] = contribution;
+        __syncthreads();
+
+        for (unsigned int stride = blockDim.x / 2; stride != 0; stride >>= 1) {
+            if (threadIdx.x < stride) block_sum[threadIdx.x] += block_sum[threadIdx.x + stride];
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            if (block_has_non_finite) atomicExch(non_finite, 1U);
+            atomicAdd(squared_norm, block_sum[0]);
+        }
     }
 
     template <typename T>

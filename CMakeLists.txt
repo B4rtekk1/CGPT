@@ -30,6 +30,8 @@ add_library(cgpt_core STATIC
         src/data/dataset_loader.cpp
         src/ops/embedding.cu
         src/ops/cross_entropy.cu
+        src/ops/cut_cross_entropy.cu
+        src/ops/softmax.cu
         src/ops/linear.cu
         src/ops/backward/linear_backward.cu
         src/ops/backward/rmsnorm_backward.cu
@@ -53,7 +55,7 @@ add_library(cgpt_core STATIC
 # Cross entropy is dominated by exp/log latency over a very wide vocabulary.
 # Keep the relaxed intrinsics scoped to this numerically-stable kernel; the
 # max-subtracted softmax still bounds exp's input to <= 0.
-set_source_files_properties(src/ops/cross_entropy.cu PROPERTIES
+set_source_files_properties(src/ops/cross_entropy.cu src/ops/softmax.cu PROPERTIES
         COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 
 target_include_directories(cgpt_core PUBLIC
@@ -103,6 +105,8 @@ add_cgpt_test(dtype_test tests/dtype_test.cu cgpt_core)
 add_cgpt_test(flash_attention_test tests/flash_attention_test.cu cgpt_core)
 add_cgpt_test(embedding_test tests/embedding_test.cu cgpt_core)
 add_cgpt_test(cross_entropy_test tests/cross_entropy_test.cu cgpt_core)
+add_cgpt_test(cut_cross_entropy_test tests/cut_cross_entropy_test.cu cgpt_core)
+add_cgpt_test(softmax_test tests/softmax_test.cu cgpt_core)
 add_cgpt_test(cuda_graph_test tests/cuda_graph_test.cu cgpt_core)
 add_cgpt_test(cuda_benchmark_test tests/cuda_benchmark_test.cu cgpt_core)
 add_cgpt_test(kv_cache_test tests/kv_cache_test.cu cgpt_core)
@@ -116,7 +120,7 @@ add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_t
 add_executable(run_all_tests tests/run_all_tests.cpp)
 add_dependencies(run_all_tests
         rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test
-        flash_attention_test embedding_test cross_entropy_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test
+        flash_attention_test embedding_test cross_entropy_test cut_cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test
         dataset_loader_test bpe_tokenizer_test bpe_tokenizer_100mb_test)
 add_custom_target(run_all
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -133,6 +137,8 @@ add_custom_target(run_all
                 flash_attention_test $<TARGET_FILE:flash_attention_test>
                 embedding_test $<TARGET_FILE:embedding_test>
                 cross_entropy_test $<TARGET_FILE:cross_entropy_test>
+                cut_cross_entropy_test $<TARGET_FILE:cut_cross_entropy_test>
+                softmax_test $<TARGET_FILE:softmax_test>
                 cuda_graph_test $<TARGET_FILE:cuda_graph_test>
                 cuda_benchmark_test $<TARGET_FILE:cuda_benchmark_test>
                 kv_cache_test $<TARGET_FILE:kv_cache_test>
@@ -149,12 +155,12 @@ add_custom_target(run_all
         COMMENT "Running all tests and printing the benchmark summary")
 
 set_tests_properties(
-        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test dataset_loader_test bpe_tokenizer_test
+        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test dataset_loader_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
 
 # The cross-entropy benchmark processes a GPT-2-sized vocabulary and needs
 # slightly longer than the standard test timeout on supported GPUs.
-set_tests_properties(cross_entropy_test PROPERTIES TIMEOUT 60)
+set_tests_properties(cross_entropy_test softmax_test PROPERTIES TIMEOUT 60)
 
 set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES
         TIMEOUT 900

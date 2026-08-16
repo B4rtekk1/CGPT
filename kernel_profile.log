@@ -82,167 +82,167 @@ AdamW tests passed.
 
 ========== Test benchmark summary ==========
 Test                          Status    Duration (s)
-rmsnorm_test                  PASS      1.608
-linear_test                   PASS      11.678
-linear_backward_test          PASS      0.550
-swiglu_test                   PASS      0.941
-rope_test                     PASS      1.044
-tensor_test                   PASS      0.213
-device_buffer_test            PASS      0.211
-dtype_test                    PASS      0.220
-flash_attention_test          PASS      8.514
-embedding_test                PASS      0.781
-cross_entropy_test            PASS      3.531
-cuda_graph_test               PASS      0.165
-cuda_benchmark_test           PASS      0.270
-kv_cache_test                 PASS      0.171
-transformer_block_test        PASS      2.592
-transformer_model_test        PASS      0.462
-adamw_test                    PASS      0.199
-Total duration: 33.149 s
+rmsnorm_test                  PASS      1.535
+linear_test                   PASS      11.293
+linear_backward_test          PASS      0.523
+swiglu_test                   PASS      0.927
+rope_test                     PASS      1.055
+tensor_test                   PASS      0.192
+device_buffer_test            PASS      0.161
+dtype_test                    PASS      0.156
+flash_attention_test          PASS      8.485
+embedding_test                PASS      0.789
+cross_entropy_test            PASS      3.394
+cuda_graph_test               PASS      0.171
+cuda_benchmark_test           PASS      0.254
+kv_cache_test                 PASS      0.159
+transformer_block_test        PASS      2.630
+transformer_model_test        PASS      0.424
+adamw_test                    PASS      0.175
+Total duration: 32.324 s
 
 ========== Kernel benchmark summary ==========
 Kernel / benchmark                                                           | Average time (ms)
-RMSNorm kernel                                                               | 0.050140
-RMSNorm BF16 kernel                                                          | 0.053475
-RMSNorm backward kernel                                                      | 0.124788
-RMSNorm BF16 backward kernel                                                 | 0.125413
-CUPTI: fill_kernel                                                           | 0.001344
-CUPTI: rmsnorm_fp16_4096_kernel                                              | 0.048028
-CUPTI: rmsnorm_scalar_cached_kernel                                          | 0.001760
-CUPTI: rmsnorm_scalar_cached_kernel                                          | 0.002144
-CUPTI: rmsnorm_scalar_cached_kernel                                          | 0.001968
-CUPTI: rmsnorm_scalar_cached_kernel                                          | 0.001760
-CUPTI: rmsnorm_bfloat162_cached_kernel                                       | 0.051093
-CUPTI: rmsnorm_vectorized_cached_kernel                                      | 0.001567
+RMSNorm kernel                                                               | 0.049581
+RMSNorm BF16 kernel                                                          | 0.050243
+RMSNorm backward kernel                                                      | 0.124583
+RMSNorm BF16 backward kernel                                                 | 0.128172
+CUPTI: fill_kernel                                                           | 0.001312
+CUPTI: rmsnorm_fp16_4096_kernel                                              | 0.047554
+CUPTI: rmsnorm_scalar_cached_kernel                                          | 0.001824
+CUPTI: rmsnorm_scalar_cached_kernel                                          | 0.002080
+CUPTI: rmsnorm_scalar_cached_kernel                                          | 0.001904
+CUPTI: rmsnorm_scalar_cached_kernel                                          | 0.001824
+CUPTI: rmsnorm_bfloat162_cached_kernel                                       | 0.048346
+CUPTI: rmsnorm_vectorized_cached_kernel                                      | 0.001568
 CUPTI: rmsnorm_vectorized_cached_kernel                                      | 0.002400
-CUPTI: rmsnorm_grad_weight_kernel                                            | 0.052803
-CUPTI: rmsnorm_grad_weight_kernel                                            | 0.052121
+CUPTI: rmsnorm_grad_weight_kernel                                            | 0.053260
+CUPTI: rmsnorm_grad_weight_kernel                                            | 0.052004
 CUPTI: rmsnorm_grad_weight_kernel                                            | 0.001632
-CUPTI: rmsnorm_grad_input_cached_kernel                                      | 0.005024
-CUPTI: rmsnorm_grad_input_cached_kernel                                      | 0.001856
-CUPTI: bit_4096_kernel                                                       | 0.068648
-CUPTI: bit_4096_kernel                                                       | 0.068296
-Linear kernel                                                                | 1.056712
-CUPTI: gemmSN_TN_kernel                                                      | 0.002496
-CUPTI: gemmSN_TN_kernel                                                      | 0.001550
-CUPTI: gemmSN_TN_kernel                                                      | 0.001568
-CUPTI: _ZN7cutlass7Kernel2I65cutlass_75_wmma_tensorop_f16_s161616gemm_f16... | 0.002208
-CUPTI: _ZN7cutlass7Kernel2I67cutlass_75_wmma_tensorop_bf16_s161616gemm_bf... | 0.002272
-CUPTI: splitKreduce_kernel                                                   | 0.001190
-CUPTI: add_bias_kernel                                                       | 0.001087
+CUPTI: rmsnorm_grad_input_cached_kernel                                      | 0.004928
+CUPTI: rmsnorm_grad_input_cached_kernel                                      | 0.001888
+CUPTI: bit_4096_kernel                                                       | 0.070398
+CUPTI: bit_4096_kernel                                                       | 0.068325
+Linear kernel                                                                | 1.043262
+CUPTI: gemmSN_TN_kernel                                                      | 0.002336
+CUPTI: gemmSN_TN_kernel                                                      | 0.001518
+CUPTI: gemmSN_TN_kernel                                                      | 0.001581
+CUPTI: _ZN7cutlass7Kernel2I65cutlass_75_wmma_tensorop_f16_s161616gemm_f16... | 0.002176
+CUPTI: _ZN7cutlass7Kernel2I67cutlass_75_wmma_tensorop_bf16_s161616gemm_bf... | 0.002176
+CUPTI: splitKreduce_kernel                                                   | 0.001175
+CUPTI: add_bias_kernel                                                       | 0.001120
 CUPTI: add_bias_kernel                                                       | 0.001120
 CUPTI: add_bias_kernel                                                       | 0.001035
-CUPTI: fill_kernel                                                           | 0.000800
-CUPTI: ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_stages_32x1_tn            | 1.053880
-CUPTI: ampere_sgemm_32x32_sliced1x4_tn                                       | 0.002948
-CUPTI: gemmSN_NN_kernel                                                      | 0.001953
-CUPTI: _ZN7cutlass7Kernel2I62cutlass_75_wmma_tensorop_s161616gemm_f16_16x... | 0.004544
-CUPTI: _ZN7cutlass7Kernel2I62cutlass_75_wmma_tensorop_s161616gemm_f16_16x... | 0.003840
-CUPTI: splitKreduce_kernel                                                   | 0.001216
-CUPTI: splitKreduce_kernel                                                   | 0.001408
+CUPTI: fill_kernel                                                           | 0.000779
+CUPTI: ampere_fp16_s1688gemm_fp16_128x128_ldg8_f2f_stages_32x1_tn            | 1.040620
+CUPTI: ampere_sgemm_32x32_sliced1x4_tn                                       | 0.002934
+CUPTI: gemmSN_NN_kernel                                                      | 0.001872
+CUPTI: _ZN7cutlass7Kernel2I62cutlass_75_wmma_tensorop_s161616gemm_f16_16x... | 0.004448
+CUPTI: _ZN7cutlass7Kernel2I62cutlass_75_wmma_tensorop_s161616gemm_f16_16x... | 0.003776
+CUPTI: splitKreduce_kernel                                                   | 0.001200
+CUPTI: splitKreduce_kernel                                                   | 0.001440
 CUPTI: reduce_bias_kernel                                                    | 0.001184
-CUPTI: reduce_bias_kernel                                                    | 0.001184
-CUPTI: ampere_sgemm_32x32_sliced1x4_nt                                       | 0.003168
+CUPTI: reduce_bias_kernel                                                    | 0.001168
+CUPTI: ampere_sgemm_32x32_sliced1x4_nt                                       | 0.003120
 SwiGLU kernel                                                                | 0.073125
-CUPTI: swiglu_fused_half2_kernel                                             | 0.071321
+CUPTI: swiglu_fused_half2_kernel                                             | 0.071432
 CUPTI: swiglu_fused_scalar_kernel                                            | 0.001344
-CUPTI: swiglu_fused_scalar_kernel                                            | 0.001376
-CUPTI: swiglu_fused_scalar_kernel                                            | 0.001504
-CUPTI: swiglu_separate_half2_kernel                                          | 0.001568
-CUPTI: swiglu_fused_bfloat162_kernel                                         | 0.001504
+CUPTI: swiglu_fused_scalar_kernel                                            | 0.001344
+CUPTI: swiglu_fused_scalar_kernel                                            | 0.001472
+CUPTI: swiglu_separate_half2_kernel                                          | 0.001536
+CUPTI: swiglu_fused_bfloat162_kernel                                         | 0.001472
 CUPTI: swiglu_separate_scalar_kernel                                         | 0.001344
-CUPTI: swiglu_separate_scalar_kernel                                         | 0.001345
-CUPTI: swiglu_separate_scalar_kernel                                         | 0.001968
+CUPTI: swiglu_separate_scalar_kernel                                         | 0.001312
+CUPTI: swiglu_separate_scalar_kernel                                         | 0.001808
 CUPTI: swiglu_separate_bfloat162_kernel                                      | 0.001536
-RoPE kernel                                                                  | 0.063809
-RoPE backward kernel                                                         | 0.064120
-RoPE BF16 kernel                                                             | 0.065395
-RoPE BF16 backward kernel                                                    | 0.063577
-CUPTI: rope_qk_kernel                                                        | 0.063149
-CUPTI: rope_qk_kernel                                                        | 0.001888
-CUPTI: rope_qk_kernel                                                        | 0.001760
-CUPTI: rope_qk_f16_32_8_128_kernel                                           | 0.061887
-CUPTI: rope_backward_kernel                                                  | 0.061652
+RoPE kernel                                                                  | 0.063913
+RoPE backward kernel                                                         | 0.063868
+RoPE BF16 kernel                                                             | 0.065316
+RoPE BF16 backward kernel                                                    | 0.063838
+CUPTI: rope_qk_kernel                                                        | 0.063204
+CUPTI: rope_qk_kernel                                                        | 0.001728
+CUPTI: rope_qk_kernel                                                        | 0.001713
+CUPTI: rope_qk_f16_32_8_128_kernel                                           | 0.062061
+CUPTI: rope_backward_kernel                                                  | 0.061887
 CUPTI: rope_backward_kernel                                                  | 0.001696
-CUPTI: rope_backward_kernel                                                  | 0.001471
-CUPTI: rope_backward_f16_32_8_128_kernel                                     | 0.062208
-CUPTI: eye_kernel                                                            | 0.001152
-CUPTI: fill_kernel                                                           | 0.001264
-Flash attention kernel                                                       | 2.780135
-Flash attention LSE forward kernel                                           | 2.811867
-Flash attention backward kernel                                              | 55.096722
-Flash attention LSE backward kernel                                          | 41.200893
-CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.014784
-CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.007686
-CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.010273
-CUPTI: flash_gqa_grouped_f16_tensor_core_kernel                              | 2.789960
-CUPTI: attention_backward_kernel                                             | 52.955600
-CUPTI: attention_backward_kernel                                             | 0.008544
-CUPTI: attention_backward_lse_kernel                                         | 39.594400
-CUPTI: attention_backward_lse_kernel                                         | 0.008352
-Embedding kernel                                                             | 0.049204
-Embedding backward kernel                                                    | 0.074965
-CUPTI: embedding_packed_kernel                                               | 0.001536
-CUPTI: embedding_packed_kernel                                               | 0.047385
-CUPTI: embedding_packed_kernel                                               | 0.001920
-CUPTI: embedding_scalar_kernel                                               | 0.001536
-CUPTI: embedding_scalar_kernel                                               | 0.001536
-CUPTI: embedding_scalar_kernel                                               | 0.001680
-CUPTI: embedding_backward_packed_kernel                                      | 0.001696
-CUPTI: embedding_backward_packed_kernel                                      | 0.073081
-Cross entropy kernel                                                         | 3.180695
-CUPTI: cross_entropy_fused_kernel                                            | 3.173490
-cudaMemsetAsync                                                              | 0.009235
-Transformer block                                                            | 0.210416
-CUPTI: _ZN7cutlass7Kernel2I61cutlass_75_wmma_tensorop_s161616gemm_f16_32x... | 0.002152
-CUPTI: _ZN7cutlass7Kernel2I64cutlass_80_tensorop_f16_s16816gemm_relu_f16_... | 0.002644
-CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002829
-CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002324
-CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002683
-CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002030
-CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002219
-CUPTI: splitKreduce_kernel                                                   | 0.001174
-CUPTI: splitKreduce_kernel                                                   | 0.001156
-CUPTI: rope_qk_kernel                                                        | 0.001573
-CUPTI: swiglu_separate_half2_kernel                                          | 0.001388
-CUPTI: rmsnorm_half2_cached_kernel                                           | 0.001431
-CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.007640
-CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.012984
-CUPTI: add_packed_kernel                                                     | 0.000991
-CUPTI: ampere_fp16_sgemm_fp16_32x32_sliced1x4_tn                             | 0.003538
-CUPTI: _ZN7cutlass7Kernel2I61cutlass_75_wmma_tensorop_s161616gemm_f16_32x... | 0.002544
-CUPTI: _ZN7cutlass7Kernel2I64cutlass_80_tensorop_f16_s16816gemm_relu_f16_... | 0.003024
+CUPTI: rope_backward_kernel                                                  | 0.001536
+CUPTI: rope_backward_f16_32_8_128_kernel                                     | 0.062035
+CUPTI: eye_kernel                                                            | 0.001120
+CUPTI: fill_kernel                                                           | 0.001248
+Flash attention kernel                                                       | 2.770921
+Flash attention LSE forward kernel                                           | 2.833772
+Flash attention backward kernel                                              | 54.938438
+Flash attention LSE backward kernel                                          | 41.032845
+CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.014560
+CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.007655
+CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.010048
+CUPTI: flash_gqa_grouped_f16_tensor_core_kernel                              | 2.797060
+CUPTI: attention_backward_kernel                                             | 52.999500
+CUPTI: attention_backward_kernel                                             | 0.008769
+CUPTI: attention_backward_lse_kernel                                         | 39.433800
+CUPTI: attention_backward_lse_kernel                                         | 0.007648
+Embedding kernel                                                             | 0.049212
+Embedding backward kernel                                                    | 0.074963
+CUPTI: embedding_packed_kernel                                               | 0.001472
+CUPTI: embedding_packed_kernel                                               | 0.047369
+CUPTI: embedding_packed_kernel                                               | 0.001792
+CUPTI: embedding_scalar_kernel                                               | 0.001440
+CUPTI: embedding_scalar_kernel                                               | 0.001440
+CUPTI: embedding_scalar_kernel                                               | 0.001584
+CUPTI: embedding_backward_packed_kernel                                      | 0.001633
+CUPTI: embedding_backward_packed_kernel                                      | 0.073032
+Cross entropy kernel                                                         | 3.054472
+CUPTI: cross_entropy_fused_kernel                                            | 3.047500
+cudaMemsetAsync                                                              | 0.008357
+Transformer block                                                            | 0.214500
+CUPTI: _ZN7cutlass7Kernel2I61cutlass_75_wmma_tensorop_s161616gemm_f16_32x... | 0.002150
+CUPTI: _ZN7cutlass7Kernel2I64cutlass_80_tensorop_f16_s16816gemm_relu_f16_... | 0.002642
+CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002147
+CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002492
+CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002648
+CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002015
+CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002240
+CUPTI: splitKreduce_kernel                                                   | 0.001176
+CUPTI: splitKreduce_kernel                                                   | 0.001158
+CUPTI: rope_qk_kernel                                                        | 0.001586
+CUPTI: swiglu_separate_half2_kernel                                          | 0.001395
+CUPTI: rmsnorm_half2_cached_kernel                                           | 0.001441
+CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.007625
+CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.012924
+CUPTI: add_packed_kernel                                                     | 0.000998
+CUPTI: ampere_fp16_sgemm_fp16_32x32_sliced1x4_tn                             | 0.003549
+CUPTI: _ZN7cutlass7Kernel2I61cutlass_75_wmma_tensorop_s161616gemm_f16_32x... | 0.002560
+CUPTI: _ZN7cutlass7Kernel2I64cutlass_80_tensorop_f16_s16816gemm_relu_f16_... | 0.003053
 CUPTI: _ZN7cutlass7Kernel2I65cutlass_75_wmma_tensorop_f16_s161616gemm_f16... | 0.002528
 CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002110
-CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002096
-CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.001989
-CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002096
-CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002515
-CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002567
-CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002272
-CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002278
-CUPTI: splitKreduce_kernel                                                   | 0.001296
+CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002092
+CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002002
+CUPTI: _ZN7cutlass7Kernel2I65cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002090
+CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002514
+CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002563
+CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002323
+CUPTI: _ZN7cutlass7Kernel2I66cutlass_80_wmma_tensorop_f16_s161616gemm_f16... | 0.002287
+CUPTI: splitKreduce_kernel                                                   | 0.001287
 CUPTI: splitKreduce_kernel                                                   | 0.001280
 CUPTI: rope_qk_kernel                                                        | 0.001888
-CUPTI: swiglu_separate_half2_kernel                                          | 0.001184
-CUPTI: rmsnorm_half2_cached_kernel                                           | 0.001559
-CUPTI: embedding_packed_kernel                                               | 0.001680
+CUPTI: swiglu_separate_half2_kernel                                          | 0.001200
+CUPTI: rmsnorm_half2_cached_kernel                                           | 0.001554
+CUPTI: embedding_packed_kernel                                               | 0.001728
 CUPTI: rope_backward_kernel                                                  | 0.001952
-CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.009072
-CUPTI: swiglu_separate_half2_backward_kernel                                 | 0.001248
-CUPTI: reduce_bias_kernel                                                    | 0.001448
-CUPTI: rmsnorm_grad_weight_kernel                                            | 0.001408
-CUPTI: rmsnorm_grad_input_cached_kernel                                      | 0.001760
-CUPTI: add_packed_kernel                                                     | 0.001112
+CUPTI: flash_gqa_f16_tensor_core_kernel                                      | 0.008992
+CUPTI: swiglu_separate_half2_backward_kernel                                 | 0.001280
+CUPTI: reduce_bias_kernel                                                    | 0.001444
+CUPTI: rmsnorm_grad_weight_kernel                                            | 0.001387
+CUPTI: rmsnorm_grad_input_cached_kernel                                      | 0.001771
+CUPTI: add_packed_kernel                                                     | 0.001105
 CUPTI: add_inplace_packed_kernel                                             | 0.001056
-CUPTI: embedding_backward_packed_kernel                                      | 0.001376
-CUPTI: attention_backward_lse_kernel                                         | 0.004544
-CUPTI: ampere_fp16_sgemm_fp16_32x32_sliced1x4_tn                             | 0.003706
-CUPTI: adamw_kernel                                                          | 0.002176
-CUPTI: adamw_kernel                                                          | 0.002155
-CUPTI: adamw_kernel                                                          | 0.002187
-CUPTI: gradient_statistics_kernel                                            | 0.001560
+CUPTI: embedding_backward_packed_kernel                                      | 0.001344
+CUPTI: attention_backward_lse_kernel                                         | 0.004384
+CUPTI: ampere_fp16_sgemm_fp16_32x32_sliced1x4_tn                             | 0.003709
+CUPTI: adamw_kernel                                                          | 0.002133
+CUPTI: adamw_kernel                                                          | 0.002165
+CUPTI: adamw_kernel                                                          | 0.002197
+CUPTI: gradient_statistics_kernel                                            | 0.001536
 CUPTI: gradient_statistics_kernel                                            | 0.001520
-CUPTI: gradient_statistics_kernel                                            | 0.001680
-Mean of kernel averages: 1.463153 ms
+CUPTI: gradient_statistics_kernel                                            | 0.001688
+Mean of kernel averages: 1.458193 ms

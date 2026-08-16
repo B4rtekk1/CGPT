@@ -107,14 +107,26 @@ bool DatasetLoader::next(Batch& batch) {
     if (!has_next()) return false;
     const std::size_t current_batch = std::min(config_.batch_size, sample_indices_.size() - next_sample_);
     const std::size_t token_count = current_batch * config_.sequence_length;
-    batch.input_ids.resize(token_count);
-    batch.target_ids.resize(token_count);
+    // Avoid touching the buffers when the steady-state batch shape is unchanged.
+    if (batch.input_ids.size() != token_count) batch.input_ids.resize(token_count);
+    if (batch.target_ids.size() != token_count) batch.target_ids.resize(token_count);
     const auto tokens = dataset_->tokens();
-    for (std::size_t item = 0; item < current_batch; ++item) {
+    const bool contiguous = std::all_of(sample_indices_.begin() + next_sample_ + 1,
+                                        sample_indices_.begin() + next_sample_ + current_batch,
+                                        [this, item = next_sample_](const std::size_t index) mutable {
+                                            return index == sample_indices_[item++] + 1;
+                                        });
+    if (contiguous) {
+        const std::size_t start = sample_indices_[next_sample_] * config_.sequence_length;
+        std::copy_n(tokens.data() + start, token_count, batch.input_ids.data());
+        std::copy_n(tokens.data() + start + 1, token_count, batch.target_ids.data());
+    } else {
+        for (std::size_t item = 0; item < current_batch; ++item) {
         const std::size_t start = sample_indices_[next_sample_ + item] * config_.sequence_length;
         const std::size_t destination = item * config_.sequence_length;
         std::copy_n(tokens.data() + start, config_.sequence_length, batch.input_ids.data() + destination);
         std::copy_n(tokens.data() + start + 1, config_.sequence_length, batch.target_ids.data() + destination);
+        }
     }
     next_sample_ += current_batch;
     batch.batch_size = current_batch;

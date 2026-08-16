@@ -50,8 +50,12 @@ $lines = $rawOutput | ForEach-Object {
 $trafficMB = @{
     'RMSNorm kernel'                    = 8.3968
     'RMSNorm BF16 kernel'               = 8.3968
-    'RMSNorm backward kernel'           = 12.60
-    'RMSNorm BF16 backward kernel'      = 12.60
+    # Backward launches two kernels.  In addition to grad_input (input +
+    # grad_output reads and grad_input write), grad_weight rereads input and
+    # grad_output across all rows.  Count both passes: 5 * 512 * 4096 * 2 B
+    # plus the small inv_rms/grad_weight transfers = 20.98 MB.
+    'RMSNorm backward kernel'           = 20.98
+    'RMSNorm BF16 backward kernel'      = 20.98
     'Linear kernel'                     = 41.943
     'SwiGLU kernel'                     = 12.583
     'RoPE kernel'                       = 10.617
