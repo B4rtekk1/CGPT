@@ -1,3 +1,15 @@
+/**
+ * @file adamw.cu
+ * @brief AdamW optimizer implementation for CPU and CUDA.
+ *
+ * @details
+ * This file implements AdamW parameter updates for both the CPU and GPU.
+ * Gradients may use the parameter type (F32, F16, or BF16), while master
+ * parameters and optimizer moments are stored in F32 to reduce precision loss
+ * during training. The implementation also supports loss scaling, detection
+ * of non-finite gradient values, and global gradient clipping.
+ */
+
 #include "optim/adamw.h"
 #include "core/cuda_check.h"
 
@@ -10,6 +22,11 @@
 #include <vector>
 
 namespace {
+    /**
+     * @brief Validates AdamW hyperparameters.
+     * @param options Parameter update options.
+     * @throws std::invalid_argument If any option has an invalid value.
+     */
     void validate_options(const AdamWOptions& options) {
         if (!std::isfinite(options.learning_rate) || options.learning_rate < 0.0f ||
         !std::isfinite(options.beta1) || options.beta1 < 0.0f || options.beta1 >= 1.0f ||
@@ -22,6 +39,13 @@ namespace {
         }
     }
 
+    /**
+     * @brief Validates parameters, gradients, and optimizer state buffers.
+     * @param parameter Model parameters being updated.
+     * @param gradient Parameter gradients.
+     * @param state AdamW master-parameter and moment buffers.
+     * @throws std::invalid_argument If tensor types, shapes, or devices differ.
+     */
     void validate_tensors(const Tensor& parameter, const Tensor& gradient, const AdamWState& state) {
         if (!is_floating_point(parameter.dtype()) || gradient.dtype() != parameter.dtype()) {
             throw std::invalid_argument("adamw_step: parameters and gradients must have the same floating dtype");
@@ -38,6 +62,15 @@ namespace {
     }
 
     template <typename T>
+    /**
+     * @brief Computes the squared gradient norm and detects non-finite values.
+     * @tparam T Gradient element type, such as float, __half, or bfloat16.
+     * @param gradient Device gradient buffer.
+     * @param count Number of gradient elements.
+     * @param loss_scale Gradient scaling factor.
+     * @param non_finite Atomically set when the gradient contains NaN or Inf.
+     * @param squared_norm Squared gradient norm accumulator.
+     */
     __global__ void gradient_statistics_kernel(
         const T* gradient, std::size_t count, float loss_scale, unsigned int* non_finite, float* squared_norm) {
         const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -51,6 +84,25 @@ namespace {
     }
 
     template <typename T>
+    /**
+     * @brief Performs the AdamW update on the GPU.
+     * @tparam T Parameter and gradient element type.
+     * @param parameter Model parameters updated in place.
+     * @param gradient Parameter gradients.
+     * @param master_parameter F32 master parameters.
+     * @param first_moment First gradient moment.
+     * @param second_moment Second gradient moment.
+     * @param count Number of parameters.
+     * @param beta1 First-moment decay coefficient.
+     * @param beta2 Second-moment decay coefficient.
+     * @param bias_correction1 First-moment bias correction.
+     * @param bias_correction2 Second-moment bias correction.
+     * @param learning_rate Learning rate.
+     * @param epsilon Denominator stability constant.
+     * @param weight_decay Decoupled weight decay coefficient.
+     * @param loss_scale Gradient unscaling factor.
+     * @param gradient_scale Additional scale resulting from gradient clipping.
+     */
     __global__ void adamw_kernel(
         T* parameter, const T* gradient, float* master_parameter, float* first_moment, float* second_moment, std::size_t count,
         float beta1, float beta2, float bias_correction1, float bias_correction2, float learning_rate, float epsilon, float weight_decay,
@@ -67,6 +119,10 @@ namespace {
         parameter[index] = static_cast<T>(updated);
     }
 
+    /**
+     * @brief Performs an AdamW step on the CPU.
+     * @return false if the gradient contains NaN/Inf; otherwise true.
+     */
     bool adamw_cpu(
     Tensor& parameter, const Tensor& gradient, AdamWState& state, const AdamWOptions& options,
     float bias_correction1, float bias_correction2) {
@@ -102,6 +158,11 @@ namespace {
     }
 
     template <typename T>
+    /**
+     * @brief Performs an AdamW step on a CUDA device.
+     * @tparam T Parameter and gradient element type.
+     * @return false if the gradient is invalid; otherwise true.
+     */
     bool adamw_cuda(Tensor& parameter, const Tensor& gradient, AdamWState& state, const AdamWOptions& options,
                     float bias_correction1, float bias_correction2, cudaStream_t stream) {
         constexpr int threads = 256;
@@ -138,6 +199,17 @@ namespace {
     }
 }
 
+/**
+ * @brief Creates a zero-initialized AdamW state matching the parameters.
+ *
+ * The master parameter is initialized as an F32 copy of the input parameters,
+ * and both moment buffers are zero-initialized.
+ *
+ * @param parameter Parameter tensor for which the state is created.
+ * @param stream CUDA stream used to initialize the buffers.
+ * @return New optimizer state with its step counter set to zero.
+ * @throws std::invalid_argument If the parameters are not floating-point.
+ */
 AdamWState AdamWState::for_parameter(const Tensor& parameter, cudaStream_t stream) {
     if (!is_floating_point(parameter.dtype())) {
         throw std::invalid_argument("AdamWState: parameter must have a floating dtype");
@@ -153,6 +225,24 @@ AdamWState AdamWState::for_parameter(const Tensor& parameter, cudaStream_t strea
         0};
 }
 
+/**
+ * @brief Performs one AdamW optimizer step.
+ *
+ * The implementation is selected automatically based on the parameter device.
+ * Before the update, the gradient is unscaled, validated, and globally
+ * clipped. The state step counter is incremented only after a successful
+ * update.
+ *
+ * @param parameter Model parameters updated in place.
+ * @param gradient Gradient corresponding to the parameters.
+ * @param state AdamW state associated with the parameters.
+ * @param options Optimizer hyperparameters.
+ * @param stream CUDA stream used for GPU operations.
+ * @return true if the parameters were updated; false if the gradient contains
+ *         NaN/Inf.
+ * @throws std::invalid_argument If argument types, shapes, or options are invalid.
+ * @throws std::overflow_error If the step counter reached uint64_t maximum.
+ */
 bool adamw_step(Tensor& parameter, const Tensor& gradient, AdamWState& state,
                 const AdamWOptions& options, cudaStream_t stream) {
     validate_options(options);

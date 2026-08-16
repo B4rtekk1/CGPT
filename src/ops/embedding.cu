@@ -3,16 +3,19 @@
  * @brief CUDA implementation of the token embedding operator.
  *
  * @details
- * This translation unit gathers rows from an embedding matrix using token identifiers stored in device memory.
- * One CUDA blok processes one token and cooperatively copies the corresponding row to the output tensor.
+ * This translation unit gathers rows from an embedding matrix using token
+ * identifiers stored in device memory.  One CUDA block processes one token
+ * and cooperatively copies the corresponding row to the output tensor.
  *
- * The implementation supports FP32, FP16 and BF16 tensors. When pointer alignment and the hidden
- * dimension allow it, the implementation selects a vectorized copy using uint4, half2 or bfloat162 values.
- * Invalid token identifier=ers can optionally be converted to an all-zero embedding row.
+ * The implementation supports FP32, FP16 and BF16 tensors.  When pointer
+ * alignment and the hidden dimension allow it, the implementation selects a
+ * vectorized copy using uint4, half2 or bfloat162 values.  Invalid token
+ * identifiers can optionally be converted to an all-zero embedding row.
  *
- * @note The public declaration are located in `include/ops/embedding.h`.
- * @warning `device_token_ids` must point to CUDA_accessible memory. This file does not copy token identifiers automatically in
- * `embedding_forward`; use embedding_upload_token_ids when needed.
+ * @note The public declarations are expected in `ops/embedding.h`.
+ * @warning `device_token_ids` must point to CUDA-accessible memory.  This
+ *          file does not copy token identifiers automatically in
+ *          `embedding_forward`; use embedding_upload_token_ids when needed.
  */
 
 #include "ops/embedding.h"
@@ -36,6 +39,18 @@ namespace {
         return reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
     }
 
+    /**
+     * @brief Validates arguments shared by all embedding launch paths.
+     * @param output Destination CUDA tensor.
+     * @param token_ids Device pointer containing token identifiers.
+     * @param token_count Number of identifiers and output rows.
+     * @param weight Embedding matrix with shape
+     *        `[vocabulary_size, hidden_size]`.
+     * @param options Kernel launch and bounds-check configuration.
+     * @throws std::invalid_argument If tensor types, shapes, devices or
+     *         options are incompatible.
+     * @throws std::overflow_error If the requested output size overflows.
+     */
     void validate_embedding(
         const Tensor &output,
         const bpe::TokenId *token_ids,
@@ -101,6 +116,13 @@ namespace {
         }
     }
 
+    /**
+     * @brief Copies one embedding row using scalar values.
+     *
+     * @tparam T Element type of the embedding matrix and output tensor.
+     * @tparam BoundsCheck Whether out-of-range token identifiers are replaced
+     *         with a zero row.
+     */
     template<typename T, bool BoundsCheck>
     __global__ void embedding_scalar_kernel(
         T* __restrict__ output,
@@ -129,6 +151,14 @@ namespace {
         }
     }
 
+    /**
+     * @brief Copies one embedding row using vectorized values.
+     *
+     * @tparam PackedT Vector type used for the copy, such as uint4, half2 or
+     *         __nv_bfloat162.
+     * @tparam BoundsCheck Whether out-of-range token identifiers are replaced
+     *         with a zero row.
+     */
     template<typename PackedT, bool BoundsCheck>
     __global__ void embedding_packed_kernel(
         PackedT* __restrict__ output,
@@ -211,6 +241,20 @@ void launch_scalar(
 
 }
 
+/**
+ * @brief Asynchronously uploads token identifiers from host to the device.
+ *
+ * The copy is enqueued on `stream` and therefore follows the normal CUDA
+ * stream synchronization rules.  The source span must remain valid until
+ * the asynchronous operation has completed.
+ *
+ * @param device_destination Device destination buffer for token IDs.
+ * @param token_ids Host-side token IDs to upload.
+ * @param stream CUDA stream receiving the copy operation.
+ * @throws std::invalid_argument If `device_destination` is null while the
+ *         input span is non-empty.
+ * @throws cudaError_t Wrapped by CUDA_CHECK if the asynchronous copy fails.
+ */
 void embedding_upload_token_ids(
     bpe::TokenId* const device_destination,
     const std::span<const bpe::TokenId> token_ids,
@@ -232,6 +276,31 @@ void embedding_upload_token_ids(
         stream));
 }
 
+/**
+ * @brief Computes embeddings for a sequence of token identifiers.
+ *
+ * For every token `token_ids[i]`, this function writes row `weight[token_ids[i]]`
+ * to the corresponding output row.  The output contains exactly
+ * `token_count * hidden_size` elements and may have additional leading
+ * dimensions as long as its last dimension equals `hidden_size`.
+ *
+ * @param output Destination CUDA tensor. Its shape must contain exactly one
+ *        row per token and have hidden size as its last dimension.
+ * @param device_token_ids Device pointer to `token_count` token IDs.
+ * @param token_count Number of token IDs and output rows.
+ * @param weight CUDA embedding matrix of shape
+ *        `[vocabulary_size, hidden_size]`.
+ * @param stream CUDA stream used to launch the embedding kernel.
+ * @param options Embedding kernel configuration. The block size must be a
+ *        multiple of 32 in the range [32, 1024].
+ * @throws std::invalid_argument If arguments, tensor metadata or dtypes are
+ *         invalid.
+ * @throws cudaError_t Wrapped by CUDA_CHECK if kernel launch fails.
+ *
+ * @par Supported data types
+ * FP32, FP16 and BF16.  Vectorized memory access is selected automatically
+ * when alignment and dimension constraints permit it.
+ */
 void embedding_forward(
     Tensor& output,
     const bpe::TokenId* const device_token_ids,

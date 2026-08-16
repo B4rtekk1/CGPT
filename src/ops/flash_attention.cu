@@ -45,7 +45,14 @@ namespace {
 constexpr int kWarpSize = 32;
 
 /// Number of K/V rows processed per iteration by the generic per-head kernel.
-constexpr int kBlockN = 16;
+///
+/// Matches kWarpSize so that every lane does useful work during the
+/// per-row online-softmax reduction below (a lane range of kBlockN < 32
+/// left half the warp idle during warp_reduce_max/warp_reduce_sum). This
+/// also halves the number of K/V tile loads and __syncthreads() rounds
+/// compared to kBlockN == 16, mirroring the tiling already used by
+/// kGroupedBlockN in the grouped GQA specialization below.
+constexpr int kBlockN = 32;
 
 /// Number of K/V rows processed per iteration by the grouped 4:1 GQA kernel.
 constexpr int kGroupedBlockN = 32;
@@ -214,6 +221,9 @@ __device__ __forceinline__ void load_kv_rows_f16(
  * @tparam BlockM Number of query rows owned by a CTA. Supported values: 16, 32,
  *         64; current dispatch uses 64.
  * @param output Contiguous FP16 tensor [B, Q, Hq, D].
+ * @param logsumexp Optional contiguous FP32 tensor [B, Q, Hq] receiving the
+ *        per-row log-sum-exp statistic. Pass nullptr when the statistic is not
+ *        required.
  * @param query Contiguous FP16 tensor [B, Q, Hq, D].
  * @param key Contiguous FP16 tensor [B, K, Hkv, D].
  * @param value Contiguous FP16 tensor [B, K, Hkv, D].
@@ -348,35 +358,41 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
 
         {
             using namespace nvcuda;
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
-                           wmma::row_major> query_fragment;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
-                           wmma::col_major> key_fragment;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float>
-                score_fragment;
-            wmma::fill_fragment(score_fragment, 0.0F);
-
             const __half* warp_query =
                 query_shared + warp_row_begin * HeadDim;
+
             #pragma unroll
-            for (int dimension = 0;
-                 dimension < HeadDim;
-                 dimension += 16) {
-                wmma::load_matrix_sync(
-                    query_fragment, warp_query + dimension, HeadDim);
-                wmma::load_matrix_sync(
-                    key_fragment, key_shared + dimension, HeadDim);
-                wmma::mma_sync(
+            for (int subtile = 0; subtile < kBlockN; subtile += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                               wmma::row_major> query_fragment;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                               wmma::col_major> key_fragment;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+                    score_fragment;
+                wmma::fill_fragment(score_fragment, 0.0F);
+
+                #pragma unroll
+                for (int dimension = 0;
+                     dimension < HeadDim;
+                     dimension += 16) {
+                    wmma::load_matrix_sync(
+                        query_fragment, warp_query + dimension, HeadDim);
+                    wmma::load_matrix_sync(
+                        key_fragment,
+                        key_shared + subtile * HeadDim + dimension,
+                        HeadDim);
+                    wmma::mma_sync(
+                        score_fragment,
+                        query_fragment,
+                        key_fragment,
+                        score_fragment);
+                }
+                wmma::store_matrix_sync(
+                    warp_scores + subtile,
                     score_fragment,
-                    query_fragment,
-                    key_fragment,
-                    score_fragment);
+                    kBlockN,
+                    wmma::mem_row_major);
             }
-            wmma::store_matrix_sync(
-                warp_scores,
-                score_fragment,
-                kBlockN,
-                wmma::mem_row_major);
         }
         __syncwarp();
 
@@ -384,20 +400,17 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
         for (int local_row = 0; local_row < 16; ++local_row) {
             const int row = warp_row_begin + local_row;
             const int query_position = query_begin + row;
+            const int key_position = key_begin + lane;
 
-            float score = -INFINITY;
-            if (lane < kBlockN) {
-                const int key_position = key_begin + lane;
-                const bool valid =
-                    query_position < query_sequence
-                    && key_position < key_value_sequence
-                    && (!causal
-                        || key_position
-                            <= query_position_offset + query_position);
-                if (valid) {
-                    score = warp_scores[local_row * kBlockN + lane] * scale;
-                }
-            }
+            const bool valid =
+                query_position < query_sequence
+                && key_position < key_value_sequence
+                && (!causal
+                    || key_position
+                        <= query_position_offset + query_position);
+            const float score = valid
+                ? warp_scores[local_row * kBlockN + lane] * scale
+                : -INFINITY;
 
             float tile_max = warp_reduce_max(score);
             tile_max = __shfl_sync(0xFFFFFFFFU, tile_max, 0);
@@ -408,17 +421,13 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
                 ? 0.0F
                 : __expf(old_max - new_max);
             const float probability =
-                lane < kBlockN && score != -INFINITY
-                ? __expf(score - new_max)
-                : 0.0F;
+                valid ? __expf(score - new_max) : 0.0F;
 
             float tile_sum = warp_reduce_sum(probability);
             tile_sum = __shfl_sync(0xFFFFFFFFU, tile_sum, 0);
 
-            if (lane < kBlockN) {
-                warp_probabilities[local_row * kBlockN + lane] =
-                    __float2half_rn(probability);
-            }
+            warp_probabilities[local_row * kBlockN + lane] =
+                __float2half_rn(probability);
 
             for (int dimension = lane;
                  dimension < HeadDim;
@@ -441,28 +450,36 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
         // the same 16 query rows, so no inter-warp accumulation is required.
         {
             using namespace nvcuda;
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
-                           wmma::row_major> probability_fragment;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
-                           wmma::row_major> value_fragment;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float>
-                output_fragment;
-
-            wmma::load_matrix_sync(
-                probability_fragment, warp_probabilities, kBlockN);
 
             #pragma unroll
             for (int dimension = 0;
                  dimension < HeadDim;
                  dimension += 16) {
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+                    output_fragment;
                 wmma::fill_fragment(output_fragment, 0.0F);
-                wmma::load_matrix_sync(
-                    value_fragment, value_shared + dimension, HeadDim);
-                wmma::mma_sync(
-                    output_fragment,
-                    probability_fragment,
-                    value_fragment,
-                    output_fragment);
+
+                #pragma unroll
+                for (int subtile = 0; subtile < kBlockN; subtile += 16) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
+                                   wmma::row_major> probability_fragment;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half,
+                                   wmma::row_major> value_fragment;
+                    wmma::load_matrix_sync(
+                        probability_fragment,
+                        warp_probabilities + subtile,
+                        kBlockN);
+                    wmma::load_matrix_sync(
+                        value_fragment,
+                        value_shared + subtile * HeadDim + dimension,
+                        HeadDim);
+                    wmma::mma_sync(
+                        output_fragment,
+                        probability_fragment,
+                        value_fragment,
+                        output_fragment);
+                }
+
                 wmma::store_matrix_sync(
                     warp_mma_tile,
                     output_fragment,
@@ -539,6 +556,9 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
  * @tparam HeadDim Must be 128.
  * @tparam GroupSize Must be 4 query heads per K/V head.
  * @param output Contiguous FP16 tensor [B, Q, Hq, D].
+ * @param logsumexp Optional contiguous FP32 tensor [B, Q, Hq] receiving the
+ *        per-row log-sum-exp statistic. Pass nullptr when the statistic is not
+ *        required.
  * @param query Contiguous FP16 tensor [B, Q, Hq, D].
  * @param key Contiguous FP16 tensor [B, K, Hkv, D].
  * @param value Contiguous FP16 tensor [B, K, Hkv, D].
@@ -913,6 +933,16 @@ void launch_grouped_f16(
  * The returned size includes the query tile, one K/V tile, intermediate scores
  * and probabilities, the FP16 online output accumulator, WMMA scratch space,
  * and softmax statistics.
+ *
+ * @note With kBlockN == 32, HeadDim=128 at the dispatcher's BlockM=64 needs
+ *       ~64.5 KiB (66048 B), which fits Volta's 96 KiB and Ampere/Hopper's
+ *       larger per-block opt-in limits but exceeds Turing's (CC 7.5) 64 KiB
+ *       per-block ceiling. That combination is only reached for GQA ratios
+ *       other than 4:1 (the 4:1 case uses launch_grouped_f16 instead). The
+ *       cudaFuncSetAttribute call below surfaces this as a CUDA_CHECK error
+ *       at launch time rather than corrupting results, but if Turing must be
+ *       supported for non-4:1 GQA with head_dim=128, use a smaller BlockM
+ *       (e.g. 32) for that specialization instead.
  */
 template <int HeadDim, int BlockM>
 constexpr std::size_t tiled_f16_shared_bytes() {
@@ -1243,10 +1273,56 @@ void flash_gqa_attention_forward(
         stream);
 }
 
-// Training entry point.  Besides the normal FP16 output it persists one FP32
-// log-sum-exp value per attention row: LSE = max(score) + log(sum(exp(score-max))).
-// Backward can therefore reconstruct P directly and does not need a separate
-// online-softmax statistics pass.
+/**
+ * @brief Executes the FP16 GQA forward pass and stores row-wise log-sum-exp.
+ *
+ * This training-oriented variant performs the same tiled scaled dot-product
+ * attention as flash_gqa_attention_forward(), while additionally persisting
+ * one FP32 statistic for every attention row:
+ * @f[
+ * LSE = m + \log\left(\sum_j \exp(s_j - m)\right),
+ * \qquad m = \max_j s_j.
+ * @f]
+ *
+ * The saved statistic allows a backward kernel to reconstruct normalized
+ * probabilities without materializing the complete attention matrix or
+ * repeating the online-softmax statistics pass.
+ *
+ * Tensor layouts:
+ * @code
+ * query:     [B, Q, Hq,  D]  FP16
+ * key:       [B, K, Hkv, D]  FP16
+ * value:     [B, K, Hkv, D]  FP16
+ * output:    [B, Q, Hq,  D]  FP16
+ * logsumexp: [B, Q, Hq]      FP32
+ * @endcode
+ *
+ * @param output Preallocated contiguous FP16 output tensor with the same shape
+ *        as @p query. It is written asynchronously on @p stream.
+ * @param logsumexp Preallocated contiguous FP32 tensor [B, Q, Hq] receiving
+ *        one log-sum-exp value per batch, query position, and query head.
+ * @param query Contiguous FP16 query tensor [B, Q, Hq, D].
+ * @param key Contiguous FP16 key tensor [B, K, Hkv, D].
+ * @param value Contiguous FP16 value tensor with exactly the same shape as
+ *        @p key.
+ * @param stream CUDA stream used for the asynchronous kernel launch.
+ * @param options Attention topology, causal-mask configuration, score scale,
+ *        Tensor Core selection, and query-position offset.
+ *
+ * @throws std::invalid_argument If tensor ranks, shapes, dtypes, head topology,
+ *         supported head dimension, Tensor Core mode, or causal bounds are
+ *         invalid.
+ * @throws std::overflow_error If a tensor or launch dimension exceeds the
+ *         optimized kernel's supported integer range or CUDA grid limit.
+ *
+ * @note If options.attention_scale <= 0, the scale defaults to
+ *       1/sqrt(options.head_dim).
+ * @note The function reports launch errors but does not synchronize @p stream.
+ * @note @p output, @p logsumexp, @p query, @p key, and @p value must refer to
+ *       valid device allocations for the entire asynchronous operation.
+ *
+ * @see flash_gqa_attention_forward()
+ */
 void flash_gqa_attention_forward_with_lse(
     Tensor& output, Tensor& logsumexp, const Tensor& query, const Tensor& key,
     const Tensor& value, cudaStream_t stream, const FlashAttentionOptions& options
