@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -22,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -89,7 +91,8 @@ Arguments parse_arguments(int argc, char** argv) {
                          "[--load-dir PATH] "
                          "[--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N] "
                          "[--learning-rate N] [--validation-fraction N] [--validation-interval N] "
-                         "[--validation-batches N] [--prompt TEXT] [--generate-tokens N]\n";
+                         "[--validation-batches N] [--prompt TEXT] [--generate-tokens N]\n"
+                         "Input may be plain text or FineWeb JSONL (the `text` field is used).\n";
             std::exit(EXIT_SUCCESS);
         } else throw std::invalid_argument("Unknown option: " + option);
     }
@@ -101,6 +104,98 @@ Arguments parse_arguments(int argc, char** argv) {
         args.validation_fraction >= 1.0F)
         throw std::invalid_argument("validation-fraction must be between 0 and 1");
     return args;
+}
+
+/**
+ * @brief Decodes the JSON string value belonging to the FineWeb `text` field.
+ *
+ * FineWeb-Edu is distributed as JSONL.  Keeping this small reader local to
+ * the training executable avoids making the binary token dataset loader aware
+ * of document formats while still handling escaped quotes, control characters,
+ * and BMP Unicode escapes emitted by JSON writers.
+ */
+std::string json_text_field(std::string_view line) {
+    const std::size_t key = line.find("\"text\"");
+    if (key == std::string_view::npos) return {};
+    std::size_t cursor = key + 6;
+    while (cursor < line.size() && std::isspace(static_cast<unsigned char>(line[cursor]))) ++cursor;
+    if (cursor >= line.size() || line[cursor++] != ':') return {};
+    while (cursor < line.size() && std::isspace(static_cast<unsigned char>(line[cursor]))) ++cursor;
+    if (cursor >= line.size() || line[cursor++] != '\"') return {};
+
+    std::string result;
+    result.reserve(line.size());
+    while (cursor < line.size()) {
+        const char character = line[cursor++];
+        if (character == '\"') return result;
+        if (character != '\\') {
+            result.push_back(character);
+            continue;
+        }
+        if (cursor >= line.size()) throw std::runtime_error("Invalid JSONL text field: dangling escape");
+        switch (const char escaped = line[cursor++]) {
+            case '\"': result.push_back('\"'); break;
+            case '\\': result.push_back('\\'); break;
+            case '/': result.push_back('/'); break;
+            case 'b': result.push_back('\b'); break;
+            case 'f': result.push_back('\f'); break;
+            case 'n': result.push_back('\n'); break;
+            case 'r': result.push_back('\r'); break;
+            case 't': result.push_back('\t'); break;
+            case 'u': {
+                if (cursor + 4 > line.size()) throw std::runtime_error("Invalid JSONL Unicode escape");
+                unsigned value = 0;
+                for (int digit = 0; digit < 4; ++digit) {
+                    const char hex = line[cursor++];
+                    const int number = std::isdigit(static_cast<unsigned char>(hex)) ? hex - '0' :
+                        (hex >= 'a' && hex <= 'f') ? hex - 'a' + 10 :
+                        (hex >= 'A' && hex <= 'F') ? hex - 'A' + 10 : -1;
+                    if (number < 0) throw std::runtime_error("Invalid JSONL Unicode escape");
+                    value = value * 16U + static_cast<unsigned>(number);
+                }
+                if (value <= 0x7fU) result.push_back(static_cast<char>(value));
+                else if (value <= 0x7ffU) {
+                    result.push_back(static_cast<char>(0xc0U | (value >> 6U)));
+                    result.push_back(static_cast<char>(0x80U | (value & 0x3fU)));
+                } else {
+                    result.push_back(static_cast<char>(0xe0U | (value >> 12U)));
+                    result.push_back(static_cast<char>(0x80U | ((value >> 6U) & 0x3fU)));
+                    result.push_back(static_cast<char>(0x80U | (value & 0x3fU)));
+                }
+                break;
+            }
+            default: throw std::runtime_error("Unsupported JSONL escape in text field");
+        }
+    }
+    throw std::runtime_error("Invalid JSONL text field: unterminated string");
+}
+
+std::string load_training_text(const std::filesystem::path& path) {
+    constexpr std::size_t target_bytes = 100 * kMiB;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("Unable to open input: " + path.string());
+    const bool jsonl = path.extension() == ".jsonl";
+    if (!jsonl) {
+        std::string text(target_bytes, '\0');
+        input.read(text.data(), static_cast<std::streamsize>(text.size()));
+        if (input.gcount() != static_cast<std::streamsize>(target_bytes))
+            throw std::runtime_error("Input must contain at least 100 MiB of text");
+        return text;
+    }
+
+    std::string text;
+    text.reserve(target_bytes);
+    std::string line;
+    while (text.size() < target_bytes && std::getline(input, line)) {
+        const std::string document = json_text_field(line);
+        if (document.empty()) continue;
+        if (!text.empty()) text.push_back('\n');
+        text.append(document);
+    }
+    if (text.size() < target_bytes)
+        throw std::runtime_error("JSONL input must contain at least 100 MiB in its text fields");
+    text.resize(target_bytes);
+    return text;
 }
 
 struct LayerStorage {
@@ -187,9 +282,7 @@ int main(int argc, char** argv) {
     try {
         const Arguments args = parse_arguments(argc, argv);
         if (!std::filesystem::exists(args.input)) throw std::runtime_error("Missing input: " + args.input.string());
-        if (std::filesystem::file_size(args.input) < 100 * kMiB) throw std::runtime_error("Input must contain at least 100 MiB");
-        std::ifstream input(args.input, std::ios::binary);
-        std::string text(100 * kMiB, '\0'); input.read(text.data(), static_cast<std::streamsize>(text.size()));
+        std::string text = load_training_text(args.input);
 
         bpe::BpeTokenizer tokenizer = [&] {
             if (args.load_directory) {
