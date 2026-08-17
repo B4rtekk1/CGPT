@@ -1,6 +1,6 @@
 #include "core/cuda_check.h"
-#include "ops/flash_attention.h"
-#include "ops/backward/flash_attention_backward.h"
+#include "ops/attention.h"
+#include "ops/backward/attention_backward.h"
 #include "cuda_benchmark.h"
 
 #include <algorithm>

@@ -5,14 +5,19 @@
 #include <cstddef>
 
 /**
- * @brief Controls whether linear backward overwrites or accumulate gradients.
+ * @brief Controls whether linear backward overwrites or accumulates gradients.
  */
 struct LinearBackwardOptions {
+    /** @brief Arithmetic mode used by cuBLASLt. */
     ComputeType compute_type = ComputeType::F32;
+    /** @brief Maximum temporary workspace size in bytes. */
     std::size_t workspace_bytes = 32ULL * 1024ULL * 1024ULL;
 
+    /** @brief Adds to the input gradient instead of overwriting it. */
     bool accumulate_input = false;
+    /** @brief Adds to the weight gradient instead of overwriting it. */
     bool accumulate_weight = false;
+    /** @brief Adds to the bias gradient instead of overwriting it. */
     bool accumulate_bias = false;
 };
 
@@ -24,9 +29,9 @@ struct LinearBackwardOptions {
  * @param grad_output Gradient of the output tensor.
  * @param input Input tensor.
  * @param weight Weight tensor.
- * @param cublas_lt_context
- * @param stream CUDA stream
- * @param options LinearBackward options
+ * @param cublas_lt_context cuBLASLt context used by the matrix operations.
+ * @param stream CUDA stream used for the operation.
+ * @param options Linear backward configuration.
  */
 void linear_backward(
     Tensor& grad_input,

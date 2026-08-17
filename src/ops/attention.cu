@@ -26,7 +26,7 @@
  * @note Tensor storage must be contiguous in the documented row-major layout.
  * @note The kernels use WMMA and therefore require a Tensor Core-capable GPU.
  */
-#include "ops/flash_attention.h"
+#include "ops/attention.h"
 
 #include "core/cuda_check.h"
 

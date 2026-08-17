@@ -2,10 +2,11 @@
 
 #include "core/tensor.h"
 
+/** @brief Configuration for rotary positional embeddings. */
 struct RopeOptions {
-    /// Uses the full head dimension when set to zero
+    /** @brief Rotary dimension; zero uses the full head dimension. */
     std::size_t rotary_dim = 0;
-    /// First position represented by query/key sequence index zero.
+    /** @brief First position represented by sequence index zero. */
     std::size_t position_offset = 0;
 };
 
@@ -20,7 +21,14 @@ struct RopeOptions {
  * sin_cache  [max_sequence, rotary_dim / 2]
  * @endcode
  *
- * Supported dtypes: F32, F16 and BF16. All four tensors must use the same dtype
+ * Supported dtypes: F32, F16 and BF16. All four tensors must use the same dtype.
+ *
+ * @param query Query tensor modified in-place.
+ * @param key Key tensor modified in-place.
+ * @param cos_cache Cosine rotary-embedding cache.
+ * @param sin_cache Sine rotary-embedding cache.
+ * @param stream CUDA stream used for the operation.
+ * @param rope_options Rotary-embedding configuration.
  */
 void rope_forward(
     Tensor& query,

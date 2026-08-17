@@ -23,7 +23,7 @@
  *    Q/grad_output global traffic drops from up to 3x (up to 7x in the
  *    grouped path) to exactly 1x.
  */
-#include "ops/flash_attention.h"
+#include "ops/attention.h"
 
 #include "core/cuda_check.h"
 #include "core/device_guard.h"

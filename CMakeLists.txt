@@ -36,7 +36,7 @@ add_library(cgpt_core STATIC
         src/ops/backward/linear_backward.cu
         src/ops/backward/rmsnorm_backward.cu
         src/ops/backward/swiglu_backward.cu
-        src/ops/backward/flash_attention_backward.cu
+        src/ops/backward/attention_backward.cu
         src/ops/backward/embedding_backward.cu
         src/ops/backward/rope_backward.cu
         src/optim/adamw.cu
@@ -50,7 +50,7 @@ add_library(cgpt_core STATIC
         src/core/weight_initialization.cu
         src/core/generation.cu
         src/core/cuda_graph.cu
-        src/ops/flash_attention.cu)
+        src/ops/attention.cu)
 
 # Cross entropy is dominated by exp/log latency over a very wide vocabulary.
 # Keep the relaxed intrinsics scoped to this numerically-stable kernel; the

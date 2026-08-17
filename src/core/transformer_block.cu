@@ -3,7 +3,7 @@
 #include "ops/rmsnorm.h"
 #include "ops/rope.h"
 #include "ops/swiglu.h"
-#include "ops/backward/flash_attention_backward.h"
+#include "ops/backward/attention_backward.h"
 #include "ops/backward/linear_backward.h"
 #include "ops/backward/rmsnorm_backward.h"
 #include "ops/backward/rope_backward.h"
@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-#include "ops/flash_attention.h"
+#include "ops/attention.h"
 
 namespace {
 
