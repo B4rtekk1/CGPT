@@ -5,7 +5,10 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
+#include <functional>
 #include <ranges>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -25,6 +28,7 @@
 #include <numeric>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -41,62 +45,114 @@ namespace bpe {
             return next.fetch_add(1, std::memory_order_relaxed);
         }
 
+        // Encoding is invoked once per data-loader batch.  Keeping these workers alive
+        // avoids repeated thread creation and lets independent tokenizer instances share
+        // the same bounded CPU resource.
+        class EncodingThreadPool {
+        public:
+            EncodingThreadPool() {
+                const std::size_t count = std::max<std::size_t>(
+                    1, std::thread::hardware_concurrency());
+                workers_.reserve(count);
+                for (std::size_t i = 0; i < count; ++i) {
+                    workers_.emplace_back([this] { worker_loop(); });
+                }
+            }
+
+            ~EncodingThreadPool() {
+                {
+                    std::lock_guard lock(mutex_);
+                    stopping_ = true;
+                }
+                work_ready_.notify_all();
+                for (std::thread& worker : workers_) worker.join();
+            }
+
+            EncodingThreadPool(const EncodingThreadPool&) = delete;
+            EncodingThreadPool& operator=(const EncodingThreadPool&) = delete;
+
+            template<typename Function>
+            void run(const std::size_t worker_count, Function&& function) {
+                if (worker_count <= 1) {
+                    function();
+                    return;
+                }
+
+                std::mutex completed_mutex;
+                std::condition_variable completed;
+                std::size_t remaining = worker_count;
+                for (std::size_t i = 0; i < worker_count; ++i) {
+                    submit([&function, &completed_mutex, &completed, &remaining] {
+                        function();
+                        {
+                            std::lock_guard lock(completed_mutex);
+                            --remaining;
+                        }
+                        completed.notify_one();
+                    });
+                }
+                std::unique_lock lock(completed_mutex);
+                completed.wait(lock, [&remaining] { return remaining == 0; });
+            }
+
+        private:
+            void submit(std::function<void()> function) {
+                {
+                    std::lock_guard lock(mutex_);
+                    jobs_.push_back(std::move(function));
+                }
+                work_ready_.notify_one();
+            }
+
+            void worker_loop() {
+                while (true) {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock lock(mutex_);
+                        work_ready_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
+                        if (stopping_ && jobs_.empty()) return;
+                        job = std::move(jobs_.front());
+                        jobs_.pop_front();
+                    }
+                    job();
+                }
+            }
+
+            std::mutex mutex_;
+            std::condition_variable work_ready_;
+            std::deque<std::function<void()>> jobs_;
+            std::vector<std::thread> workers_;
+            bool stopping_ = false;
+        };
+
+        [[nodiscard]] EncodingThreadPool& encoding_thread_pool() {
+            static EncodingThreadPool pool;
+            return pool;
+        }
+
         class CandidateHeap {
         public:
             void reserve(const std::size_t count) {
                 entries_.reserve(count);
-                indices_.reserve(count);
-            }
-
-            void insert(const PairKey pair, const std::uint64_t count) {
-                indices_.emplace(pair, entries_.size());
-                entries_.push_back({.count = count, .pair = pair});
-                sift_up(entries_.size() - 1);
             }
 
             void set(const PairKey pair, const std::uint64_t count) {
-                const auto found = indices_.find(pair);
-                if (found == indices_.end()) {
-                    insert(pair, count);
-                    return;
-                }
-
-                const std::size_t index = found->second;
-                entries_[index].count = count;
-                if (index != 0 && better(entries_[index], entries_[parent(index)])) {
-                    sift_up(index);
-                } else {
-                    sift_down(index);
-                }
-            }
-
-            void erase(const PairKey pair) {
-                const auto found = indices_.find(pair);
-                if (found == indices_.end()) {
-                    return;
-                }
-
-                const std::size_t index = found->second;
-                const std::size_t last = entries_.size() - 1;
-                indices_.erase(found);
-                if (index == last) {
-                    entries_.pop_back();
-                    return;
-                }
-
-                entries_[index] = entries_.back();
-                entries_.pop_back();
-                indices_[entries_[index].pair] = index;
-                if (index != 0 && better(entries_[index], entries_[parent(index)])) {
-                    sift_up(index);
-                } else {
-                    sift_down(index);
-                }
+                entries_.push_back({.count = count, .pair = pair});
+                sift_up(entries_.size() - 1);
             }
 
             [[nodiscard]] bool empty() const noexcept { return entries_.empty(); }
             [[nodiscard]] PairKey top_pair() const noexcept { return entries_.front().pair; }
             [[nodiscard]] std::uint64_t top_count() const noexcept { return entries_.front().count; }
+            void pop() {
+                if (entries_.size() == 1) {
+                    entries_.pop_back();
+                    return;
+                }
+                entries_.front() = entries_.back();
+                entries_.pop_back();
+                sift_down(0);
+            }
 
         private:
             struct Entry {
@@ -113,8 +169,6 @@ namespace bpe {
 
             void swap_entries(const std::size_t left, const std::size_t right) {
                 std::swap(entries_[left], entries_[right]);
-                indices_[entries_[left].pair] = left;
-                indices_[entries_[right].pair] = right;
             }
             void sift_up(std::size_t index) {
                 while (index != 0 && better(entries_[index], entries_[parent(index)])) {
@@ -143,7 +197,6 @@ namespace bpe {
             }
 
             std::vector<Entry> entries_;
-            std::unordered_map<PairKey, std::size_t> indices_;
         };
 
         struct OccurrenceList {
@@ -170,6 +223,85 @@ namespace bpe {
                 }
                 mark_sorted();
             }
+        };
+
+        // One cache-friendly table owns the count, occurrence list and candidate state
+        // for a pair.  The previous representation kept those keys in three separate
+        // node-based hash maps.
+        class PairTable {
+        public:
+            struct Entry {
+                PairKey pair = 0;
+                std::uint64_t count = 0;
+                OccurrenceList occurrences;
+                bool occupied = false;
+            };
+
+            void reserve(const std::size_t expected) {
+                if (expected * 10 >= slots_.size() * 7) rehash(expected * 2 + 1);
+            }
+
+            [[nodiscard]] Entry* find(const PairKey pair) noexcept {
+                if (slots_.empty()) return nullptr;
+                std::size_t index = hash(pair) & (slots_.size() - 1);
+                while (slots_[index].occupied) {
+                    if (slots_[index].pair == pair) return &slots_[index];
+                    index = (index + 1) & (slots_.size() - 1);
+                }
+                return nullptr;
+            }
+
+            Entry& get_or_create(const PairKey pair) {
+                reserve(size_ + 1);
+                std::size_t index = hash(pair) & (slots_.size() - 1);
+                while (slots_[index].occupied && slots_[index].pair != pair) {
+                    index = (index + 1) & (slots_.size() - 1);
+                }
+                if (!slots_[index].occupied) {
+                    slots_[index].pair = pair;
+                    slots_[index].count = 0;
+                    slots_[index].occurrences = {};
+                    slots_[index].occupied = true;
+                    ++size_;
+                }
+                return slots_[index];
+            }
+
+            template<typename Function>
+            void for_each(Function&& function) {
+                for (Entry& entry : slots_) {
+                    if (entry.occupied) function(entry);
+                }
+            }
+
+            [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+        private:
+            [[nodiscard]] static std::size_t hash(PairKey value) noexcept {
+                value ^= value >> 33U;
+                value *= 0xff51afd7ed558ccdULL;
+                value ^= value >> 33U;
+                return static_cast<std::size_t>(value);
+            }
+
+            void rehash(const std::size_t expected) {
+                std::size_t capacity = 8;
+                while (capacity * 7 < expected * 10) capacity <<= 1U;
+                std::vector<Entry> old_slots = std::move(slots_);
+                slots_.clear();
+                slots_.resize(capacity);
+                size_ = 0;
+                for (Entry& entry : old_slots) {
+                    if (!entry.occupied) continue;
+                    std::size_t index = hash(entry.pair) & (slots_.size() - 1);
+                    while (slots_[index].occupied) index = (index + 1) & (slots_.size() - 1);
+                    slots_[index] = std::move(entry);
+                    ++size_;
+                }
+            }
+
+            std::vector<Entry> slots_;
+            std::size_t size_ = 0;
         };
 
         [[nodiscard]] PairKey pair_key(const TokenId left, const TokenId right) noexcept {
@@ -712,7 +844,29 @@ namespace bpe {
                 throw std::invalid_argument("special tokens must not be empty");
             }
         }
+        rebuild_special_matcher();
         rebuild_token_bytes();
+    }
+
+    void BpeTokenizer::rebuild_special_matcher() {
+        special_matcher_.clear();
+        special_matcher_.emplace_back();
+        for (std::size_t token_index = 0; token_index < special_tokens_.size(); ++token_index) {
+            std::size_t node = 0;
+            for (const unsigned char byte : special_tokens_[token_index]) {
+                std::int32_t next = special_matcher_[node].next[byte];
+                if (next < 0) {
+                    next = static_cast<std::int32_t>(special_matcher_.size());
+                    special_matcher_[node].next[byte] = next;
+                    special_matcher_.emplace_back();
+                }
+                node = static_cast<std::size_t>(next);
+            }
+            // Equal special strings retain the lowest configured token ID.
+            if (special_matcher_[node].token_index < 0) {
+                special_matcher_[node].token_index = static_cast<std::int32_t>(token_index);
+            }
+        }
     }
 
     BpeTokenizer BpeTokenizer::train(
@@ -797,7 +951,7 @@ namespace bpe {
         }
 
         const std::size_t workers = worker_count_for(config.worker_count, piece_count);
-        PairCounts global_counts;
+        PairTable pair_stats;
 
         {
             std::vector<PairCounts> initial_counts(workers);
@@ -818,36 +972,34 @@ namespace bpe {
 
             std::size_t unique_hint = 0;
             for (const auto& counts : initial_counts) unique_hint += counts.size();
-            global_counts.reserve(unique_hint / 2 + 1);
+            pair_stats.reserve(unique_hint / 2 + 1);
             for (const PairCounts &counts : initial_counts) {
                 for (const auto &[pair, count] : counts) {
-                    global_counts[pair] += count;
+                    pair_stats.get_or_create(pair).count += count;
                 }
             }
         }
 
-        std::unordered_map<PairKey, OccurrenceList> occurrences;
-        occurrences.reserve(global_counts.size());
-        for (const auto& [pair, count] : global_counts) {
-            auto [entry, inserted] = occurrences.try_emplace(pair);
-            (void)inserted;
-            entry->second.values.reserve(count);
-        }
+        pair_stats.for_each([](PairTable::Entry& entry) {
+            entry.occurrences.values.reserve(entry.count);
+        });
         std::size_t occurrence_entries = 0;
         for (std::size_t piece = 0; piece < piece_count; ++piece) {
             const std::size_t begin = piece_offsets[piece];
             const std::size_t finish = piece_offsets[piece + 1];
             for (std::size_t i = begin + 1; i < finish; ++i) {
                 const PairKey pair = pair_key(corpus[i - 1], corpus[i]);
-                occurrences.find(pair)->second.append(static_cast<Occurrence>(i - 1));
+                pair_stats.find(pair)->occurrences.append(static_cast<Occurrence>(i - 1));
                 ++occurrence_entries;
             }
         }
-        for (auto &list: occurrences | std::views::values) list.mark_sorted();
+        pair_stats.for_each([](PairTable::Entry& entry) { entry.occurrences.mark_sorted(); });
 
         CandidateHeap candidates;
-        candidates.reserve(global_counts.size());
-        for (const auto &[pair, count] : global_counts) candidates.insert(pair, count);
+        candidates.reserve(pair_stats.size());
+        pair_stats.for_each([&candidates](PairTable::Entry& entry) {
+            candidates.set(entry.pair, entry.count);
+        });
 
         struct MergeUpdates {
             std::vector<std::pair<PairKey, std::int64_t>> count_deltas;
@@ -855,14 +1007,16 @@ namespace bpe {
             std::size_t merged_edges = 0;
         };
         std::vector<MergeUpdates> updates(workers);
+        std::unordered_map<PairKey, std::int64_t> total_deltas;
 
         while (tokenizer.vocab_size() < config.vocab_size) {
-            PairKey best_pair = 0;
-            std::uint64_t best_count = 0;
-            if (!candidates.empty()) {
-                best_pair = candidates.top_pair();
-                best_count = candidates.top_count();
+            while (!candidates.empty()) {
+                const PairTable::Entry* entry = pair_stats.find(candidates.top_pair());
+                if (entry != nullptr && entry->count == candidates.top_count()) break;
+                candidates.pop();
             }
+            PairKey best_pair = candidates.empty() ? 0 : candidates.top_pair();
+            std::uint64_t best_count = candidates.empty() ? 0 : candidates.top_count();
             if (best_count < config.min_pair_frequency) break;
 
             const TokenId left = pair_left(best_pair);
@@ -870,9 +1024,8 @@ namespace bpe {
             const auto merged = static_cast<TokenId>(tokenizer.vocab_size());
             tokenizer.add_merge(left, right);
 
-            if (auto found = occurrences.find(best_pair); found != occurrences.end()) {
-                OccurrenceList positions = std::move(found->second);
-                occurrences.erase(found);
+            if (PairTable::Entry* best_entry = pair_stats.find(best_pair); best_entry != nullptr) {
+                OccurrenceList positions = std::move(best_entry->occurrences);
                 occurrence_entries -= positions.values.size();
                 positions.sort();
 
@@ -954,7 +1107,7 @@ namespace bpe {
                         }
                     });
 
-                std::unordered_map<PairKey, std::int64_t> total_deltas;
+                total_deltas.clear();
                 for (std::size_t w = 0; w < merge_workers; ++w) {
                     MergeUpdates& local = updates[w];
                     active_edges -= local.merged_edges;
@@ -976,24 +1129,22 @@ namespace bpe {
 
                 for (const auto& [pair, delta] : total_deltas) {
                     if (delta == 0) continue;
-                    auto count_it = global_counts.find(pair);
-                    const std::int64_t previous = count_it == global_counts.end()
-                        ? 0 : static_cast<std::int64_t>(count_it->second);
+                    PairTable::Entry& entry = pair_stats.get_or_create(pair);
+                    const std::int64_t previous = static_cast<std::int64_t>(entry.count);
                     const std::int64_t updated = previous + delta;
                     if (updated <= 0) {
-                        if (count_it != global_counts.end()) global_counts.erase(count_it);
-                        candidates.erase(pair);
+                        entry.count = 0;
+                        entry.occurrences = {};
                     } else {
                         const auto count = static_cast<std::uint64_t>(updated);
-                        if (count_it == global_counts.end()) global_counts.emplace(pair, count);
-                        else count_it->second = count;
+                        entry.count = count;
                         candidates.set(pair, count);
                     }
                 }
 
                 for (std::size_t w = 0; w < merge_workers; ++w) {
                     for (const auto& [pair, occurrence] : updates[w].new_occurrences) {
-                        occurrences[pair].append(occurrence);
+                        pair_stats.get_or_create(pair).occurrences.append(occurrence);
                         ++occurrence_entries;
                     }
                 }
@@ -1022,22 +1173,21 @@ namespace bpe {
                             }
                         });
 
-                    occurrences.clear();
-                    occurrences.reserve(global_counts.size());
+                    pair_stats.for_each([](PairTable::Entry& entry) { entry.occurrences = {}; });
                     occurrence_entries = 0;
                     for (auto& local : local_occurrences) {
                         for (auto& [pair, values] : local) {
-                            OccurrenceList& list = occurrences[pair];
+                            OccurrenceList& list = pair_stats.get_or_create(pair).occurrences;
                             occurrence_entries += values.size();
                             list.values.insert(list.values.end(),
                                 std::make_move_iterator(values.begin()),
                                 std::make_move_iterator(values.end()));
                         }
                     }
-                    for (auto &list: occurrences | std::views::values) {
-                        std::ranges::sort(list.values);
-                        list.mark_sorted();
-                    }
+                    pair_stats.for_each([](PairTable::Entry& entry) {
+                        std::ranges::sort(entry.occurrences.values);
+                        entry.occurrences.mark_sorted();
+                    });
                 }
             }
 
@@ -1270,41 +1420,40 @@ namespace bpe {
         std::vector<TokenId> result;
         result.reserve(text.size());
 
+        std::size_t encoded_begin = 0;
         std::size_t cursor = 0;
         while (cursor < text.size()) {
-            std::size_t best_start = std::string_view::npos;
-            std::size_t best_length = 0;
-            std::size_t best_index = 0;
+            std::int32_t node = special_matcher_[0].next[
+                static_cast<unsigned char>(text[cursor])];
+            if (node < 0) {
+                ++cursor;
+                continue;
+            }
 
-            for (std::size_t token_index = 0;
-                 token_index < special_tokens_.size(); ++token_index) {
-                const std::string& token = special_tokens_[token_index];
-                const std::size_t found = text.find(token, cursor);
-                if (found < best_start ||
-                    (found == best_start && token.size() > best_length) ||
-                    (found == best_start && token.size() == best_length &&
-                     token_index < best_index)) {
-                    best_start = found;
-                    best_length = token.size();
-                    best_index = token_index;
+            std::size_t scan = cursor + 1;
+            std::int32_t best_index = special_matcher_[node].token_index;
+            std::size_t best_end = scan;
+            while (node >= 0 && scan < text.size()) {
+                node = special_matcher_[static_cast<std::size_t>(node)].next[
+                    static_cast<unsigned char>(text[scan])];
+                ++scan;
+                if (node >= 0 && special_matcher_[static_cast<std::size_t>(node)].token_index >= 0) {
+                    best_index = special_matcher_[static_cast<std::size_t>(node)].token_index;
+                    best_end = scan;
                 }
             }
-
-            if (best_start == std::string_view::npos) {
-                append_encoded_bytes(
-                    text.substr(cursor), result, options, dense_limit_bits);
-                break;
+            if (best_index < 0) {
+                ++cursor;
+                continue;
             }
 
-            append_encoded_bytes(
-                text.substr(cursor, best_start - cursor),
-                result,
-                options,
-                dense_limit_bits);
-            result.push_back(
-                kByteVocabularySize + static_cast<TokenId>(best_index));
-            cursor = best_start + best_length;
+            append_encoded_bytes(text.substr(encoded_begin, cursor - encoded_begin),
+                                 result, options, dense_limit_bits);
+            result.push_back(kByteVocabularySize + static_cast<TokenId>(best_index));
+            cursor = best_end;
+            encoded_begin = cursor;
         }
+        append_encoded_bytes(text.substr(encoded_begin), result, options, dense_limit_bits);
 
         return result;
     }
@@ -1375,10 +1524,7 @@ namespace bpe {
             return result;
         }
 
-        std::vector<std::thread> threads;
-        threads.reserve(workers);
-        for (std::size_t i = 0; i < workers; ++i) threads.emplace_back(worker);
-        for (auto& thread : threads) thread.join();
+        encoding_thread_pool().run(workers, worker);
         return result;
     }
 
@@ -1410,10 +1556,7 @@ namespace bpe {
         if (workers == 1) {
             gather();
         } else {
-            std::vector<std::thread> threads;
-            threads.reserve(workers);
-            for (std::size_t i = 0; i < workers; ++i) threads.emplace_back(gather);
-            for (auto& thread : threads) thread.join();
+            encoding_thread_pool().run(workers, gather);
         }
         return flat;
     }

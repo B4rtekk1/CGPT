@@ -5,6 +5,18 @@
 #include <iostream>
 #include <utility>
 
+/**
+ * @file 1775283d-b192-4176-a5e6-8ee7a6dbef26.cpp
+ * @brief Implementation of the terminal progress bar.
+ */
+
+/**
+ * @brief Initializes a progress bar and starts its timer.
+ * @param total Total number of work units.
+ * @param label Text displayed before the progress information.
+ * @param speed_divisor Divisor applied to the calculated throughput.
+ * @param speed_unit Unit displayed after the throughput value.
+ */
 ProgressBar::ProgressBar(const std::size_t total, std::string label, const double speed_divisor,
                          std::string speed_unit)
     : total_(total),
@@ -14,6 +26,14 @@ ProgressBar::ProgressBar(const std::size_t total, std::string label, const doubl
       start_(std::chrono::steady_clock::now()),
       last_draw_(start_) {}
 
+/**
+ * @brief Updates the current progress and redraws when needed.
+ *
+ * Progress is clamped to the configured total. Redrawing is throttled to at
+ * most once every 100 milliseconds unless the operation has completed.
+ *
+ * @param current Number of completed work units.
+ */
 void ProgressBar::update(const std::size_t current) {
     current_ = std::min(current, total_);
 
@@ -24,10 +44,17 @@ void ProgressBar::update(const std::size_t current) {
     }
 }
 
+/**
+ * @brief Advances the progress by a specified number of work units.
+ * @param amount Number of completed work units to add.
+ */
 void ProgressBar::increment(const std::size_t amount) {
     update(current_ + amount);
 }
 
+/**
+ * @brief Completes the progress bar and prints the total elapsed time.
+ */
 void ProgressBar::finish() {
     const auto now = std::chrono::steady_clock::now();
     current_ = total_;
@@ -38,6 +65,10 @@ void ProgressBar::finish() {
               << elapsed << " s\n";
 }
 
+/**
+ * @brief Renders the current progress, throughput, and estimated time remaining.
+ * @param now Timestamp used for elapsed-time and speed calculations.
+ */
 void ProgressBar::draw(const std::chrono::steady_clock::time_point now) const {
     constexpr int width = 40;
     const double progress = total_ == 0

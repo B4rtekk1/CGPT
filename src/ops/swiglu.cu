@@ -1,9 +1,10 @@
 /**
- * @file swiglu.cu
+ * @file swiglu(4).cu
  * @brief CUDA implementation of the SwiGLU activation.
  *
  * Both separated-input (`gate`, `up`) and fused-input (`gate_up`) layouts are supported.
- * FP16 and BF16 use packed two-element vector paths whenever the last dimension permits vector access.
+ * FP16 and BF16 use packed two-element vector paths whenever the last
+ * dimension permits vector access.
  */
 
 #include "ops/swiglu.h"

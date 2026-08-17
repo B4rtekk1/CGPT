@@ -1,3 +1,11 @@
+/**
+ * @file softmax.cu
+ * @brief CUDA implementation of numerically stable row-wise softmax.
+ *
+ * The implementation performs row-wise maximum and sum reductions in FP32,
+ * stores centered exponentials once, and reuses them for final normalization.
+ */
+
 #include "ops/softmax.h"
 
 #include "core/cuda_check.h"
@@ -15,11 +23,14 @@ constexpr int kWarpSize = 32;
 constexpr int kWarps = kThreads / kWarpSize;
 
 template <typename T>
+/** @brief Converts a supported CUDA scalar value to FP32. */
 __device__ __forceinline__ float to_float(const T value) { return static_cast<float>(value); }
 
 template <typename T>
+/** @brief Converts an FP32 value to a supported CUDA scalar type. */
 __device__ __forceinline__ T from_float(const float value) { return static_cast<T>(value); }
 
+/** @brief Reduces values to a block-wide maximum using warp shuffles. */
 __device__ __forceinline__ float reduce_max(float value, float* const scratch) {
     const int lane = threadIdx.x & (kWarpSize - 1);
     const int warp = threadIdx.x / kWarpSize;
@@ -39,6 +50,7 @@ __device__ __forceinline__ float reduce_max(float value, float* const scratch) {
     return scratch[0];
 }
 
+/** @brief Reduces values to a block-wide sum using warp shuffles. */
 __device__ __forceinline__ float reduce_sum(float value, float* const scratch) {
     const int lane = threadIdx.x & (kWarpSize - 1);
     const int warp = threadIdx.x / kWarpSize;
@@ -59,6 +71,7 @@ __device__ __forceinline__ float reduce_sum(float value, float* const scratch) {
 }
 
 template <typename T>
+/** @brief Computes one row-wise softmax using FP32 reductions. */
 __global__ __launch_bounds__(kThreads)
 void softmax_fused_kernel(T* const __restrict__ output, const T* const __restrict__ input,
                           const std::size_t rows, const std::size_t columns) {
@@ -111,6 +124,7 @@ void softmax_fused_kernel(T* const __restrict__ output, const T* const __restric
         row_output[column] = from_float<T>(to_float(row_output[column]) * inverse_sum);
 }
 
+/** @brief Validates the shape, device, and dtype contract for softmax. */
 void validate(const Tensor& output, const Tensor& input) {
     if (input.device_type() != DeviceType::CUDA || input.dim() != 2 ||
         !is_floating_point(input.dtype()) || input.size(0) == 0 || input.size(1) == 0 ||
@@ -120,6 +134,7 @@ void validate(const Tensor& output, const Tensor& input) {
 }
 
 template <typename T>
+/** @brief Launches the fused softmax kernel for a concrete element type. */
 void launch(Tensor& output, const Tensor& input, const cudaStream_t stream) {
     softmax_fused_kernel<T><<<static_cast<unsigned>(input.size(0)), kThreads, 0, stream>>>(
         static_cast<T*>(output.raw_data()), static_cast<const T*>(input.raw_data()), input.size(0), input.size(1));
@@ -127,6 +142,12 @@ void launch(Tensor& output, const Tensor& input, const cudaStream_t stream) {
 
 } // namespace
 
+/**
+ * @brief Dispatches the CUDA softmax implementation for the input dtype.
+ * @param output Destination tensor.
+ * @param input Source logits tensor.
+ * @param stream CUDA stream used for the operation.
+ */
 void softmax_forward(Tensor& output, const Tensor& input, const cudaStream_t stream) {
     validate(output, input);
     switch (input.dtype()) {

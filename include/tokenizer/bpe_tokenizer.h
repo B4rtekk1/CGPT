@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
@@ -174,6 +175,7 @@ namespace bpe {
         void add_merge(TokenId left, TokenId right);
         void rebuild_fast_merge_lookup();
         void rebuild_token_bytes();
+        void rebuild_special_matcher();
         [[nodiscard]] std::vector<TokenId> encode_with_dense_limit(
             std::string_view text,
             const EncodeOptions& options,
@@ -205,6 +207,13 @@ namespace bpe {
 
         PretokenizerMode pretokenizer_mode_ = PretokenizerMode::GptLike;
         std::vector<std::string> special_tokens_;
+        struct SpecialMatcherNode {
+            std::array<std::int32_t, 256> next{};
+            std::int32_t token_index = -1;
+
+            SpecialMatcherNode() { next.fill(-1); }
+        };
+        std::vector<SpecialMatcherNode> special_matcher_;
         std::vector<MergeRule> merges_;
         std::vector<std::vector<std::uint8_t>> token_bytes_;
         std::unordered_map<std::uint64_t, TokenId> merge_lookup_;
