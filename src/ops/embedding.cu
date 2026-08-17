@@ -20,6 +20,7 @@
 
 #include "ops/embedding.h"
 #include "core/cuda_check.h"
+#include "core/cuda_autotune.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -64,7 +65,7 @@ namespace {
         if (token_count == 0) {
             throw std::invalid_argument("embedding_forward: token_count must be positive");
         }
-        if (!valid_block_size(options.block_size)) {
+        if (options.block_size != 0 && !valid_block_size(options.block_size)) {
             throw std::invalid_argument(
                 "embedding_forward: block_size must be a multiple of 32 in [32, 1024]");
         }
@@ -291,8 +292,9 @@ void embedding_upload_token_ids(
  * @param weight CUDA embedding matrix of shape
  *        `[vocabulary_size, hidden_size]`.
  * @param stream CUDA stream used to launch the embedding kernel.
- * @param options Embedding kernel configuration. The block size must be a
- *        multiple of 32 in the range [32, 1024].
+ * @param options Embedding kernel configuration. A zero block size selects a
+ *        device- and shape-aware value; explicit values must be a multiple of
+ *        32 in the range [32, 1024].
  * @throws std::invalid_argument If arguments, tensor metadata or dtypes are
  *         invalid.
  * @throws cudaError_t Wrapped by CUDA_CHECK if kernel launch fails.
@@ -311,6 +313,12 @@ void embedding_forward(
 ) {
     validate_embedding(output, device_token_ids, token_count, weight, options);
 
+    EmbeddingOptions launch_options = options;
+    if (launch_options.block_size == 0) {
+        launch_options.block_size = cuda_autotune::embedding_block_size(
+            token_count, weight.size(1));
+    }
+
     const int hidden_size = static_cast<int>(weight.size(1));
     const std::size_t row_bytes = weight.nbytes() / weight.size(0);
     const bool can_pack_128 = row_bytes % sizeof(uint4) == 0 &&
@@ -323,22 +331,22 @@ void embedding_forward(
     if (can_pack_128) {
         launch_packed<uint4>(
             output, device_token_ids, weight, token_count,
-            static_cast<int>(row_bytes / sizeof(uint4)), stream, options);
+            static_cast<int>(row_bytes / sizeof(uint4)), stream, launch_options);
     } else if (weight.dtype() == Dtype::F32) {
         launch_scalar<float>(
-            output, device_token_ids, weight, token_count, hidden_size, stream, options);
+            output, device_token_ids, weight, token_count, hidden_size, stream, launch_options);
     } else if (weight.dtype() == Dtype::F16 && can_pack) {
         launch_packed<__half2>(
-            output, device_token_ids, weight, token_count, hidden_size / 2, stream, options);
+            output, device_token_ids, weight, token_count, hidden_size / 2, stream, launch_options);
     } else if (weight.dtype() == Dtype::BF16 && can_pack) {
         launch_packed<__nv_bfloat162>(
-            output, device_token_ids, weight, token_count, hidden_size / 2, stream, options);
+            output, device_token_ids, weight, token_count, hidden_size / 2, stream, launch_options);
     } else if (weight.dtype() == Dtype::F16) {
         launch_scalar<__half>(
-            output, device_token_ids, weight, token_count, hidden_size, stream, options);
+            output, device_token_ids, weight, token_count, hidden_size, stream, launch_options);
     } else if (weight.dtype() == Dtype::BF16) {
         launch_scalar<__nv_bfloat16>(
-            output, device_token_ids, weight, token_count, hidden_size, stream, options);
+            output, device_token_ids, weight, token_count, hidden_size, stream, launch_options);
     } else {
         throw std::invalid_argument("embedding_forward: unsupported dtype");
     }

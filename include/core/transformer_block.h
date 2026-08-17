@@ -40,6 +40,10 @@ struct TransformerBlockWeights {
     const Tensor& q_projection;
     /** @brief Key projection weights. */
     const Tensor& k_projection;
+    /** @brief Query RMSNorm scale applied before RoPE. */
+    const Tensor& q_norm;
+    /** @brief Key RMSNorm scale applied before RoPE. */
+    const Tensor& k_norm;
     /** @brief Value projection weights. */
     const Tensor& v_projection;
     /** @brief Attention output projection weights. */
@@ -68,6 +72,9 @@ struct TransformerBlockWorkspace {
     Tensor key;
     /** @brief Value activations. */
     Tensor value;
+    /** @brief Q/K values before QK-Norm, saved for backward. */
+    Tensor query_pre_norm;
+    Tensor key_pre_norm;
     /** @brief Output produced by the attention operation. */
     Tensor attention_output;
     /** @brief FP32 softmax log-sum-exp values saved for the backward pass. */
@@ -95,6 +102,10 @@ struct TransformerBlockGradients {
     Tensor& q_projection;
     /** @brief Gradient of the key projection weights. */
     Tensor& k_projection;
+    /** @brief Gradient of the query RMSNorm scale. */
+    Tensor& q_norm;
+    /** @brief Gradient of the key RMSNorm scale. */
+    Tensor& k_norm;
     /** @brief Gradient of the value projection weights. */
     Tensor& v_projection;
     /** @brief Gradient of the attention output projection weights. */

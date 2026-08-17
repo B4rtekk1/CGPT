@@ -52,6 +52,13 @@ void ProgressBar::increment(const std::size_t amount) {
     update(current_ + amount);
 }
 
+void ProgressBar::set_suffix(std::string suffix) {
+    suffix_ = std::move(suffix);
+    const auto now = std::chrono::steady_clock::now();
+    draw(now);
+    last_draw_ = now;
+}
+
 /**
  * @brief Completes the progress bar and prints the total elapsed time.
  */
@@ -83,17 +90,19 @@ void ProgressBar::draw(const std::chrono::steady_clock::time_point now) const {
                            ? static_cast<double>(total_ - current_) / speed
                            : 0.0;
 
-    std::cout << '\r';
+    // Clear the prior render first: a new suffix can be shorter than the old
+    // one, and metrics must not leave stale characters in the terminal.
+    std::cout << "\x1b[2K\r";
     if (!label_.empty()) {
         std::cout << label_ << ' ';
     }
     std::cout << '['
               << std::string(filled, '=')
-              << (filled < width ? ">" : "")
-              << std::string(std::max(0, width - filled - 1), ' ')
+              << std::string(std::max(0, width - filled), ' ')
               << "] " << std::fixed << std::setprecision(1)
               << progress * 100.0 << "% " << current_ << '/' << total_
               << " | " << std::setprecision(2) << speed << ' ' << speed_unit_
               << " | ETA: " << std::setprecision(1) << eta << " s"
+              << suffix_
               << std::flush;
 }

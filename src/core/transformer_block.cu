@@ -295,6 +295,25 @@ void transformer_block_forward(
     workspace.value.reshape({batch, sequence, options.num_kv_heads,
                              options.head_dim});
 
+    // Normalize each attention head independently before positional rotation.
+    // Keep the unnormalized projections because QK-Norm needs them in backward.
+    CUDA_CHECK(cudaMemcpyAsync(workspace.query_pre_norm.raw_data(), workspace.query.raw_data(),
+                               workspace.query.nbytes(), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(workspace.key_pre_norm.raw_data(), workspace.key.raw_data(),
+                               workspace.key.nbytes(), cudaMemcpyDeviceToDevice, stream));
+    workspace.query.reshape({batch * sequence * options.num_query_heads, options.head_dim});
+    workspace.query_pre_norm.reshape({batch * sequence * options.num_query_heads, options.head_dim});
+    rmsnorm_forward(workspace.query, workspace.query_pre_norm, weights.q_norm,
+                    options.rms_epsilon, stream);
+    workspace.key.reshape({batch * sequence * options.num_kv_heads, options.head_dim});
+    workspace.key_pre_norm.reshape({batch * sequence * options.num_kv_heads, options.head_dim});
+    rmsnorm_forward(workspace.key, workspace.key_pre_norm, weights.k_norm,
+                    options.rms_epsilon, stream);
+    workspace.query_pre_norm.reshape({batch, sequence, options.num_query_heads, options.head_dim});
+    workspace.key_pre_norm.reshape({batch, sequence, options.num_kv_heads, options.head_dim});
+    workspace.query.reshape({batch, sequence, options.num_query_heads, options.head_dim});
+    workspace.key.reshape({batch, sequence, options.num_kv_heads, options.head_dim});
+
     rope_forward(
         workspace.query,
         workspace.key,
@@ -412,21 +431,40 @@ void transformer_block_backward(
     rope_backward(backward.grad_query_pre_rope, backward.grad_key_pre_rope, backward.grad_query,
         backward.grad_key, cos_cache, sin_cache, stream, RopeOptions{options.rotary_dim, position_offset});
 
+    // Backpropagate through the per-head QK normalizations. Reuse the original
+    // gradient buffers after RoPE has consumed them.
+    backward.grad_query_pre_rope.reshape({batch * sequence * options.num_query_heads, options.head_dim});
+    backward.grad_query.reshape({batch * sequence * options.num_query_heads, options.head_dim});
+    auto& saved_query_pre_norm = const_cast<Tensor&>(forward_workspace.query_pre_norm);
+    saved_query_pre_norm.reshape({batch * sequence * options.num_query_heads, options.head_dim});
+    rmsnorm_backward(backward.grad_query, gradients.q_norm, backward.grad_query_pre_rope,
+                     saved_query_pre_norm, weights.q_norm, options.rms_epsilon, stream);
+    backward.grad_key_pre_rope.reshape({batch * sequence * options.num_kv_heads, options.head_dim});
+    backward.grad_key.reshape({batch * sequence * options.num_kv_heads, options.head_dim});
+    auto& saved_key_pre_norm = const_cast<Tensor&>(forward_workspace.key_pre_norm);
+    saved_key_pre_norm.reshape({batch * sequence * options.num_kv_heads, options.head_dim});
+    rmsnorm_backward(backward.grad_key, gradients.k_norm, backward.grad_key_pre_rope,
+                     saved_key_pre_norm, weights.k_norm, options.rms_epsilon, stream);
+    saved_query_pre_norm.reshape({batch, sequence, options.num_query_heads, options.head_dim});
+    saved_key_pre_norm.reshape({batch, sequence, options.num_kv_heads, options.head_dim});
+
     rmsnorm_forward(backward.attention_norm_output, input, weights.attention_norm, options.rms_epsilon, stream);
-    backward.grad_query_pre_rope.reshape({rows, options.num_query_heads * options.head_dim});
-    backward.grad_key_pre_rope.reshape({rows, options.num_kv_heads * options.head_dim});
+    backward.grad_query.reshape({rows, options.num_query_heads * options.head_dim});
+    backward.grad_key.reshape({rows, options.num_kv_heads * options.head_dim});
     backward.grad_value.reshape({rows, options.num_kv_heads * options.head_dim});
     linear_backward(backward.grad_attention_norm_input, gradients.q_projection, backward.hidden_bias,
-        backward.grad_query_pre_rope, backward.attention_norm_output, weights.q_projection, cublas_context, stream, linear_options);
+        backward.grad_query, backward.attention_norm_output, weights.q_projection, cublas_context, stream, linear_options);
     linear_options.accumulate_input = true;
     linear_backward(backward.grad_attention_norm_input, gradients.k_projection, backward.kv_bias,
-        backward.grad_key_pre_rope, backward.attention_norm_output, weights.k_projection, cublas_context, stream, linear_options);
+        backward.grad_key, backward.attention_norm_output, weights.k_projection, cublas_context, stream, linear_options);
     linear_backward(backward.grad_attention_norm_input, gradients.v_projection, backward.kv_bias,
         backward.grad_value, backward.attention_norm_output, weights.v_projection, cublas_context, stream, linear_options);
     linear_options.accumulate_input = false;
     backward.grad_query_pre_rope.reshape({batch, sequence, options.num_query_heads, options.head_dim});
     backward.grad_key_pre_rope.reshape({batch, sequence, options.num_kv_heads, options.head_dim});
     backward.grad_value.reshape({batch, sequence, options.num_kv_heads, options.head_dim});
+    backward.grad_query.reshape({batch, sequence, options.num_query_heads, options.head_dim});
+    backward.grad_key.reshape({batch, sequence, options.num_kv_heads, options.head_dim});
     rmsnorm_backward(backward.grad_residual, gradients.attention_norm, backward.grad_attention_norm_input,
         input, weights.attention_norm, options.rms_epsilon, stream);
     add_inplace(grad_input, backward.grad_residual, stream);

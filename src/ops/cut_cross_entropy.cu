@@ -1,3 +1,12 @@
+/**
+ * @file cut_cross_entropy.cu
+ * @brief CUDA implementation of cut cross-entropy with input and classifier gradients.
+ *
+ * This implementation avoids storing the complete logits or softmax matrix.
+ * For every input row it stores only the maximum logit and the inverse softmax
+ * denominator required by the backward kernels.
+ */
+
 #include "ops/cut_cross_entropy.h"
 
 #include "core/cuda_check.h"
@@ -9,6 +18,11 @@ namespace {
 
 constexpr int kThreads = 256;
 
+/**
+ * @brief Reduces a value across all threads in a block by summation.
+ * @param value Per-thread value to reduce.
+ * @return The block-wide sum, returned consistently to every thread.
+ */
 __device__ float block_sum(float value) {
     __shared__ float partial[kThreads / 32];
     const int lane = threadIdx.x & 31;
@@ -27,6 +41,11 @@ __device__ float block_sum(float value) {
     return partial[0];
 }
 
+/**
+ * @brief Reduces a value across all threads in a block by maximum.
+ * @param value Per-thread value to reduce.
+ * @return The block-wide maximum, returned consistently to every thread.
+ */
 __device__ float block_max(float value) {
     __shared__ float partial[kThreads / 32];
     const int lane = threadIdx.x & 31;
@@ -45,13 +64,36 @@ __device__ float block_max(float value) {
     return partial[0];
 }
 
+/**
+ * @brief Computes a dot product between an input vector and a classifier row.
+ * @param input Input vector.
+ * @param classifier Classifier row.
+ * @param hidden Number of vector elements.
+ * @return The dot product accumulated with fused multiply-add operations.
+ */
 __device__ float dot(const float* input, const float* classifier, std::size_t hidden) {
     float value = 0.0f;
     for (std::size_t h = 0; h < hidden; ++h) value = fmaf(input[h], classifier[h], value);
     return value;
 }
 
-// One block per row. The only saved state is max and inverse denominator per row.
+/**
+ * @brief Computes the mean cross-entropy loss and per-row softmax statistics.
+ *
+ * One block processes one input row. Only the maximum logit and inverse softmax
+ * denominator are retained for use by the backward kernels.
+ *
+ * @param loss Device scalar receiving the accumulated mean loss.
+ * @param statistics Device array containing two values per row: max logit and
+ *        inverse softmax denominator.
+ * @param input Input matrix with shape [rows, hidden].
+ * @param classifier Classifier matrix with shape [vocabulary, hidden].
+ * @param targets Device target-token array with length @p rows.
+ * @param rows Number of input rows.
+ * @param vocabulary Number of classifier rows/classes.
+ * @param hidden Hidden/vector dimension.
+ * @param inv_rows Reciprocal of @p rows.
+ */
 __global__ void cce_forward(float* loss, float* statistics, const float* input,
     const float* classifier, const bpe::TokenId* targets, std::size_t rows,
     std::size_t vocabulary, std::size_t hidden, float inv_rows) {
@@ -74,7 +116,12 @@ __global__ void cce_forward(float* loss, float* statistics, const float* input,
     }
 }
 
-// Each block produces one input-gradient coordinate; no logits are retained.
+/**
+ * @brief Computes the gradient with respect to the input matrix.
+ *
+ * Each block computes one input-gradient coordinate and reconstructs the
+ * required probabilities from the saved row statistics.
+ */
 __global__ void cce_input_backward(float* input_gradient, const float* statistics,
     const float* input, const float* classifier, const bpe::TokenId* targets,
     std::size_t rows, std::size_t vocabulary, std::size_t hidden, float inv_rows) {
@@ -94,7 +141,12 @@ __global__ void cce_input_backward(float* input_gradient, const float* statistic
         input_gradient[row * hidden + h] = (value - classifier[static_cast<std::size_t>(targets[row]) * hidden + h]) * inv_rows;
 }
 
-// Blocks cover classifier rows; atomics accumulate contributions from examples.
+/**
+ * @brief Computes the gradient with respect to the classifier matrix.
+ *
+ * Blocks cover classifier rows while atomic additions accumulate contributions
+ * from all examples in the batch.
+ */
 __global__ void cce_classifier_backward(float* classifier_gradient, const float* statistics,
     const float* input, const float* classifier, const bpe::TokenId* targets,
     std::size_t rows, std::size_t vocabulary, std::size_t hidden, float inv_rows) {
@@ -107,6 +159,11 @@ __global__ void cce_classifier_backward(float* classifier_gradient, const float*
     for (std::size_t h = 0; h < hidden; ++h) atomicAdd(classifier_gradient + token * hidden + h, scale * x[h]);
 }
 
+/**
+ * @brief Validates tensors and target metadata for cut cross-entropy.
+ * @throws std::invalid_argument If devices, dtypes, shapes, or target count
+ *         are incompatible with the operation.
+ */
 void validate(const Tensor& loss, const Tensor& input_gradient, const Tensor& classifier_gradient,
     const Tensor& input, const Tensor& classifier, const bpe::TokenId* targets, std::size_t target_count) {
     if (targets == nullptr || input.device_type() != DeviceType::CUDA || classifier.device_type() != DeviceType::CUDA ||
@@ -123,6 +180,25 @@ void validate(const Tensor& loss, const Tensor& input_gradient, const Tensor& cl
 }
 } // namespace
 
+/**
+ * @brief Computes cut cross-entropy and both required parameter gradients.
+ *
+ * The operation expects CUDA F32 tensors. The loss is the mean over rows and
+ * is accumulated into the one-element CUDA tensor @p loss. Target IDs must be
+ * stored in device memory.
+ *
+ * @param[out] loss One-element CUDA F32 tensor receiving the mean loss.
+ * @param[out] input_gradient Gradient with respect to @p input.
+ * @param[out] classifier_gradient Gradient with respect to @p classifier.
+ * @param[in] input Input activations with shape [rows, hidden].
+ * @param[in] classifier Classifier weights with shape [vocabulary, hidden].
+ * @param[in] device_targets Device pointer to @p target_count target IDs.
+ * @param target_count Number of target IDs; must equal the number of rows.
+ * @param stream CUDA stream used for all asynchronous operations.
+ * @throws std::invalid_argument If the supplied tensors or targets are invalid.
+ * @throws cudaError_t If a CUDA allocation, memory operation, or kernel launch
+ *         fails.
+ */
 void cut_cross_entropy_forward_backward(Tensor& loss, Tensor& input_gradient, Tensor& classifier_gradient,
     const Tensor& input, const Tensor& classifier, const bpe::TokenId* device_targets,
     std::size_t target_count, cudaStream_t stream) {

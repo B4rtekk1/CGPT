@@ -1,3 +1,12 @@
+/**
+ * @file cross_entropy(3).cu
+ * @brief Fused CUDA implementation of softmax cross-entropy and its gradient.
+ *
+ * The kernel supports FP32, FP16, and BF16 logits. It computes the numerically
+ * stable softmax using a row-wise maximum, reuses the gradient buffer for
+ * centered exponentials, and avoids allocating a separate probability matrix.
+ */
+
 #include "ops/cross_entropy.h"
 
 #include "core/cuda_check.h"
@@ -18,16 +27,29 @@ constexpr int kWarpSize = 32;
 constexpr int kWarps = kThreads / kWarpSize;
 static_assert(kThreads % kWarpSize == 0);
 
+/**
+ * @brief Converts a supported CUDA scalar type to FP32 for arithmetic.
+ * @tparam T Source scalar type.
+ * @param value Value to convert.
+ * @return The value represented as a float.
+ */
 template <typename T>
 __device__ __forceinline__ float to_float(T value) {
     return static_cast<float>(value);
 }
 
+/**
+ * @brief Converts an FP32 arithmetic result to a supported output type.
+ * @tparam T Destination scalar type.
+ * @param value Value to convert.
+ * @return The converted value.
+ */
 template <typename T>
 __device__ __forceinline__ T from_float(float value) {
     return static_cast<T>(value);
 }
 
+/** @brief Performs a warp-wide maximum reduction. */
 __device__ __forceinline__ float warp_reduce_max(float value) {
 #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
@@ -36,6 +58,7 @@ __device__ __forceinline__ float warp_reduce_max(float value) {
     return value;
 }
 
+/** @brief Performs a warp-wide sum reduction. */
 __device__ __forceinline__ float warp_reduce_sum(float value) {
 #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
@@ -44,6 +67,12 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
     return value;
 }
 
+/**
+ * @brief Performs a block-wide maximum reduction using warp scratch storage.
+ * @param value Per-thread value.
+ * @param warp_scratch Shared-memory storage with one slot per warp.
+ * @return Block-wide maximum, available to every thread after synchronization.
+ */
 __device__ __forceinline__ float block_reduce_max(float value, float* warp_scratch) {
     const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
@@ -61,6 +90,12 @@ __device__ __forceinline__ float block_reduce_max(float value, float* warp_scrat
     return warp_scratch[0];
 }
 
+/**
+ * @brief Performs a block-wide sum reduction using warp scratch storage.
+ * @param value Per-thread value.
+ * @param warp_scratch Shared-memory storage with one slot per warp.
+ * @return Block-wide sum, available to every thread after synchronization.
+ */
 __device__ __forceinline__ float block_reduce_sum(float value, float* warp_scratch) {
     const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
     const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
@@ -78,6 +113,24 @@ __device__ __forceinline__ float block_reduce_sum(float value, float* warp_scrat
     return warp_scratch[0];
 }
 
+/**
+ * @brief Fused row-wise softmax cross-entropy forward and backward kernel.
+ *
+ * One block handles one row. The kernel first finds the row maximum, computes
+ * centered exponentials and their denominator, accumulates the mean loss, and
+ * finally transforms the staged exponentials in @p gradient into dL/dlogits.
+ * Invalid target IDs produce a zero target contribution while still producing
+ * the softmax gradient.
+ *
+ * @tparam T Logit and gradient scalar type: float, __half, or __nv_bfloat16.
+ * @param loss Device scalar receiving the accumulated mean loss.
+ * @param gradient Output gradient with the same shape and dtype as @p logits.
+ * @param logits Input logits with shape [rows, vocabulary_size].
+ * @param targets Device target-token array.
+ * @param rows Number of rows.
+ * @param vocabulary_size Number of classes per row.
+ * @param inv_rows Reciprocal of @p rows.
+ */
 template <typename T>
 __global__ __launch_bounds__(kThreads)
 void cross_entropy_fused_kernel(
@@ -195,6 +248,46 @@ void cross_entropy_fused_kernel(
     }
 }
 
+template <typename T>
+__global__ __launch_bounds__(kThreads)
+void cross_entropy_forward_kernel(
+    float* __restrict__ loss,
+    const T* __restrict__ logits,
+    const bpe::TokenId* __restrict__ targets,
+    const std::size_t rows,
+    const std::size_t vocabulary_size,
+    const float inv_rows) {
+
+    const std::size_t row = blockIdx.x;
+    if (row >= rows) return;
+    __shared__ float warp_scratch[kWarps];
+    const T* const row_logits = logits + row * vocabulary_size;
+    constexpr auto kStride = static_cast<std::size_t>(kThreads);
+    const auto tid = static_cast<std::size_t>(threadIdx.x);
+
+    float local_max = -CUDART_INF_F;
+    for (std::size_t column = tid; column < vocabulary_size; column += kStride)
+        local_max = fmaxf(local_max, to_float(row_logits[column]));
+    const float maximum = block_reduce_max(local_max, warp_scratch);
+
+    float local_sum = 0.0f;
+    for (std::size_t column = tid; column < vocabulary_size; column += kStride)
+        local_sum += __expf(to_float(row_logits[column]) - maximum);
+    const float denominator = block_reduce_sum(local_sum, warp_scratch);
+
+    const bpe::TokenId target = targets[row];
+    if (threadIdx.x == 0 && target < vocabulary_size) {
+        const float row_loss = __logf(denominator) + maximum -
+            to_float(row_logits[static_cast<std::size_t>(target)]);
+        atomicAdd(loss, row_loss * inv_rows);
+    }
+}
+
+/**
+ * @brief Validates tensors and target metadata for cross-entropy.
+ * @throws std::invalid_argument If inputs are not compatible CUDA tensors or
+ *         if the target count does not match the number of rows.
+ */
 void validate(const Tensor& loss, const Tensor& gradient, const Tensor& logits,
               const bpe::TokenId* targets, const std::size_t target_count) {
     if (targets == nullptr || logits.device_type() != DeviceType::CUDA || logits.dim() != 2 ||
@@ -211,6 +304,10 @@ void validate(const Tensor& loss, const Tensor& gradient, const Tensor& logits,
     }
 }
 
+/**
+ * @brief Launches the fused cross-entropy kernel for one scalar type.
+ * @tparam T CUDA scalar type used by logits and gradient.
+ */
 template <typename T>
 void launch(Tensor& loss, Tensor& gradient, const Tensor& logits,
             const bpe::TokenId* targets, const std::size_t rows,
@@ -227,8 +324,33 @@ void launch(Tensor& loss, Tensor& gradient, const Tensor& logits,
         inv_rows);
 }
 
+template <typename T>
+void launch_forward(Tensor& loss, const Tensor& logits,
+                    const bpe::TokenId* targets, const std::size_t rows,
+                    const std::size_t vocabulary_size, cudaStream_t stream) {
+    cross_entropy_forward_kernel<T><<<static_cast<unsigned>(rows), kThreads, 0, stream>>>(
+        static_cast<float*>(loss.raw_data()), static_cast<const T*>(logits.raw_data()),
+        targets, rows, vocabulary_size, 1.0f / static_cast<float>(rows));
+}
+
 } // namespace
 
+/**
+ * @brief Computes mean softmax cross-entropy and its logits gradient.
+ *
+ * Supported logits and gradient dtypes are FP32, FP16, and BF16. The loss is
+ * always accumulated in a one-element CUDA FP32 tensor. Target IDs must point
+ * to device memory and the target count must equal the number of logits rows.
+ *
+ * @param[out] loss One-element CUDA FP32 tensor receiving the mean loss.
+ * @param[out] gradient Gradient with respect to @p logits.
+ * @param[in] logits Input logits with shape [rows, vocabulary_size].
+ * @param[in] device_targets Device pointer to target IDs.
+ * @param target_count Number of target IDs.
+ * @param stream CUDA stream used for the asynchronous operation.
+ * @throws std::invalid_argument If inputs, shapes, dtypes, or targets are invalid.
+ * @throws cudaError_t If a CUDA memory operation or kernel launch fails.
+ */
 void cross_entropy_forward_backward(Tensor& loss, Tensor& gradient, const Tensor& logits,
                                     const bpe::TokenId* device_targets,
                                     const std::size_t target_count, cudaStream_t stream) {
@@ -253,5 +375,35 @@ void cross_entropy_forward_backward(Tensor& loss, Tensor& gradient, const Tensor
             throw std::invalid_argument("cross_entropy: unsupported logits dtype");
     }
 
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void cross_entropy_forward(Tensor& loss, const Tensor& logits,
+                           const bpe::TokenId* device_targets,
+                           const std::size_t target_count, cudaStream_t stream) {
+    if (device_targets == nullptr || logits.device_type() != DeviceType::CUDA ||
+        logits.dim() != 2 || !is_floating_point(logits.dtype()) || logits.size(0) == 0 ||
+        logits.size(1) == 0 || target_count != logits.size(0))
+        throw std::invalid_argument("cross_entropy: invalid logits or target count");
+    if (loss.device_type() != DeviceType::CUDA || loss.dtype() != Dtype::F32 ||
+        loss.shape() != std::vector<std::size_t>{1})
+        throw std::invalid_argument("cross_entropy: loss must be a CUDA F32 tensor with shape [1]");
+
+    CUDA_CHECK(cudaMemsetAsync(loss.raw_data(), 0, sizeof(float), stream));
+    const auto rows = logits.size(0);
+    const auto vocabulary_size = logits.size(1);
+    switch (logits.dtype()) {
+        case Dtype::F32:
+            launch_forward<float>(loss, logits, device_targets, rows, vocabulary_size, stream);
+            break;
+        case Dtype::F16:
+            launch_forward<__half>(loss, logits, device_targets, rows, vocabulary_size, stream);
+            break;
+        case Dtype::BF16:
+            launch_forward<__nv_bfloat16>(loss, logits, device_targets, rows, vocabulary_size, stream);
+            break;
+        default:
+            throw std::invalid_argument("cross_entropy: unsupported logits dtype");
+    }
     CUDA_CHECK(cudaGetLastError());
 }

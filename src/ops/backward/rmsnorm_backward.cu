@@ -1,5 +1,5 @@
 /**
- * @file rmsnorm_backward.cu
+ * @file rmsnorm_backward(1).cu
  * @brief CUDA backward pass for RMSNorm.
  */
 
@@ -17,6 +17,7 @@
 #include <unordered_map>
 
 namespace {
+    /** @brief Performs a warp-wide FP32 sum reduction. */
     __forceinline__ __device__ float warp_reduce_sum(float value) {
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -25,6 +26,7 @@ namespace {
         return value;
     }
 
+    /** @brief Performs a block-wide FP32 sum reduction. */
     __forceinline__ __device__ float block_reduce_sum(float value) {
         value = warp_reduce_sum(value);
         __shared__ float warp_sums[8];
@@ -47,6 +49,13 @@ namespace {
         return warp_sums[0];
     }
 
+    /**
+     * @brief Computes the inverse RMS for one row after block reduction.
+     * @param value Per-thread sum of squared input values.
+     * @param inverse_hidden Reciprocal hidden dimension.
+     * @param epsilon Numerical stability constant.
+     * @return `1 / sqrt(mean(x^2) + epsilon)`.
+     */
     __forceinline__ __device__ float block_reduce_rms(
         float value,
         const float inverse_hidden,
@@ -73,6 +82,7 @@ namespace {
         return warp_values[0];
     }
 
+    /** @brief Unpacks two FP16 or BF16 values stored in a 32-bit word. */
     template<typename T>
     __forceinline__ __device__ float2 packed_u32_to_float2(
         const unsigned int value
@@ -90,6 +100,7 @@ namespace {
         }
     }
 
+    /** @brief Packs two FP32 values into FP16 or BF16 storage. */
     template<typename T>
     __forceinline__ __device__ unsigned int floats_to_packed_u32(
         const float first,
@@ -113,6 +124,10 @@ namespace {
      *
      * Each thread owns sixteen elements and reads x, dy, and weight once. The
      * packed values remain live across the RMS and weighted-dot reductions.
+     */
+    /**
+     * @brief Optimized 16-bit input-gradient kernel for hidden size 4096.
+     * @tparam T Either __half or __nv_bfloat16.
      */
     template<typename T>
     __launch_bounds__(256, 2)
@@ -213,6 +228,10 @@ namespace {
         grad_input128[tid + kThreads] = dx1;
     }
 
+    /**
+     * @brief Cached-register RMSNorm input-gradient kernel for small rows.
+     * @tparam T Input and gradient storage type.
+     */
     template<typename T>
     __launch_bounds__(256)
     __global__ void rmsnorm_grad_input_cached_kernel(
@@ -273,6 +292,10 @@ namespace {
         }
     }
 
+    /**
+     * @brief General RMSNorm input-gradient kernel.
+     * @tparam T Input and gradient storage type.
+     */
     template<typename T>
     __launch_bounds__(256)
     __global__ void rmsnorm_grad_input_kernel(
@@ -344,6 +367,10 @@ namespace {
         }
     }
 
+    /**
+     * @brief Computes the gradient of the RMSNorm scale vector.
+     * @tparam T Input and gradient storage type.
+     */
     template<typename T>
     __launch_bounds__(256)
     __global__ void rmsnorm_grad_weight_kernel(
@@ -370,6 +397,11 @@ namespace {
         grad_weight[column] = static_cast<T>(grad);
     }
 
+    /**
+     * @brief Validates RMSNorm backward tensors and epsilon.
+     * @throws std::invalid_argument If shapes, devices, dtypes, dimensions, or
+     *         epsilon are invalid.
+     */
     void validate_rmsnorm_backward(
         const Tensor &grad_input,
         const Tensor &grad_weight,
@@ -407,6 +439,10 @@ namespace {
         }
     }
 
+    /**
+     * @brief Selects and launches the optimized RMSNorm backward kernels.
+     * @tparam T Input and gradient storage type.
+     */
     template<typename T>
     void launch_rmsnorm_backward(
         Tensor &grad_input, Tensor &grad_weight, const Tensor &grad_output,
@@ -473,6 +509,23 @@ namespace {
     }
 }
 
+/**
+ * @brief Computes gradients through RMSNorm.
+ *
+ * For `y = weight * input / sqrt(mean(input^2) + epsilon)`, this function
+ * computes gradients for both the input and the scale vector. It supports
+ * FP32, FP16, and BF16 CUDA tensors and selects specialized kernels based on
+ * hidden size, alignment, and data type.
+ *
+ * @param[out] grad_input Gradient with respect to the input matrix.
+ * @param[out] grad_weight Gradient with respect to the scale vector.
+ * @param[in] grad_output Gradient from the following operation.
+ * @param[in] input RMSNorm input with shape [rows, hidden].
+ * @param[in] weight Scale vector with shape [hidden].
+ * @param epsilon Positive numerical stability constant.
+ * @param stream CUDA stream used for asynchronous launches.
+ * @throws std::invalid_argument If tensors or epsilon are invalid.
+ */
 void rmsnorm_backward(
     Tensor& grad_input, Tensor& grad_weight, const Tensor& grad_output,
     const Tensor& input, const Tensor& weight, const float epsilon, cudaStream_t stream) {

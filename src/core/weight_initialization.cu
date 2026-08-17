@@ -64,6 +64,10 @@ void initialize_transformer_weights(
         validate_shape(tensor, {block.hidden_size}, name);
         initialize_norm_tensor(tensor);
     };
+    const auto head_norm = [&](Tensor& tensor, const char* name) {
+        validate_shape(tensor, {block.head_dim}, name);
+        initialize_norm_tensor(tensor);
+    };
 
     matrix(weights.token_embedding, {options.vocabulary_size, block.hidden_size},
            "token embedding", initialization.seed);
@@ -80,6 +84,8 @@ void initialize_transformer_weights(
                {block.num_query_heads * block.head_dim, block.hidden_size}, "q projection", base);
         matrix(current.k_projection,
                {block.num_kv_heads * block.head_dim, block.hidden_size}, "k projection", base + 1);
+        head_norm(current.q_norm, "q norm");
+        head_norm(current.k_norm, "k norm");
         matrix(current.v_projection,
                {block.num_kv_heads * block.head_dim, block.hidden_size}, "v projection", base + 2);
         matrix(current.o_projection,

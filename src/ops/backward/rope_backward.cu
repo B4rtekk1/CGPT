@@ -1,5 +1,10 @@
 /**
- * @file rope_backward.cu @brief CUDA backward pass for Rotary Positional Embedding (RoPE).
+ * @file rope_backward.cu
+ * @brief CUDA backward pass for Rotary Positional Embedding (RoPE).
+ *
+ * The implementation provides a generic path for arbitrary supported layouts
+ * and a specialized FP16 path for the common 32-query-head, 8-key-head,
+ * 128-dimensional configuration.
  */
 
 #include "ops/backward/rope_backward.h"
@@ -15,6 +20,7 @@ namespace {
     constexpr std::uint32_t kThreadsPerBlock = 256U;
     constexpr std::uint32_t kMaxGridX = 65535U;
 
+    /** @brief Converts a supported RoPE cache or gradient value to FP32. */
     template<typename T>
     __device__ __forceinline__ float to_float(const T value) {
         return static_cast<float>(value);
@@ -30,7 +36,27 @@ namespace {
         return __bfloat162float(value);
     }
 
-    /** @brief Applies the transpose of the forward rotation to one gradient pair. */
+    /**
+     * @brief Applies the transpose of the forward rotation to Q and K gradients.
+     *
+     * Each pair `(x0, x1)` is transformed with the inverse rotation:
+     * `dx0 = dy0*cos + dy1*sin` and `dx1 = -dy0*sin + dy1*cos`.
+     *
+     * @tparam T Element type of gradients and trigonometric caches.
+     * @param grad_query Output query gradient.
+     * @param grad_key Output key gradient.
+     * @param grad_rotated_query Gradient after the forward RoPE operation.
+     * @param grad_rotated_key Gradient after the forward RoPE operation.
+     * @param cos_cache Cosine cache indexed by position and rotary pair.
+     * @param sin_cache Sine cache indexed by position and rotary pair.
+     * @param token_count Number of batch/sequence tokens.
+     * @param sequence_length Sequence length used to derive token positions.
+     * @param query_head_count Number of query heads.
+     * @param key_head_count Number of key heads.
+     * @param head_dim Head dimension.
+     * @param rotary_pair_count Number of rotated coordinate pairs.
+     * @param position_offset Offset into the trigonometric caches.
+     */
     template<typename T>
     __global__ void rope_backward_kernel(
         T * __restrict__ grad_query,
@@ -82,7 +108,12 @@ namespace {
         }
     }
 
-    /** Register-cached FP16 backward path for the model's 32/8-head layout. */
+    /**
+     * @brief Register/shared-memory optimized FP16 backward path for 32/8 heads.
+     *
+     * This specialization assumes 32 query heads, 8 key heads, head dimension
+     * 128, and a full 128-dimensional rotation.
+     */
     __global__ __launch_bounds__(256) void rope_backward_f16_32_8_128_kernel(
         half * __restrict__ grad_query,
         half * __restrict__ grad_key,
@@ -150,6 +181,7 @@ namespace {
         }
     }
 
+    /** @brief Converts a size value to uint32_t or throws on overflow. */
     [[nodiscard]] std::uint32_t checked_u32(const std::size_t value, const char *name) {
         if (value > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error(std::string("RoPE backward: ") + name + " exceeds uint32_t range");
@@ -157,6 +189,7 @@ namespace {
         return static_cast<std::uint32_t>(value);
     }
 
+    /** @brief Validates that a tensor is a CUDA rank-four tensor. */
     void validate_tensor(const Tensor &tensor, const char *name) {
         if (tensor.device_type() != DeviceType::CUDA) {
             throw std::invalid_argument(std::string("RoPE backward: ") + name +
@@ -168,6 +201,12 @@ namespace {
         }
     }
 
+    /**
+     * @brief Validates RoPE gradient tensors, caches, options, and dimensions.
+     * @throws std::invalid_argument For incompatible devices, shapes, dtypes,
+     *         rotary dimensions, or cache coverage.
+     * @throws std::overflow_error If a launch parameter exceeds uint32_t range.
+     */
     void validate_inputs(
         const Tensor &grad_query, const Tensor &grad_key,
         const Tensor &grad_rotated_query, const Tensor &grad_rotated_key,
@@ -222,6 +261,10 @@ namespace {
         static_cast<void>(checked_u32(options.position_offset, "position offset"));
     }
 
+    /**
+     * @brief Launches the generic RoPE backward kernel for one element type.
+     * @tparam T Element type used by gradients and caches.
+     */
     template<typename T>
     void launch(
         Tensor &grad_query, Tensor &grad_key,
@@ -252,6 +295,26 @@ namespace {
     }
 }
 
+/**
+ * @brief Computes gradients through Rotary Positional Embedding.
+ *
+ * The function supports FP32, FP16, and BF16 tensors with query/key layouts
+ * `[batch, sequence, heads, head_dim]`. When `rotary_dim` is smaller than the
+ * head dimension, the unrotated suffix is copied before the rotated prefix is
+ * processed. The operation is asynchronous with respect to the supplied CUDA
+ * stream.
+ *
+ * @param[out] grad_query Gradient with respect to the original query tensor.
+ * @param[out] grad_key Gradient with respect to the original key tensor.
+ * @param[in] grad_rotated_query Gradient after RoPE for queries.
+ * @param[in] grad_rotated_key Gradient after RoPE for keys.
+ * @param[in] cos_cache Cosine cache with shape [max_sequence, rotary_dim / 2].
+ * @param[in] sin_cache Sine cache with shape [max_sequence, rotary_dim / 2].
+ * @param stream CUDA stream used for copies and kernel launches.
+ * @param rope_options RoPE dimension and position-offset configuration.
+ * @throws std::invalid_argument If tensors or RoPE options are incompatible.
+ * @throws std::overflow_error If dimensions cannot be represented by launch types.
+ */
 void rope_backward(
     Tensor &grad_query, Tensor &grad_key,
     const Tensor &grad_rotated_query, const Tensor &grad_rotated_key,

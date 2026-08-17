@@ -27,3 +27,13 @@ void cross_entropy_forward_backward(
     const bpe::TokenId* device_targets,
     std::size_t target_count,
     cudaStream_t stream = nullptr);
+
+/**
+ * @brief Computes mean next-token cross-entropy without producing a gradient.
+ */
+void cross_entropy_forward(
+    Tensor& loss,
+    const Tensor& logits,
+    const bpe::TokenId* device_targets,
+    std::size_t target_count,
+    cudaStream_t stream = nullptr);

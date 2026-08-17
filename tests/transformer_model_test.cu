@@ -43,6 +43,8 @@ struct Fixture {
     Tensor attention_norm{{kHidden}, Dtype::F16};
     Tensor q{{kHidden, kHidden}, Dtype::F16};
     Tensor k{{kKvHeads * kHeadDim, kHidden}, Dtype::F16};
+    Tensor q_norm{{kHeadDim}, Dtype::F16};
+    Tensor k_norm{{kHeadDim}, Dtype::F16};
     Tensor v{{kKvHeads * kHeadDim, kHidden}, Dtype::F16};
     Tensor o{{kHidden, kHidden}, Dtype::F16};
     Tensor ffn_norm{{kHidden}, Dtype::F16};
@@ -62,6 +64,8 @@ struct Fixture {
         attention_norm.copy_from_host(values(attention_norm.numel(), 0.2F));
         q.copy_from_host(values(q.numel(), 0.3F));
         k.copy_from_host(values(k.numel(), 0.4F));
+        q_norm.copy_from_host(std::vector<float>(q_norm.numel(), 1.0F));
+        k_norm.copy_from_host(std::vector<float>(k_norm.numel(), 1.0F));
         v.copy_from_host(values(v.numel(), 0.5F));
         o.copy_from_host(values(o.numel(), 0.6F));
         ffn_norm.copy_from_host(values(ffn_norm.numel(), 0.7F));
@@ -72,7 +76,7 @@ struct Fixture {
         lm_head.copy_from_host(values(lm_head.numel(), 1.2F));
         cosine.copy_from_host(std::vector<float>(cosine.numel(), 1.0F));
         sine.copy_from_host(std::vector<float>(sine.numel(), 0.0F));
-        layers.push_back({attention_norm, q, k, v, o, ffn_norm, gate, up, down});
+        layers.push_back({attention_norm, q, k, q_norm, k_norm, v, o, ffn_norm, gate, up, down});
     }
 
     [[nodiscard]] TransformerModelWeights weights() const {
@@ -119,11 +123,12 @@ void test_backward() {
         grad_logits.copy_from_host(std::vector<float>(grad_logits.numel(), 0.1F));
         Tensor ge({kVocabulary, kHidden}, Dtype::F16), gan({kHidden}, Dtype::F16), gq({kHidden, kHidden}, Dtype::F16);
         Tensor gk({kKvHeads * kHeadDim, kHidden}, Dtype::F16), gv({kKvHeads * kHeadDim, kHidden}, Dtype::F16);
+        Tensor gqn({kHeadDim}, Dtype::F16), gkn({kHeadDim}, Dtype::F16);
         Tensor go({kHidden, kHidden}, Dtype::F16), gfn({kHidden}, Dtype::F16), gg({kIntermediate, kHidden}, Dtype::F16);
         Tensor gu({kIntermediate, kHidden}, Dtype::F16), gd({kHidden, kIntermediate}, Dtype::F16);
         Tensor gfinal({kHidden}, Dtype::F16), glm({kVocabulary, kHidden}, Dtype::F16);
         std::vector<TransformerBlockGradients> layer_grads;
-        layer_grads.push_back({gan, gq, gk, gv, go, gfn, gg, gu, gd});
+        layer_grads.push_back({gan, gq, gk, gqn, gkn, gv, go, gfn, gg, gu, gd});
         TransformerModelGradients grads{ge, layer_grads, gfinal, glm};
         TransformerModelBackwardWorkspace backward(fixture.options, kBatch, kSequence, Dtype::F16);
         transformer_model_backward(grad_logits, device_ids, kBatch, kSequence, fixture.weights(), grads,

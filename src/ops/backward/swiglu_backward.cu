@@ -1,5 +1,5 @@
 /**
- * @file swiglu_backward.cu
+ * @file swiglu_backward(1).cu
  * @brief CUDA backward implementation of the SwiGLU activation.
  *
  * Both separated-input (`gate`, `up`) and fused-input (`gate_up`) layouts are supported.
@@ -17,6 +17,10 @@ namespace {
     constexpr int THREADS_PER_BLOCK = 256;
     constexpr int MAX_BLOCKS_PER_ROW = 32;
 
+    /**
+     * @brief Provides conversions between a CUDA storage type and FP32.
+     * @tparam T Storage type supported by the SwiGLU kernels.
+     */
     template<typename T>
     struct CudaTypeTraits;
 
@@ -53,19 +57,28 @@ namespace {
         }
     };
 
+    /** @brief Computes the logistic sigmoid in FP32. */
     __device__ __forceinline__ float sigmoid(const float value) {
         return 1.0f / (1.0f + expf(-value));
     }
 
+    /** @brief Computes the SiLU activation in FP32. */
     __device__ __forceinline__ float silu(const float value) {
         return value * sigmoid(value);
     }
 
+    /** @brief Computes the derivative of SiLU in FP32. */
     __device__ __forceinline__ float silu_derivative(const float value) {
         const float sigmoid_value = sigmoid(value);
         return sigmoid_value * (1.0f + value * (1.0f - sigmoid_value));
     }
 
+    /**
+     * @brief Computes separate-layout SwiGLU gradients element by element.
+     * @tparam T Scalar storage type.
+     * @tparam ACCUMULATE_GATE Whether existing gate gradients are preserved.
+     * @tparam ACCUMULATE_UP Whether existing up gradients are preserved.
+     */
     template<typename T, bool ACCUMULATE_GATE, bool ACCUMULATE_UP>
     __global__ void swiglu_separate_scalar_backward_kernel(
         T * __restrict__ grad_gate,
@@ -102,6 +115,7 @@ namespace {
         }
     }
 
+    /** @brief Vectorized FP16 separate-layout SwiGLU backward kernel. */
     template<bool ACCUMULATE_GATE, bool ACCUMULATE_UP>
     __global__ void swiglu_separate_half2_backward_kernel(
         half2 * __restrict__ grad_gate,
@@ -150,6 +164,7 @@ namespace {
         }
     }
 
+    /** @brief Vectorized BF16 separate-layout SwiGLU backward kernel. */
     template<bool ACCUMULATE_GATE, bool ACCUMULATE_UP>
     __global__ void swiglu_separate_bfloat162_backward_kernel(
         __nv_bfloat162* __restrict__ grad_gate,
@@ -199,6 +214,11 @@ namespace {
         }
     }
 
+    /**
+     * @brief Computes fused-layout SwiGLU gradients element by element.
+     * @tparam T Scalar storage type.
+     * @tparam ACCUMULATE Whether existing fused gradients are preserved.
+     */
     template<typename T, bool ACCUMULATE>
     __global__ void swiglu_fused_scalar_backward_kernel(
         T* __restrict__ grad_gate_up,
@@ -245,6 +265,7 @@ namespace {
         }
     }
 
+    /** @brief Vectorized FP16 fused-layout SwiGLU backward kernel. */
     template<bool ACCUMULATE>
     __global__ void swiglu_fused_half2_backward_kernel(
         half2* __restrict__ grad_gate_up,
@@ -299,6 +320,7 @@ namespace {
         }
     }
 
+    /** @brief Vectorized BF16 fused-layout SwiGLU backward kernel. */
     template<bool ACCUMULATE>
     __global__ void swiglu_fused_bfloat162_backward_kernel(
         __nv_bfloat162* __restrict__ grad_gate_up,
@@ -719,6 +741,22 @@ namespace {
     }
 }
 
+/**
+ * @brief Computes SwiGLU backward gradients for separate gate and up tensors.
+ *
+ * For `output = SiLU(gate) * up`, the operation computes gradients for both
+ * inputs and supports FP32, FP16, and BF16 storage. Even-sized tensors use
+ * packed two-element kernels for FP16 and BF16 when possible.
+ *
+ * @param[out] grad_gate Gradient with respect to the gate tensor.
+ * @param[out] grad_up Gradient with respect to the up tensor.
+ * @param[in] grad_output Gradient from the following operation.
+ * @param[in] gate Gate activation tensor.
+ * @param[in] up Up-projection tensor.
+ * @param stream CUDA stream used for the launch.
+ * @param options Controls optional accumulation into output gradients.
+ * @throws std::invalid_argument If tensor shapes, devices, or dtypes are invalid.
+ */
 void swiglu_backward(
     Tensor& grad_gate,
     Tensor& grad_up,
@@ -776,6 +814,19 @@ void swiglu_backward(
     CUDA_CHECK(cudaGetLastError());
 }
 
+/**
+ * @brief Computes SwiGLU backward gradients for a fused gate/up tensor.
+ *
+ * The fused input stores the gate half followed by the up half in its last
+ * dimension. The result is written back in the same layout.
+ *
+ * @param[out] grad_gate_up Fused gradient tensor with the same layout as @p gate_up.
+ * @param[in] grad_output Gradient from the following operation.
+ * @param[in] gate_up Fused gate/up activation tensor.
+ * @param stream CUDA stream used for the launch.
+ * @param options Controls optional accumulation into the fused gradient.
+ * @throws std::invalid_argument If tensor shapes, devices, or dtypes are invalid.
+ */
 void swiglu_backward(
     Tensor& grad_gate_up,
     const Tensor& grad_output,

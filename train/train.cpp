@@ -16,7 +16,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -33,7 +35,10 @@ struct Arguments {
     std::size_t sequence_length = 1024;
     std::size_t epochs = 10;
     std::size_t max_steps = 0; // 0 means all batches from every requested epoch.
+    std::size_t validation_interval = 500;
+    std::size_t validation_batches = 64;
     float learning_rate = 1.0e-4F;
+    float validation_fraction = 0.1F;
     std::string prompt = "The";
     std::size_t generate_tokens = 64;
 };
@@ -67,34 +72,44 @@ Arguments parse_arguments(int argc, char** argv) {
         else if (option == "--sequence-length") args.sequence_length = std::stoull(value());
         else if (option == "--epochs") args.epochs = std::stoull(value());
         else if (option == "--max-steps") args.max_steps = std::stoull(value());
+        else if (option == "--validation-interval") args.validation_interval = std::stoull(value());
+        else if (option == "--validation-batches") args.validation_batches = std::stoull(value());
         else if (option == "--learning-rate") args.learning_rate = std::stof(value());
+        else if (option == "--validation-fraction") args.validation_fraction = std::stof(value());
         else if (option == "--prompt") args.prompt = value();
         else if (option == "--generate-tokens") args.generate_tokens = std::stoull(value());
         else if (option == "--help") {
             std::cout << "Usage: cgpt_train [--input PATH] [--tokenizer PATH] [--vocab-size N] "
                          "[--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N] "
-                         "[--learning-rate N] [--prompt TEXT] [--generate-tokens N]\n";
+                         "[--learning-rate N] [--validation-fraction N] [--validation-interval N] "
+                         "[--validation-batches N] [--prompt TEXT] [--generate-tokens N]\n";
             std::exit(EXIT_SUCCESS);
         } else throw std::invalid_argument("Unknown option: " + option);
     }
     if (args.vocab_size < 512 || args.batch_size == 0 || args.sequence_length < 2 || args.epochs == 0 ||
-        !std::isfinite(args.learning_rate) || args.learning_rate <= 0.0F)
+        !std::isfinite(args.learning_rate) || args.learning_rate <= 0.0F ||
+        args.validation_interval == 0 || args.validation_batches == 0)
         throw std::invalid_argument("Invalid training dimensions");
+    if (!std::isfinite(args.validation_fraction) || args.validation_fraction <= 0.0F ||
+        args.validation_fraction >= 1.0F)
+        throw std::invalid_argument("validation-fraction must be between 0 and 1");
     return args;
 }
 
 struct LayerStorage {
-    Tensor attention_norm, q, k, v, o, ffn_norm, gate, up, down;
-    Tensor g_attention_norm, g_q, g_k, g_v, g_o, g_ffn_norm, g_gate, g_up, g_down;
+    Tensor attention_norm, q, k, q_norm, k_norm, v, o, ffn_norm, gate, up, down;
+    Tensor g_attention_norm, g_q, g_k, g_q_norm, g_k_norm, g_v, g_o, g_ffn_norm, g_gate, g_up, g_down;
     explicit LayerStorage(const TransformerBlockOptions& options)
         : attention_norm({options.hidden_size}, Dtype::F16), q({options.hidden_size, options.hidden_size}, Dtype::F16),
           k({options.num_kv_heads * options.head_dim, options.hidden_size}, Dtype::F16),
+          q_norm({options.head_dim}, Dtype::F16), k_norm({options.head_dim}, Dtype::F16),
           v({options.num_kv_heads * options.head_dim, options.hidden_size}, Dtype::F16),
           o({options.hidden_size, options.hidden_size}, Dtype::F16), ffn_norm({options.hidden_size}, Dtype::F16),
           gate({options.intermediate_size, options.hidden_size}, Dtype::F16), up({options.intermediate_size, options.hidden_size}, Dtype::F16),
           down({options.hidden_size, options.intermediate_size}, Dtype::F16),
           g_attention_norm({options.hidden_size}, Dtype::F16), g_q({options.hidden_size, options.hidden_size}, Dtype::F16),
           g_k({options.num_kv_heads * options.head_dim, options.hidden_size}, Dtype::F16),
+          g_q_norm({options.head_dim}, Dtype::F16), g_k_norm({options.head_dim}, Dtype::F16),
           g_v({options.num_kv_heads * options.head_dim, options.hidden_size}, Dtype::F16),
           g_o({options.hidden_size, options.hidden_size}, Dtype::F16), g_ffn_norm({options.hidden_size}, Dtype::F16),
           g_gate({options.intermediate_size, options.hidden_size}, Dtype::F16), g_up({options.intermediate_size, options.hidden_size}, Dtype::F16),
@@ -110,15 +125,15 @@ struct ModelStorage {
     std::vector<TransformerBlockGradients> gradient_layers;
 
     explicit ModelStorage(std::size_t vocab)
-        : options{vocab, 2, {256, 768, 4, 4, 64, 64, 1.0e-5F, true, {ComputeType::F32}}},
+        : options{vocab, 2, {256, 768, 4, 1, 64, 64, 1.0e-5F, true, {ComputeType::F32}}},
           embedding({vocab, 256}, Dtype::F16), final_norm({256}, Dtype::F16), lm_head({vocab, 256}, Dtype::F16),
           g_embedding({vocab, 256}, Dtype::F16), g_final_norm({256}, Dtype::F16), g_lm_head({vocab, 256}, Dtype::F16) {
         layers.reserve(options.num_layers);
         for (std::size_t i = 0; i < options.num_layers; ++i) layers.emplace_back(options.block_options);
         for (auto& layer : layers) {
-            weight_layers.push_back({layer.attention_norm, layer.q, layer.k, layer.v, layer.o, layer.ffn_norm, layer.gate, layer.up, layer.down});
-            mutable_layers.push_back({layer.attention_norm, layer.q, layer.k, layer.v, layer.o, layer.ffn_norm, layer.gate, layer.up, layer.down});
-            gradient_layers.push_back({layer.g_attention_norm, layer.g_q, layer.g_k, layer.g_v, layer.g_o, layer.g_ffn_norm, layer.g_gate, layer.g_up, layer.g_down});
+            weight_layers.push_back({layer.attention_norm, layer.q, layer.k, layer.q_norm, layer.k_norm, layer.v, layer.o, layer.ffn_norm, layer.gate, layer.up, layer.down});
+            mutable_layers.push_back({layer.attention_norm, layer.q, layer.k, layer.q_norm, layer.k_norm, layer.v, layer.o, layer.ffn_norm, layer.gate, layer.up, layer.down});
+            gradient_layers.push_back({layer.g_attention_norm, layer.g_q, layer.g_k, layer.g_q_norm, layer.g_k_norm, layer.g_v, layer.g_o, layer.g_ffn_norm, layer.g_gate, layer.g_up, layer.g_down});
         }
         initialize_transformer_weights({embedding, mutable_layers, final_norm, lm_head}, options);
     }
@@ -128,7 +143,7 @@ struct ModelStorage {
 
 void append_parameters(ModelStorage& model, std::vector<std::pair<Tensor*, Tensor*>>& result) {
     result.clear();
-    result.reserve(3 + model.layers.size() * 9);
+    result.reserve(3 + model.layers.size() * 11);
     result.emplace_back(&model.embedding, &model.g_embedding);
     result.emplace_back(&model.final_norm, &model.g_final_norm);
     result.emplace_back(&model.lm_head, &model.g_lm_head);
@@ -136,6 +151,8 @@ void append_parameters(ModelStorage& model, std::vector<std::pair<Tensor*, Tenso
         result.emplace_back(&l.attention_norm, &l.g_attention_norm);
         result.emplace_back(&l.q, &l.g_q);
         result.emplace_back(&l.k, &l.g_k);
+        result.emplace_back(&l.q_norm, &l.g_q_norm);
+        result.emplace_back(&l.k_norm, &l.g_k_norm);
         result.emplace_back(&l.v, &l.g_v);
         result.emplace_back(&l.o, &l.g_o);
         result.emplace_back(&l.ffn_norm, &l.g_ffn_norm);
@@ -196,9 +213,27 @@ int main(int argc, char** argv) {
         tokenization_bar.update(text.size()); tokenization_bar.finish();
         std::cout << "Vocabulary: " << tokenizer.vocab_size() << ", tokens: " << tokens.size() << '\n';
 
+        if (args.batch_size > (std::numeric_limits<std::size_t>::max() - 1) / args.sequence_length)
+            throw std::overflow_error("Batch token count overflows size_t");
+        const std::size_t minimum_split_tokens = args.batch_size * args.sequence_length + 1;
+        if (minimum_split_tokens > tokens.size() / 2)
+            throw std::runtime_error("Not enough tokens for one training and validation batch");
+        const std::size_t requested_validation_tokens = static_cast<std::size_t>(
+            static_cast<double>(tokens.size()) * args.validation_fraction);
+        const std::size_t validation_tokens = std::clamp(
+            requested_validation_tokens, minimum_split_tokens, tokens.size() - minimum_split_tokens);
+        const auto split = tokens.begin() + static_cast<std::ptrdiff_t>(tokens.size() - validation_tokens);
+        std::vector<bpe::TokenId> training_tokens(tokens.begin(), split);
+        std::vector<bpe::TokenId> validation_tokens_data(split, tokens.end());
+
         data::DataLoaderConfig loader_config{args.batch_size, args.sequence_length, true, true, 42};
-        data::DatasetLoader loader(std::make_shared<const data::TokenDataset>(tokens), loader_config);
-        if (loader.batch_count() == 0) throw std::runtime_error("Not enough tokens for one batch");
+        data::DatasetLoader loader(
+            std::make_shared<const data::TokenDataset>(std::move(training_tokens)), loader_config);
+        data::DataLoaderConfig validation_loader_config{args.batch_size, args.sequence_length, false, true, 42};
+        data::DatasetLoader validation_loader(
+            std::make_shared<const data::TokenDataset>(std::move(validation_tokens_data)), validation_loader_config);
+        if (loader.batch_count() == 0 || validation_loader.batch_count() == 0)
+            throw std::runtime_error("Not enough tokens for one training and validation batch");
         const std::size_t total_steps = args.max_steps ? std::min(args.max_steps, loader.batch_count() * args.epochs) : loader.batch_count() * args.epochs;
         ModelStorage model(tokenizer.vocab_size());
         auto [cos_cache, sin_cache] = rotary_cache(args.sequence_length, model.options.block_options.rotary_dim);
@@ -209,7 +244,10 @@ int main(int argc, char** argv) {
         // avoids materializing/converting a second F32 model copy.
         Tensor logits({args.batch_size * args.sequence_length, tokenizer.vocab_size()}, Dtype::F16);
         Tensor loss({1}, Dtype::F32), grad_logits({args.batch_size * args.sequence_length, tokenizer.vocab_size()}, Dtype::F16);
+        Tensor validation_logits({args.batch_size * args.sequence_length, tokenizer.vocab_size()}, Dtype::F16);
+        Tensor validation_loss({1}, Dtype::F32);
         data::DeviceBatch device_batch;
+        data::DeviceBatch validation_device_batch;
         std::vector<std::pair<Tensor*, Tensor*>> parameters; append_parameters(model, parameters);
         std::vector<AdamWState> optimizer; for (const auto& [parameter, gradient] : parameters) optimizer.push_back(AdamWState::for_parameter(*parameter));
         std::vector<AdamWBatchEntry> optimizer_entries;
@@ -233,6 +271,39 @@ int main(int argc, char** argv) {
         double loss_sum = 0.0;
         std::size_t loss_count = 0;
         std::vector<float> host_loss(1);
+        std::vector<float> host_validation_loss(1);
+        std::optional<double> last_validation_loss;
+        std::optional<double> last_average_loss;
+        const auto update_training_metrics = [&] {
+            std::string suffix = " | avg_loss=";
+            suffix += last_average_loss ? std::to_string(*last_average_loss) : "n/a";
+            suffix += " | validation_loss=";
+            suffix += last_validation_loss ? std::to_string(*last_validation_loss) : "n/a";
+            progress.set_suffix(std::move(suffix));
+        };
+        const auto run_validation = [&] {
+            validation_loader.reset();
+            double validation_loss_sum = 0.0;
+            std::size_t validation_loss_count = 0;
+            data::Batch validation_batch;
+            while (validation_loss_count < args.validation_batches && validation_loader.next(validation_batch)) {
+                data::upload_batch(validation_batch, validation_device_batch, cuda_stream);
+                transformer_model_forward(validation_logits,
+                    static_cast<const bpe::TokenId*>(validation_device_batch.input_ids.data()), args.batch_size,
+                    args.sequence_length, model.weights(), forward_workspace, cos_cache, sin_cache, cublas,
+                    cuda_stream, model.options);
+                cross_entropy_forward(validation_loss, validation_logits,
+                    static_cast<const bpe::TokenId*>(validation_device_batch.target_ids.data()),
+                    validation_batch.token_count(), cuda_stream);
+                CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+                validation_loss.copy_to_host(host_validation_loss);
+                validation_loss_sum += host_validation_loss[0];
+                ++validation_loss_count;
+            }
+            last_validation_loss = validation_loss_sum / static_cast<double>(validation_loss_count);
+            update_training_metrics();
+        };
+        update_training_metrics();
 
         // All batches have the configured fixed shape (drop_last=true).  Allocate
         // the device buffers and tune cuBLASLt plans before capture, so graph
@@ -267,10 +338,13 @@ int main(int argc, char** argv) {
                 if (step % 50 == 0 || step == total_steps) {
                     if (!adamw_check(optimizer_workspace, cuda_stream))
                         throw std::runtime_error("Non-finite gradient at step " + std::to_string(step));
-                    std::cout << " avg_loss=" << (loss_sum / static_cast<double>(loss_count)) << std::flush;
+                    last_average_loss = loss_sum / static_cast<double>(loss_count);
                     loss_sum = 0.0;
                     loss_count = 0;
+                    update_training_metrics();
                 }
+                if (step % args.validation_interval == 0 || step == total_steps)
+                    run_validation();
                 if (step < total_steps) {
                     host_batch_index ^= 1U;
                     if (!loader.next(host_batches[host_batch_index])) break;

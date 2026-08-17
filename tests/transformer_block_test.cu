@@ -112,6 +112,9 @@ std::vector<float> reference_forward(const std::vector<float>& input,
     auto query = linear(norm, q_weight, rows, kHidden, kHidden);
     auto key = linear(norm, k_weight, rows, kHidden, kHeadDim);
     const auto value = linear(norm, v_weight, rows, kHidden, kHeadDim);
+    const std::vector<float> head_norm(kHeadDim, 1.0F);
+    query = rmsnorm(query, head_norm, rows * kQueryHeads, kHeadDim);
+    key = rmsnorm(key, head_norm, rows * kKvHeads, kHeadDim);
     if (rotate_rope) {
         rotate_second_position(query, kQueryHeads, kHeadDim);
         rotate_second_position(key, kKvHeads, kHeadDim);
@@ -170,6 +173,8 @@ struct BlockFixture {
     Tensor attention_norm{{kHidden}, Dtype::F16};
     Tensor q{{kHidden, kHidden}, Dtype::F16};
     Tensor k{{kHeadDim, kHidden}, Dtype::F16};
+    Tensor q_norm{{kHeadDim}, Dtype::F16};
+    Tensor k_norm{{kHeadDim}, Dtype::F16};
     Tensor v{{kHeadDim, kHidden}, Dtype::F16};
     Tensor o{{kHidden, kHidden}, Dtype::F16};
     Tensor ffn_norm{{kHidden}, Dtype::F16};
@@ -182,6 +187,8 @@ struct BlockFixture {
         Tensor{{kBatch * kSequence, kHidden}, Dtype::F16},
         Tensor{{kBatch, kSequence, kQueryHeads, kHeadDim}, Dtype::F16},
         Tensor{{kBatch, kSequence, kKvHeads, kHeadDim}, Dtype::F16},
+        Tensor{{kBatch, kSequence, kKvHeads, kHeadDim}, Dtype::F16},
+        Tensor{{kBatch, kSequence, kQueryHeads, kHeadDim}, Dtype::F16},
         Tensor{{kBatch, kSequence, kKvHeads, kHeadDim}, Dtype::F16},
         Tensor{{kBatch, kSequence, kQueryHeads, kHeadDim}, Dtype::F16},
         Tensor{{kBatch, kSequence, kQueryHeads}, Dtype::F32},
@@ -199,12 +206,14 @@ struct BlockFixture {
         v.copy_from_host(make_values(v.numel(), 0.4F)); o.copy_from_host(make_values(o.numel(), 0.5F));
         gate.copy_from_host(make_values(gate.numel(), 0.6F)); up.copy_from_host(make_values(up.numel(), 0.7F));
         down.copy_from_host(make_values(down.numel(), 0.8F));
+        q_norm.copy_from_host(std::vector<float>(q_norm.numel(), 1.0F));
+        k_norm.copy_from_host(std::vector<float>(k_norm.numel(), 1.0F));
         cos_cache.copy_from_host(std::vector<float>(cos_cache.numel(), 1.0F));
         sin_cache.copy_from_host(std::vector<float>(sin_cache.numel(), 0.0F));
     }
 
     TransformerBlockWeights weights() const {
-        return {attention_norm, q, k, v, o, ffn_norm, gate, up, down};
+        return {attention_norm, q, k, q_norm, k_norm, v, o, ffn_norm, gate, up, down};
     }
 };
 
@@ -330,8 +339,11 @@ void benchmark_kernel() {
     TransformerBlockOptions options{hidden, intermediate, query_heads, kv_heads, head_dim, head_dim, kEpsilon, true, {ComputeType::F32}};
     Tensor input({batch * sequence, hidden}, Dtype::F16), output({batch * sequence, hidden}, Dtype::F16);
     Tensor norm({hidden}, Dtype::F16), q({hidden, hidden}, Dtype::F16), k({kv_heads * head_dim, hidden}, Dtype::F16), v({kv_heads * head_dim, hidden}, Dtype::F16), o({hidden, hidden}, Dtype::F16), gate({intermediate, hidden}, Dtype::F16), up({intermediate, hidden}, Dtype::F16), down({hidden, intermediate}, Dtype::F16), cos({sequence, head_dim / 2}, Dtype::F16), sin({sequence, head_dim / 2}, Dtype::F16);
-    TransformerBlockWeights weights{norm, q, k, v, o, norm, gate, up, down};
-    TransformerBlockWorkspace workspace{Tensor({batch * sequence, hidden}, Dtype::F16), Tensor({batch, sequence, query_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, kv_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, kv_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, query_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, query_heads}, Dtype::F32), Tensor({batch * sequence, hidden}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, hidden}, Dtype::F16)};
+    Tensor q_norm({head_dim}, Dtype::F16), k_norm({head_dim}, Dtype::F16);
+    q_norm.copy_from_host(std::vector<float>(head_dim, 1.0F));
+    k_norm.copy_from_host(std::vector<float>(head_dim, 1.0F));
+    TransformerBlockWeights weights{norm, q, k, q_norm, k_norm, v, o, norm, gate, up, down};
+    TransformerBlockWorkspace workspace{Tensor({batch * sequence, hidden}, Dtype::F16), Tensor({batch, sequence, query_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, kv_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, kv_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, query_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, kv_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, query_heads, head_dim}, Dtype::F16), Tensor({batch, sequence, query_heads}, Dtype::F32), Tensor({batch * sequence, hidden}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, intermediate}, Dtype::F16), Tensor({batch * sequence, hidden}, Dtype::F16)};
     const CublasLtContext context;
     test::benchmark_cuda_launches("Transformer block", [&](cudaStream_t stream) { transformer_block_forward(output, input, weights, workspace, cos, sin, context, stream, options); });
 }

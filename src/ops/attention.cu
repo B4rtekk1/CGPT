@@ -29,6 +29,7 @@
 #include "ops/attention.h"
 
 #include "core/cuda_check.h"
+#include "core/cuda_autotune.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1042,19 +1043,25 @@ void launch_tiled_f16_dispatch(
     const FlashAttentionOptions& options,
     cudaStream_t stream
 ) {
+    const bool use_large_tile = cuda_autotune::attention_block_m() == 64;
     switch (options.head_dim) {
         case 32:
-            // Smaller BlockM improves occupancy on RTX 3050-class GPUs.
-            launch_tiled_f16<32, 32>(
-                output, logsumexp, query, key, value,
-                batch_size, query_sequence, key_value_sequence,
-                scale, options, stream);
+            if (use_large_tile) {
+                launch_tiled_f16<32, 64>(output, logsumexp, query, key, value,
+                    batch_size, query_sequence, key_value_sequence, scale, options, stream);
+            } else {
+                launch_tiled_f16<32, 32>(output, logsumexp, query, key, value,
+                    batch_size, query_sequence, key_value_sequence, scale, options, stream);
+            }
             break;
         case 64:
-            launch_tiled_f16<64, 32>(
-                output, logsumexp, query, key, value,
-                batch_size, query_sequence, key_value_sequence,
-                scale, options, stream);
+            if (use_large_tile) {
+                launch_tiled_f16<64, 64>(output, logsumexp, query, key, value,
+                    batch_size, query_sequence, key_value_sequence, scale, options, stream);
+            } else {
+                launch_tiled_f16<64, 32>(output, logsumexp, query, key, value,
+                    batch_size, query_sequence, key_value_sequence, scale, options, stream);
+            }
             break;
         case 128:
             if (options.num_query_heads / options.num_kv_heads == 4U) {
@@ -1065,10 +1072,13 @@ void launch_tiled_f16_dispatch(
                     batch_size, query_sequence, key_value_sequence,
                     scale, options, stream);
             } else {
-                launch_tiled_f16<128, 32>(
-                    output, logsumexp, query, key, value,
-                    batch_size, query_sequence, key_value_sequence,
-                    scale, options, stream);
+                if (use_large_tile) {
+                    launch_tiled_f16<128, 64>(output, logsumexp, query, key, value,
+                        batch_size, query_sequence, key_value_sequence, scale, options, stream);
+                } else {
+                    launch_tiled_f16<128, 32>(output, logsumexp, query, key, value,
+                        batch_size, query_sequence, key_value_sequence, scale, options, stream);
+                }
             }
             break;
         default:

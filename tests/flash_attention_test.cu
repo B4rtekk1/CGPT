@@ -372,13 +372,18 @@ void test_backward() {
     options.attention_scale = 0.23F;
     run_backward_case(2, 3, 5, options);
 
-    // Exercises the CTA-cooperative 4:1 GQA/head_dim=128 specialization.
+    // Exercises the CTA-cooperative 4:1 GQA/head_dim=64 specialization used
+    // by the training model.
     options.num_query_heads = 4;
     options.num_kv_heads = 1;
-    options.head_dim = 128;
+    options.head_dim = 64;
     options.causal = true;
     options.query_position_offset = 32;
     options.attention_scale = 0.11F;
+    run_backward_case(1, 3, 35, options);
+
+    // Keep coverage for the original 128-wide grouped specialization.
+    options.head_dim = 128;
     run_backward_case(1, 3, 35, options);
 }
 

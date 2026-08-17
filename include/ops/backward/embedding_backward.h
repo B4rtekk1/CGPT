@@ -4,8 +4,9 @@
 
 /** @brief Kernel configuration for embedding-table backpropagation. */
 struct EmbeddingBackwardOptions {
-    /** @brief CUDA thread-block size. */
-    int block_size = 128;
+    /** @brief CUDA thread-block size; zero selects it automatically. */
+    /** Set to zero to select a device- and shape-aware launch configuration. */
+    int block_size = 0;
     /** @brief Enables validation of token IDs against the vocabulary size. */
     bool bounds_check = true;
     /** @brief Adds to existing weight gradients instead of overwriting them. */

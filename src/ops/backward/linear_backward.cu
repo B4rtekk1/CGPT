@@ -1,5 +1,5 @@
 /**
- * @file linear_backward.cu
+ * @file linear_backward(2).cu
  * @brief Cached cuBLASLt implementation of the row-major linear backward pass.
  *
  * For Y = X W^T + b this computes dX = dY W, dW = dY^T X and db = sum(dY).
@@ -21,10 +21,12 @@
 
 namespace {
 
+/** @brief Returns a readable name for a tensor device type. */
 const char* device_type_name(const DeviceType type) {
     return type == DeviceType::CUDA ? "CUDA" : "CPU";
 }
 
+/** @brief Ensures that two tensors are placed on the same device. */
 void require_same_device(const Tensor& left, const Tensor& right) {
     if (left.device_type() != right.device_type()) {
         throw std::invalid_argument("linear_backward: tensors must be on the same device, got " +
@@ -39,6 +41,7 @@ void set_row_major(cublasLtMatrixLayout_t layout) {
 }
 
 struct MatmulKey {
+    /** @brief Equality key for cached cuBLASLt matmul plans. */
     std::uintptr_t handle;
     std::uintptr_t stream;
     std::size_t rows, columns, inner, workspace_bytes;
@@ -50,6 +53,7 @@ struct MatmulKey {
 };
 
 struct MatmulKeyHash {
+    /** @brief Hashes all properties that affect a cuBLASLt plan. */
     std::size_t operator()(const MatmulKey& key) const noexcept {
         std::size_t seed = 0;
         const auto combine = [&seed](const std::size_t value) {
@@ -66,6 +70,11 @@ struct MatmulKeyHash {
 
 class MatmulPlan {
 public:
+    /**
+     * @brief Creates a row-major cuBLASLt matrix multiplication plan.
+     * @param handle cuBLASLt handle used for heuristic selection.
+     * @param key Shape, dtype, transpose, stream, and workspace configuration.
+     */
     MatmulPlan(cublasLtHandle_t handle, const MatmulKey& key) {
         const bool tf32 = key.dtype == Dtype::F32 && key.compute_type == ComputeType::TF32 &&
                           key.rows >= 8 && key.columns >= 8 && key.inner >= 8;
@@ -104,6 +113,7 @@ public:
         }
     }
 
+    /** @brief Releases cuBLASLt descriptors owned by the plan. */
     ~MatmulPlan() {
         if (output_layout_) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(output_layout_));
         if (right_layout_) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(right_layout_));
@@ -113,6 +123,15 @@ public:
     MatmulPlan(const MatmulPlan&) = delete;
     MatmulPlan& operator=(const MatmulPlan&) = delete;
 
+    /**
+     * @brief Executes the cached matrix multiplication.
+     * @param handle cuBLASLt handle.
+     * @param output Destination tensor.
+     * @param left Left matrix operand.
+     * @param right Right matrix operand.
+     * @param accumulate Whether to add to the existing output.
+     * @param stream CUDA stream for the operation.
+     */
     void execute(cublasLtHandle_t handle, Tensor& output, const Tensor& left, const Tensor& right,
                  const bool accumulate, cudaStream_t stream) {
         constexpr float alpha = 1.0f;
@@ -136,6 +155,7 @@ private:
     bool has_algorithm_ = false;
 };
 
+/** @brief Retrieves or creates a thread-local cached cuBLASLt plan. */
 MatmulPlan& cached_plan(cublasLtHandle_t handle, const MatmulKey& key) {
     thread_local std::unordered_map<MatmulKey, std::unique_ptr<MatmulPlan>, MatmulKeyHash> plans;
     if (const auto found = plans.find(key); found != plans.end()) return *found->second;
@@ -147,12 +167,17 @@ MatmulPlan& cached_plan(cublasLtHandle_t handle, const MatmulKey& key) {
     return result;
 }
 
+/** @brief Performs a warp-wide sum reduction for bias computation. */
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_down_sync(0xffffffff, value, offset);
     return value;
 }
 
+/**
+ * @brief Reduces output gradients across rows to compute a bias gradient.
+ * @tparam T Bias and output-gradient storage type.
+ */
 template <typename T>
 __global__ void reduce_bias_kernel(T* __restrict__ grad_bias, const T* __restrict__ grad_output,
                                    std::size_t rows, std::size_t columns, bool accumulate) {
@@ -174,6 +199,7 @@ __global__ void reduce_bias_kernel(T* __restrict__ grad_bias, const T* __restric
     }
 }
 
+/** @brief Dispatches the typed CUDA bias-reduction kernel. */
 void launch_bias_reduction(Tensor& grad_bias, const Tensor& grad_output, std::size_t rows,
                            bool accumulate, cudaStream_t stream) {
     constexpr unsigned threads = 256;
@@ -190,6 +216,10 @@ void launch_bias_reduction(Tensor& grad_bias, const Tensor& grad_output, std::si
     CUDA_CHECK(cudaGetLastError());
 }
 
+/**
+ * @brief Validates linear backward tensor shapes, devices, dtypes, and options.
+ * @throws std::invalid_argument If any tensor or compute option is invalid.
+ */
 void validate_linear_backward(const Tensor& grad_input, const Tensor& grad_weight, const Tensor& grad_bias,
                               const Tensor& grad_output, const Tensor& input, const Tensor& weight,
                               const LinearBackwardOptions& options) {
@@ -217,6 +247,24 @@ void validate_linear_backward(const Tensor& grad_input, const Tensor& grad_weigh
 
 } // namespace
 
+/**
+ * @brief Computes gradients for a row-major linear layer.
+ *
+ * For `Y = X W^T + b`, computes `dX = dY W`, `dW = dY^T X`, and
+ * `db = sum(dY)`. Matrix products use cached cuBLASLt plans and the bias
+ * gradient uses a dedicated CUDA reduction kernel.
+ *
+ * @param[out] grad_input Gradient with respect to the input.
+ * @param[out] grad_weight Gradient with respect to the weight matrix.
+ * @param[out] grad_bias Gradient with respect to the bias vector.
+ * @param[in] grad_output Output gradient, flattened internally to rows.
+ * @param[in] input Input tensor whose final dimension is `in_features`.
+ * @param[in] weight Weight matrix with shape [out_features, in_features].
+ * @param[in] context cuBLASLt context and CUDA device information.
+ * @param stream CUDA stream used for all operations.
+ * @param options Compute type, workspace size, and accumulation flags.
+ * @throws std::invalid_argument If tensors or options are invalid.
+ */
 void linear_backward(Tensor& grad_input, Tensor& grad_weight, Tensor& grad_bias, const Tensor& grad_output,
                      const Tensor& input, const Tensor& weight, const CublasLtContext& context,
                      cudaStream_t stream, const LinearBackwardOptions& options) {

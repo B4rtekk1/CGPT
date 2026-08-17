@@ -5,23 +5,25 @@ include(CTest)
 enable_testing()
 find_package(CUDAToolkit REQUIRED)
 
-# CUDA::cupti is a dynamic library on Windows. Keep its runtime DLL next to
-# every test executable so the run_all child processes do not depend on PATH.
-file(GLOB CGPT_CUPTI_RUNTIME_DLLS
-        "${CUDAToolkit_CUPTI_INCLUDE_DIR}/../lib64/cupti64_*.dll")
-if (NOT CGPT_CUPTI_RUNTIME_DLLS)
-    message(FATAL_ERROR "Could not locate the CUPTI runtime DLL")
+# On Windows, keep CUPTI's runtime DLL next to the test executables. Linux
+# loads libcupti.so through the CUDA toolkit/loader and needs no copy step.
+if (WIN32)
+    file(GLOB CGPT_CUPTI_RUNTIME_DLLS
+            "${CUDAToolkit_CUPTI_INCLUDE_DIR}/../lib64/cupti64_*.dll")
+    if (NOT CGPT_CUPTI_RUNTIME_DLLS)
+        message(FATAL_ERROR "Could not locate the CUPTI runtime DLL")
+    endif()
+    list(GET CGPT_CUPTI_RUNTIME_DLLS 0 CGPT_CUPTI_RUNTIME_DLL)
 endif()
-list(GET CGPT_CUPTI_RUNTIME_DLLS 0 CGPT_CUPTI_RUNTIME_DLL)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-# This project is profiled and deployed on the local RTX 3050 Laptop GPU
-# (Ampere, SM86).  FORCE prevents an old build-directory cache from silently
-# compiling SM75 PTX, which disables Ampere-specific code generation.
-set(CMAKE_CUDA_ARCHITECTURES 86-real CACHE STRING "CUDA architectures" FORCE)
+# Keep native cubins for the original Ampere target and Hopper/H100.  The
+# runtime launch heuristic selects suitable block geometry for the detected
+# device; compiling both targets keeps that selection free of JIT surprises.
+set(CMAKE_CUDA_ARCHITECTURES "86-real;90a-real" CACHE STRING "CUDA architectures")
 
 set(CGPT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -85,9 +87,11 @@ endif()
 function(add_cgpt_test name source dependency)
     add_executable(${name} ${source} tests/cuda_kernel_profiler.cpp)
     target_link_libraries(${name} PRIVATE ${dependency} CUDA::cudart CUDA::cupti)
-    add_custom_command(TARGET ${name} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${CGPT_CUPTI_RUNTIME_DLL}" $<TARGET_FILE_DIR:${name}>)
+    if (WIN32)
+        add_custom_command(TARGET ${name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${CGPT_CUPTI_RUNTIME_DLL}" $<TARGET_FILE_DIR:${name}>)
+    endif()
     add_test(NAME ${name} COMMAND ${name})
     set_target_properties(${name} PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
@@ -122,10 +126,15 @@ add_dependencies(run_all_tests
         rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test
         flash_attention_test embedding_test cross_entropy_test cut_cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test
         dataset_loader_test bpe_tokenizer_test bpe_tokenizer_100mb_test)
-add_custom_target(run_all
+if (WIN32)
+    add_custom_target(run_all
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CGPT_CUPTI_RUNTIME_DLL}" $<TARGET_FILE_DIR:run_all_tests>
-        COMMAND $<TARGET_FILE:run_all_tests>
+                "${CGPT_CUPTI_RUNTIME_DLL}" $<TARGET_FILE_DIR:run_all_tests>)
+else()
+    add_custom_target(run_all)
+endif()
+
+set(CGPT_RUN_ALL_ARGUMENTS
                 rmsnorm_test $<TARGET_FILE:rmsnorm_test>
                 linear_test $<TARGET_FILE:linear_test>
                 linear_backward_test $<TARGET_FILE:linear_backward_test>
@@ -147,12 +156,24 @@ add_custom_target(run_all
                 adamw_test $<TARGET_FILE:adamw_test>
                 dataset_loader_test $<TARGET_FILE:dataset_loader_test>
                 bpe_tokenizer_test $<TARGET_FILE:bpe_tokenizer_test>
-                bpe_tokenizer_100mb_test $<TARGET_FILE:bpe_tokenizer_100mb_test>
-        DEPENDS run_all_tests
-        USES_TERMINAL
-        VERBATIM
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-        COMMENT "Running all tests and printing the benchmark summary")
+        bpe_tokenizer_100mb_test $<TARGET_FILE:bpe_tokenizer_100mb_test>)
+set_property(TARGET run_all APPEND PROPERTY COMMAND
+        $<TARGET_FILE:run_all_tests> ${CGPT_RUN_ALL_ARGUMENTS})
+add_dependencies(run_all run_all_tests)
+set_property(TARGET run_all PROPERTY USES_TERMINAL TRUE)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    add_custom_target(profile_kernels
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/profile_kernels.py
+                    --build-dir ${CMAKE_BINARY_DIR}
+                    --output ${CMAKE_CURRENT_SOURCE_DIR}/kernel_profile.md
+            DEPENDS run_all_tests
+            USES_TERMINAL
+            VERBATIM
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            COMMENT "Running cross-platform CUDA kernel profiler")
+endif()
 
 set_tests_properties(
         rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test dataset_loader_test bpe_tokenizer_test

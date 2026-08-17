@@ -28,6 +28,13 @@ public:
      * @param amount Number of work units completed since the last update.
      */
     void increment(std::size_t amount = 1);
+    /**
+     * @brief Sets text rendered after the progress information.
+     *
+     * The text is retained on every redraw, which makes it suitable for
+     * continuously visible metrics such as training and validation loss.
+     */
+    void set_suffix(std::string suffix);
     /** @brief Marks the operation as complete and renders the final state. */
     void finish();
 
@@ -39,6 +46,7 @@ private:
     std::string label_;
     double speed_divisor_;
     std::string speed_unit_;
+    std::string suffix_;
     std::chrono::steady_clock::time_point start_;
     std::chrono::steady_clock::time_point last_draw_;
 };

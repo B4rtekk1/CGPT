@@ -1,7 +1,15 @@
-/** @file embedding_backward.cu @brief CUDA backward pass for embedding lookup. */
+/**
+ * @file embedding_backward.cu
+ * @brief CUDA backward pass for embedding lookup.
+ *
+ * Gradients are accumulated into the embedding table with atomic additions,
+ * allowing repeated token IDs in a batch. FP16 and BF16 use packed two-value
+ * kernels when alignment and hidden-size requirements permit.
+ */
 
 #include "ops/backward/embedding_backward.h"
 #include "core/cuda_check.h"
+#include "core/cuda_autotune.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -13,14 +21,21 @@
 namespace {
     constexpr int kWarpSize = 32;
 
+    /** @brief Checks whether a block size is a supported warp-aligned value. */
     [[nodiscard]] bool valid_block_size(const int block_size) noexcept {
         return block_size >= kWarpSize && block_size <= 1024 && block_size % kWarpSize == 0;
     }
 
+    /** @brief Checks whether a pointer satisfies the requested byte alignment. */
     [[nodiscard]] bool aligned_to(const void *pointer, const std::uintptr_t alignment) noexcept {
         return reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
     }
 
+    /**
+     * @brief Accumulates embedding gradients using scalar elements.
+     * @tparam T Element type.
+     * @tparam BoundsCheck Whether token IDs are checked against vocabulary size.
+     */
     template<typename T, bool BoundsCheck>
     __global__ void embedding_backward_kernel(
         T * __restrict__ grad_weight,
@@ -45,6 +60,11 @@ namespace {
         }
     }
 
+    /**
+     * @brief Accumulates embedding gradients using packed two-element values.
+     * @tparam PackedT Packed FP16 or BF16 type.
+     * @tparam BoundsCheck Whether token IDs are checked against vocabulary size.
+     */
     template<typename PackedT, bool BoundsCheck>
     __global__ void embedding_backward_packed_kernel(
         PackedT * __restrict__ grad_weight,
@@ -71,6 +91,11 @@ namespace {
         }
     }
 
+    /**
+     * @brief Validates embedding gradients, token metadata, and launch options.
+     * @throws std::invalid_argument If tensors, dimensions, token IDs, or block
+     *         configuration are invalid.
+     */
     void validate_inputs(
         const Tensor &grad_weight,
         const Tensor &grad_output,
@@ -84,7 +109,7 @@ namespace {
         if (token_count == 0) {
             throw std::invalid_argument("embedding_backward: token_count must be positive");
         }
-        if (!valid_block_size(options.block_size)) {
+        if (options.block_size != 0 && !valid_block_size(options.block_size)) {
             throw std::invalid_argument(
                 "embedding_backward: block_size must be a multiple of 32 in [32, 1024]");
         }
@@ -115,6 +140,7 @@ namespace {
         }
     }
 
+    /** @brief Launches the scalar embedding backward kernel for type @p T. */
     template<typename T>
     void launch(
         Tensor &grad_weight, const Tensor &grad_output,
@@ -135,6 +161,7 @@ namespace {
         }
     }
 
+    /** @brief Launches the packed two-element embedding backward kernel. */
     template<typename PackedT>
     void launch_packed(
         Tensor &grad_weight, const Tensor &grad_output,
@@ -160,6 +187,23 @@ namespace {
     }
 }
 
+/**
+ * @brief Computes the gradient of an embedding lookup.
+ *
+ * For every token ID, the corresponding row in @p grad_output is atomically
+ * accumulated into @p grad_weight. This correctly handles repeated token IDs.
+ * Supported storage types are FP32, FP16, and BF16.
+ *
+ * @param[out] grad_weight Embedding-table gradient with shape
+ *        [vocabulary_size, hidden_size].
+ * @param[in] grad_output Token gradients; the last dimension must equal
+ *        @p hidden_size.
+ * @param[in] device_token_ids Device pointer to token IDs.
+ * @param token_count Number of token IDs and gradient rows.
+ * @param stream CUDA stream used for memset and kernel launch.
+ * @param options Block size, bounds-checking, and accumulation configuration.
+ * @throws std::invalid_argument If inputs or options are invalid.
+ */
 void embedding_backward(
     Tensor &grad_weight,
     const Tensor &grad_output,
@@ -169,6 +213,11 @@ void embedding_backward(
     const EmbeddingBackwardOptions &options
 ) {
     validate_inputs(grad_weight, grad_output, device_token_ids, token_count, options);
+    EmbeddingBackwardOptions launch_options = options;
+    if (launch_options.block_size == 0) {
+        launch_options.block_size = cuda_autotune::embedding_block_size(
+            token_count, grad_weight.size(1));
+    }
     if (!options.accumulate_weight) {
         CUDA_CHECK(cudaMemsetAsync(grad_weight.raw_data(), 0, grad_weight.nbytes(), stream));
     }
@@ -178,24 +227,24 @@ void embedding_backward(
         aligned_to(grad_output.raw_data(), alignof(std::uint32_t));
     switch (grad_weight.dtype()) {
         case Dtype::F32:
-            launch<float>(grad_weight, grad_output, device_token_ids, token_count, stream, options);
+            launch<float>(grad_weight, grad_output, device_token_ids, token_count, stream, launch_options);
             break;
         case Dtype::F16:
             if (can_pack) {
                 launch_packed<half2>(
-                    grad_weight, grad_output, device_token_ids, token_count, stream, options);
+                    grad_weight, grad_output, device_token_ids, token_count, stream, launch_options);
             } else {
                 launch<half>(
-                    grad_weight, grad_output, device_token_ids, token_count, stream, options);
+                    grad_weight, grad_output, device_token_ids, token_count, stream, launch_options);
             }
             break;
         case Dtype::BF16:
             if (can_pack) {
                 launch_packed<__nv_bfloat162>(
-                    grad_weight, grad_output, device_token_ids, token_count, stream, options);
+                    grad_weight, grad_output, device_token_ids, token_count, stream, launch_options);
             } else {
                 launch<__nv_bfloat16>(
-                    grad_weight, grad_output, device_token_ids, token_count, stream, options);
+                    grad_weight, grad_output, device_token_ids, token_count, stream, launch_options);
             }
             break;
         default:

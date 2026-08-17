@@ -31,6 +31,8 @@ struct MutableTransformerBlockWeights {
     Tensor& q_projection;
     /** @brief Key projection weights. */
     Tensor& k_projection;
+    Tensor& q_norm;
+    Tensor& k_norm;
     /** @brief Value projection weights. */
     Tensor& v_projection;
     /** @brief Attention output projection weights. */

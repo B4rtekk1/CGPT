@@ -1,5 +1,5 @@
 /**
- * @file flash_attention_backward.cu
+ * @file attention_backward.cu
  * @brief Memory-efficient CUDA backward pass for grouped-query attention.
  *
  * One warp owns one (batch, query position, query head) row, and a CTA handles
@@ -63,6 +63,7 @@ namespace {
     // The score and dP reductions always have exactly the same producer lanes.
     // Reducing them together gives the compiler two independent dependency chains
     // between shuffle instructions and removes a second shuffle-loop branch.
+    /** @brief Reduces two independent FP32 values across a warp. */
     __device__ __forceinline__ void warp_sum_pair(float &first, float &second) {
         for (int offset = 16; offset > 0; offset >>= 1) {
             first += __shfl_down_sync(0xffffffffU, first, offset);
@@ -72,6 +73,7 @@ namespace {
         second = __shfl_sync(0xffffffffU, second, 0);
     }
 
+    /** @brief Atomically adds an FP32 value converted to storage type @p T. */
     template<typename T>
     __device__ __forceinline__ void atomic_add(T *address, float value) {
         atomicAdd(address, static_cast<T>(value));
@@ -80,7 +82,18 @@ namespace {
     // HeadDim is a compile-time specialization for the overwhelmingly common
     // 32/64/128 cases.  It makes the per-lane register loops fixed-size, while 0
     // preserves the generic path for unusual head dimensions.
-    template<typename T, int HeadDim, bool GroupedFourDim128>
+    /**
+     * @brief Memory-efficient streaming GQA attention backward kernel.
+     *
+     * The kernel computes dQ, dK, and dV without materializing the attention
+     * probability matrix. It supports causal masking, grouped-query head
+     * sharing, and compile-time head-dimension specializations.
+     *
+     * @tparam T Input and gradient storage type.
+     * @tparam HeadDim Compile-time head dimension, or 0 for generic dispatch.
+     * @tparam GroupedFour Enables the optimized four-warp GQA path.
+     */
+    template<typename T, int HeadDim, bool GroupedFour>
     __launch_bounds__(kThreads)
     __global__ void attention_backward_kernel(
         T * __restrict__ grad_query, T * __restrict__ grad_key, T * __restrict__ grad_value,
@@ -129,21 +142,22 @@ namespace {
         float row_normalizer = 0.0f;
         float d_numerator = 0.0f; // unnormalized sum_j exp(score_j - row_max) * dP_j
 
-        if constexpr (GroupedFourDim128) {
+        if constexpr (GroupedFour) {
             // The four warps in the CTA are the four query heads which share one
             // K/V head. Stage this row's Q/dO into shared memory too, so the dK/dV
             // reduction later can read the other group members' rows without ever
             // touching global memory for Q/grad_output again.
             __shared__ float q_group[kWarpsPerBlock][128];
             __shared__ float do_group[kWarpsPerBlock][128];
+            constexpr int kOwnedDimensions = (HeadDim + kWarpSize - 1) / kWarpSize;
 #pragma unroll
-            for (int owned = 0; owned < kMaxOwnedDims; ++owned) {
+            for (int owned = 0; owned < kOwnedDimensions; ++owned) {
                 const int d = lane + owned * kWarpSize;
                 q_group[warp][d] = q_reg[owned];
                 do_group[warp][d] = do_reg[owned];
             }
             __syncthreads(); // Safe: qh/kh==4 forces row_count % 4 == 0, so no warp
-            // in a GroupedFourDim128 launch ever early-returns above.
+            // in a grouped four-head launch ever early-returns above.
 
             // Fused pass: online softmax stats AND the unnormalized softmax_dot
             // numerator, accumulated together using the same rescale-on-new-max
@@ -154,7 +168,7 @@ namespace {
                 float score_partial = 0.0f;
                 float d_probability_partial = 0.0f;
 #pragma unroll
-                for (int owned = 0; owned < kMaxOwnedDims; ++owned) {
+                for (int owned = 0; owned < kOwnedDimensions; ++owned) {
                     const int d = lane + owned * kWarpSize;
                     score_partial = fmaf(q_reg[owned], static_cast<float>(key[kv_base + d]), score_partial);
                     d_probability_partial = fmaf(do_reg[owned], static_cast<float>(value[kv_base + d]),
@@ -192,7 +206,7 @@ namespace {
                     float score_partial = 0.0f;
                     float d_probability_partial = 0.0f;
 #pragma unroll
-                    for (int owned = 0; owned < kMaxOwnedDims; ++owned) {
+                    for (int owned = 0; owned < kOwnedDimensions; ++owned) {
                         const int column = lane + owned * kWarpSize;
                         score_partial = fmaf(q_reg[owned], static_cast<float>(key[kv_base + column]), score_partial);
                         d_probability_partial = fmaf(do_reg[owned], static_cast<float>(value[kv_base + column]),
@@ -208,7 +222,7 @@ namespace {
                         d_scores[warp][offset] = d_score;
                     }
 #pragma unroll
-                    for (int owned = 0; owned < kMaxOwnedDims; ++owned) {
+                    for (int owned = 0; owned < kOwnedDimensions; ++owned) {
                         const int d = lane + owned * kWarpSize;
                         d_query[owned] = fmaf(d_score * scale,
                                               static_cast<float>(key[kv_base + d]), d_query[owned]);
@@ -217,21 +231,23 @@ namespace {
                 __syncthreads();
 
                 const int d = warp * kWarpSize + lane;
-                for (int offset = 0; offset < tile_size; ++offset) {
-                    const int k_pos = tile + offset;
-                    const std::size_t kv_base = kv_batch_base +
-                                                (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
-                    float d_key = 0.0f;
-                    float d_value = 0.0f;
+                if (d < dimensions) {
+                    for (int offset = 0; offset < tile_size; ++offset) {
+                        const int k_pos = tile + offset;
+                        const std::size_t kv_base = kv_batch_base +
+                                                    (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
+                        float d_key = 0.0f;
+                        float d_value = 0.0f;
 #pragma unroll
-                    for (int group_head = 0; group_head < kWarpsPerBlock; ++group_head) {
-                        d_key = fmaf(d_scores[group_head][offset] * scale,
-                                     q_group[group_head][d], d_key);
-                        d_value = fmaf(probabilities[group_head][offset],
-                                       do_group[group_head][d], d_value);
+                        for (int group_head = 0; group_head < kWarpsPerBlock; ++group_head) {
+                            d_key = fmaf(d_scores[group_head][offset] * scale,
+                                         q_group[group_head][d], d_key);
+                            d_value = fmaf(probabilities[group_head][offset],
+                                           do_group[group_head][d], d_value);
+                        }
+                        atomic_add(grad_key + kv_base + d, d_key);
+                        atomic_add(grad_value + kv_base + d, d_value);
                     }
-                    atomic_add(grad_key + kv_base + d, d_key);
-                    atomic_add(grad_value + kv_base + d, d_value);
                 }
                 __syncthreads();
             }
@@ -246,7 +262,7 @@ namespace {
             }
         } else {
             // A lane owns dimensions lane, lane+32, ... for the complete K/V stream.
-            // Fused pass: see the derivation above the GroupedFourDim128 branch.
+            // Fused pass: see the derivation above the grouped four-head branch.
             for (int k_pos = 0; k_pos < visible; ++k_pos) {
                 const std::size_t kv_base = kv_batch_base +
                                             (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
@@ -315,7 +331,17 @@ namespace {
     // Training fast path: the forward pass supplies LSE and O.  Thus
     // D_i = sum_d dO_id * O_id is computed once, and P_ij = exp(S_ij - LSE_i).
     // This removes the complete streaming statistics pass from the legacy kernel.
-    template<typename T, int HeadDim, bool GroupedFourDim128>
+    /**
+     * @brief Streaming attention backward kernel using forward LSE values.
+     *
+     * Reuses the supplied log-sum-exp tensor to reconstruct probabilities and
+     * therefore skips the forward softmax-statistics pass.
+     *
+     * @tparam T Input and gradient storage type.
+     * @tparam HeadDim Compile-time head dimension, or 0 for generic dispatch.
+     * @tparam GroupedFour Enables the optimized four-warp GQA path.
+     */
+    template<typename T, int HeadDim, bool GroupedFour>
     __launch_bounds__(kThreads)
     __global__ void attention_backward_lse_kernel(
         T * __restrict__ grad_query, T * __restrict__ grad_key, T * __restrict__ grad_value,
@@ -360,15 +386,16 @@ namespace {
         warp_sum_pair(d_output, ignored);
 
         float d_query[kMaxOwnedDims] = {};
-        if constexpr (GroupedFourDim128) {
+        if constexpr (GroupedFour) {
             // Keep the four GQA rows together.  This preserves the LSE fast path
             // while reducing four dK/dV atomics per element to one.
             __shared__ float q_group[kWarpsPerBlock][128];
             __shared__ float do_group[kWarpsPerBlock][128];
             __shared__ float probabilities[kWarpsPerBlock][32];
             __shared__ float d_scores[kWarpsPerBlock][32];
+            constexpr int kOwnedDimensions = (HeadDim + kWarpSize - 1) / kWarpSize;
 #pragma unroll
-            for (int owned_index = 0; owned_index < kMaxOwnedDims; ++owned_index) {
+            for (int owned_index = 0; owned_index < kOwnedDimensions; ++owned_index) {
                 const int d = lane + owned_index * kWarpSize;
                 q_group[warp][d] = q_reg[owned_index];
                 do_group[warp][d] = do_reg[owned_index];
@@ -385,7 +412,7 @@ namespace {
                     float score_partial = 0.0f;
                     float d_probability_partial = 0.0f;
 #pragma unroll
-                    for (int owned_index = 0; owned_index < kMaxOwnedDims; ++owned_index) {
+                    for (int owned_index = 0; owned_index < kOwnedDimensions; ++owned_index) {
                         const int d = lane + owned_index * kWarpSize;
                         score_partial = fmaf(q_reg[owned_index], static_cast<float>(key[kv_base + d]), score_partial);
                         d_probability_partial = fmaf(do_reg[owned_index], static_cast<float>(value[kv_base + d]),
@@ -399,7 +426,7 @@ namespace {
                         d_scores[warp][offset] = d_score;
                     }
 #pragma unroll
-                    for (int owned_index = 0; owned_index < kMaxOwnedDims; ++owned_index) {
+                    for (int owned_index = 0; owned_index < kOwnedDimensions; ++owned_index) {
                         const int d = lane + owned_index * kWarpSize;
                         d_query[owned_index] = fmaf(
                             d_score * scale, static_cast<float>(key[kv_base + d]), d_query[owned_index]);
@@ -408,21 +435,23 @@ namespace {
                 __syncthreads();
 
                 const int d = warp * kWarpSize + lane;
-                for (int offset = 0; offset < tile_size; ++offset) {
-                    const std::size_t kv_base = kv_batch_base +
-                                                (static_cast<std::size_t>(tile + offset) * kv_heads + kv_head) *
-                                                head_dim;
-                    float d_key = 0.0f;
-                    float d_value = 0.0f;
+                if (d < dimensions) {
+                    for (int offset = 0; offset < tile_size; ++offset) {
+                        const std::size_t kv_base = kv_batch_base +
+                                                    (static_cast<std::size_t>(tile + offset) * kv_heads + kv_head) *
+                                                    head_dim;
+                        float d_key = 0.0f;
+                        float d_value = 0.0f;
 #pragma unroll
-                    for (int group_head = 0; group_head < kWarpsPerBlock; ++group_head) {
-                        d_key = fmaf(d_scores[group_head][offset] * scale,
-                                     q_group[group_head][d], d_key);
-                        d_value = fmaf(probabilities[group_head][offset],
-                                       do_group[group_head][d], d_value);
+                        for (int group_head = 0; group_head < kWarpsPerBlock; ++group_head) {
+                            d_key = fmaf(d_scores[group_head][offset] * scale,
+                                         q_group[group_head][d], d_key);
+                            d_value = fmaf(probabilities[group_head][offset],
+                                           do_group[group_head][d], d_value);
+                        }
+                        atomic_add(grad_key + kv_base + d, d_key);
+                        atomic_add(grad_value + kv_base + d, d_value);
                     }
-                    atomic_add(grad_key + kv_base + d, d_key);
-                    atomic_add(grad_value + kv_base + d, d_value);
                 }
                 __syncthreads();
             }
@@ -461,6 +490,7 @@ namespace {
         }
     }
 
+    /** @brief Launches a specialized non-LSE attention backward kernel. */
     template<typename T, int HeadDim>
     void launch_attention_backward_specialized(
         T *grad_query, T *grad_key, T *grad_value, const T *grad_output,
@@ -470,7 +500,7 @@ namespace {
         cudaStream_t stream
     ) {
         const auto args = dim3(blocks);
-        if (qh / kh == kWarpsPerBlock && dim == 128) {
+        if (qh / kh == kWarpsPerBlock && (dim == 64 || dim == 128)) {
             attention_backward_kernel<T, HeadDim, true><<<args, kThreads, 0, stream>>>(
                 grad_query, grad_key, grad_value, grad_output, query, key, value,
                 batch, qs, ks, qh, kh, dim, scale, causal, query_position_offset,
@@ -483,6 +513,7 @@ namespace {
         }
     }
 
+    /** @brief Launches the generic non-LSE attention backward path. */
     template<typename T>
     void launch_attention_backward(
         T *grad_query, T *grad_key, T *grad_value, const T *grad_output,
@@ -519,6 +550,7 @@ namespace {
         }
     }
 
+    /** @brief Launches a specialized LSE-based attention backward kernel. */
     template<typename T, int HeadDim>
     void launch_attention_backward_lse_specialized(
         T *grad_query, T *grad_key, T *grad_value, const T *grad_output, const T *output,
@@ -526,7 +558,7 @@ namespace {
         int batch, int qs, int ks, int qh, int kh, int dim, float scale,
         bool causal, int query_position_offset, bool accumulate_grads, cudaStream_t stream
     ) {
-        if (qh / kh == kWarpsPerBlock && dim == 128) {
+        if (qh / kh == kWarpsPerBlock && (dim == 64 || dim == 128)) {
             attention_backward_lse_kernel<T, HeadDim, true><<<dim3(blocks), kThreads, 0, stream>>>(
                 grad_query, grad_key, grad_value, grad_output, output, logsumexp, query, key, value,
                 batch, qs, ks, qh, kh, dim, scale, causal, query_position_offset, accumulate_grads);
@@ -537,6 +569,7 @@ namespace {
         }
     }
 
+    /** @brief Launches the generic LSE-based attention backward path. */
     template<typename T>
     void launch_attention_backward_lse(
         T *grad_query, T *grad_key, T *grad_value, const T *grad_output, const T *output,
@@ -576,6 +609,7 @@ namespace {
     constexpr int kTcTile = 16;
 
     // Higher min-blocks-per-SM for better occupancy on laptop Ampere (16 SMs).
+    /** @brief FP16 WMMA kernel computing query gradients from saved LSE. */
     __global__ __launch_bounds__(32, 6)
     void attention_backward_lse_dq_wmma(
         __half * __restrict__ grad_query, const __half * __restrict__ grad_output,
@@ -693,6 +727,7 @@ namespace {
         }
     }
 
+    /** @brief FP16 WMMA kernel computing key and value gradients from saved LSE. */
     __global__ __launch_bounds__(32, 6)
     void attention_backward_lse_dkv_wmma(
         __half * __restrict__ grad_key, __half * __restrict__ grad_value, const __half * __restrict__ grad_output,
@@ -807,6 +842,7 @@ namespace {
         }
     }
 
+    /** @brief Launches the pair of FP16 WMMA LSE backward kernels. */
     void launch_attention_backward_lse_wmma(
         __half *gq, __half *gk, __half *gv, const __half *go, const __half *out, const float *lse,
         const __half *q, const __half *k, const __half *v, int batch, int qs, int ks, int qh, int kh,
@@ -820,6 +856,11 @@ namespace {
                                                                        kh, scale, causal, offset, accumulate);
     }
 
+    /**
+     * @brief Validates GQA attention tensors and configuration.
+     * @throws std::invalid_argument If shapes, dtypes, dimensions, scale, or
+     *         causal range are invalid.
+     */
     void validate(const Tensor &gq, const Tensor &gk, const Tensor &gv, const Tensor &go,
                   const Tensor &q, const Tensor &k, const Tensor &v, const FlashAttentionOptions &o) {
         const Tensor *tensors[] = {&gq, &gk, &gv, &go, &q, &k, &v};
@@ -848,6 +889,24 @@ namespace {
     }
 }
 
+/**
+ * @brief Computes streaming backward gradients for grouped-query attention.
+ *
+ * Computes dQ, dK, and dV using an online softmax backward pass without an
+ * O(query_length * key_length) attention-probability workspace.
+ *
+ * @param[out] grad_query Query gradient.
+ * @param[out] grad_key Key gradient.
+ * @param[out] grad_value Value gradient.
+ * @param[in] grad_output Gradient with respect to the attention output.
+ * @param[in] query Query tensor [batch, query_sequence, query_heads, head_dim].
+ * @param[in] key Key tensor [batch, key_sequence, kv_heads, head_dim].
+ * @param[in] value Value tensor with the same shape as @p key.
+ * @param stream CUDA stream used for the operation.
+ * @param options Attention dimensions, scaling, and causal configuration.
+ * @param accumulate_grads Whether existing gradients should be preserved.
+ * @throws std::invalid_argument If tensors or options are invalid.
+ */
 void flash_gqa_attention_backward(
     Tensor &grad_query, Tensor &grad_key, Tensor &grad_value, const Tensor &grad_output,
     const Tensor &query, const Tensor &key, const Tensor &value, cudaStream_t stream,
@@ -886,6 +945,27 @@ void flash_gqa_attention_backward(
 }
 
 
+/**
+ * @brief Computes GQA attention backward using precomputed log-sum-exp values.
+ *
+ * The supplied forward output and LSE tensor allow probabilities to be
+ * reconstructed directly, eliminating the statistics pass used by the basic
+ * backward entry point. FP16 may use an additional WMMA-specialized path.
+ *
+ * @param[out] grad_query Query gradient.
+ * @param[out] grad_key Key gradient.
+ * @param[out] grad_value Value gradient.
+ * @param[in] grad_output Gradient with respect to the attention output.
+ * @param[in] output Forward attention output.
+ * @param[in] logsumexp FP32 tensor [batch, query_sequence, query_heads].
+ * @param[in] query Query tensor.
+ * @param[in] key Key tensor.
+ * @param[in] value Value tensor.
+ * @param stream CUDA stream used for the operation.
+ * @param options Attention dimensions, scaling, and causal configuration.
+ * @param accumulate_grads Whether existing gradients should be preserved.
+ * @throws std::invalid_argument If tensors or options are invalid.
+ */
 void flash_gqa_attention_backward_with_lse(
     Tensor &grad_query, Tensor &grad_key, Tensor &grad_value, const Tensor &grad_output,
     const Tensor &output, const Tensor &logsumexp, const Tensor &query,
