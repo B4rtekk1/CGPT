@@ -171,30 +171,36 @@ std::string json_text_field(std::string_view line) {
 }
 
 std::string load_training_text(const std::filesystem::path& path) {
-    constexpr std::size_t target_bytes = 100 * kMiB;
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("Unable to open input: " + path.string());
     const bool jsonl = path.extension() == ".jsonl";
     if (!jsonl) {
-        std::string text(target_bytes, '\0');
+        input.seekg(0, std::ios::end);
+        const std::streampos end = input.tellg();
+        if (end <= 0) throw std::runtime_error("Input is empty: " + path.string());
+        if (static_cast<std::uintmax_t>(end) > std::numeric_limits<std::size_t>::max() ||
+            static_cast<std::uintmax_t>(end) > static_cast<std::uintmax_t>(std::numeric_limits<std::streamsize>::max()))
+            throw std::overflow_error("Input is too large to load into memory: " + path.string());
+        std::string text(static_cast<std::size_t>(end), '\0');
+        input.seekg(0, std::ios::beg);
         input.read(text.data(), static_cast<std::streamsize>(text.size()));
-        if (input.gcount() != static_cast<std::streamsize>(target_bytes))
-            throw std::runtime_error("Input must contain at least 100 MiB of text");
+        if (!input) throw std::runtime_error("Unable to read input: " + path.string());
         return text;
     }
 
     std::string text;
-    text.reserve(target_bytes);
+    std::error_code error;
+    const std::uintmax_t file_bytes = std::filesystem::file_size(path, error);
+    if (!error && file_bytes <= std::numeric_limits<std::size_t>::max())
+        text.reserve(static_cast<std::size_t>(file_bytes));
     std::string line;
-    while (text.size() < target_bytes && std::getline(input, line)) {
+    while (std::getline(input, line)) {
         const std::string document = json_text_field(line);
         if (document.empty()) continue;
         if (!text.empty()) text.push_back('\n');
         text.append(document);
     }
-    if (text.size() < target_bytes)
-        throw std::runtime_error("JSONL input must contain at least 100 MiB in its text fields");
-    text.resize(target_bytes);
+    if (text.empty()) throw std::runtime_error("JSONL input contains no text fields: " + path.string());
     return text;
 }
 
@@ -290,7 +296,7 @@ int main(int argc, char** argv) {
                 return bpe::BpeTokenizer::load(*args.load_directory / "tokenizer.json");
             }
             bpe::TrainerConfig tokenizer_config; tokenizer_config.vocab_size = args.vocab_size;
-            std::cout << "Training BPE tokenizer on 100 MiB...\n";
+            std::cout << "Training BPE tokenizer on the complete input...\n";
             return bpe::BpeTokenizer::train(std::vector<std::string>{text}, tokenizer_config);
         }();
         if (!args.tokenizer_output.parent_path().empty())
