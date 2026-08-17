@@ -8,6 +8,7 @@
 #include "ops/cross_entropy.h"
 #include "ops/embedding.h"
 #include "optim/adamw.h"
+#include "optim/lr_scheduler.h"
 #include "tokenizer/bpe_tokenizer.h"
 #include "utils/progress_bar.h"
 
@@ -44,6 +45,8 @@ struct Arguments {
     std::size_t validation_interval = 500;
     std::size_t validation_batches = 64;
     float learning_rate = 1.0e-4F;
+    float min_learning_rate = 0.0F;
+    std::size_t warmup_steps = 0;
     float validation_fraction = 0.1F;
     std::string prompt = "The";
     std::size_t generate_tokens = 64;
@@ -83,6 +86,8 @@ Arguments parse_arguments(int argc, char** argv) {
         else if (option == "--validation-interval") args.validation_interval = std::stoull(value());
         else if (option == "--validation-batches") args.validation_batches = std::stoull(value());
         else if (option == "--learning-rate") args.learning_rate = std::stof(value());
+        else if (option == "--min-learning-rate") args.min_learning_rate = std::stof(value());
+        else if (option == "--warmup-steps") args.warmup_steps = std::stoull(value());
         else if (option == "--validation-fraction") args.validation_fraction = std::stof(value());
         else if (option == "--prompt") args.prompt = value();
         else if (option == "--generate-tokens") args.generate_tokens = std::stoull(value());
@@ -91,7 +96,8 @@ Arguments parse_arguments(int argc, char** argv) {
                          "[--output-dir PATH] "
                          "[--load-dir PATH] "
                          "[--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N] "
-                         "[--learning-rate N] [--validation-fraction N] [--validation-interval N] "
+                         "[--learning-rate N] [--min-learning-rate N] [--warmup-steps N] "
+                         "[--validation-fraction N] [--validation-interval N] "
                          "[--validation-batches N] [--prompt TEXT] [--generate-tokens N]\n"
                          "Input may be plain text or FineWeb JSONL (the `text` field is used).\n";
             std::exit(EXIT_SUCCESS);
@@ -99,6 +105,8 @@ Arguments parse_arguments(int argc, char** argv) {
     }
     if (args.vocab_size < 512 || args.batch_size == 0 || args.sequence_length < 2 || args.epochs == 0 ||
         !std::isfinite(args.learning_rate) || args.learning_rate <= 0.0F ||
+        !std::isfinite(args.min_learning_rate) || args.min_learning_rate < 0.0F ||
+        args.min_learning_rate > args.learning_rate ||
         args.validation_interval == 0 || args.validation_batches == 0)
         throw std::invalid_argument("Invalid training dimensions");
     if (!std::isfinite(args.validation_fraction) || args.validation_fraction <= 0.0F ||
@@ -355,6 +363,7 @@ int main(int argc, char** argv) {
         if (loader.batch_count() == 0 || validation_loader.batch_count() == 0)
             throw std::runtime_error("Not enough tokens for one training and validation batch");
         const std::size_t total_steps = args.max_steps ? std::min(args.max_steps, loader.batch_count() * args.epochs) : loader.batch_count() * args.epochs;
+        LearningRateScheduler scheduler({args.learning_rate, args.min_learning_rate, args.warmup_steps, total_steps});
         ModelStorage model(tokenizer.vocab_size());
         if (args.load_directory) {
             load_huggingface_model(*args.load_directory,
@@ -464,6 +473,7 @@ int main(int argc, char** argv) {
                 if (device_batch.input_ids.data() != captured_inputs || device_batch.target_ids.data() != captured_targets)
                     throw std::runtime_error("Training batch storage changed after CUDA graph capture");
                 training_graph.launch(cuda_stream);
+                optimizer_options.learning_rate = scheduler.learning_rate(step);
                 adamw_step_many_async(optimizer_entries, optimizer_options, optimizer_workspace, cuda_stream);
                 ++step; progress.update(step);
                 loss.copy_to_host(host_loss);

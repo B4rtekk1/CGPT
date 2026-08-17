@@ -3,7 +3,37 @@
 #include <algorithm>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <utility>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+
+namespace {
+
+[[nodiscard]] int terminal_width() {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info) != 0) {
+        return info.srWindow.Right - info.srWindow.Left + 1;
+    }
+#else
+    struct winsize size{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col != 0) {
+        return static_cast<int>(size.ws_col);
+    }
+#endif
+    return 0;
+}
+
+} // namespace
 
 /**
  * @file 1775283d-b192-4176-a5e6-8ee7a6dbef26.cpp
@@ -77,11 +107,10 @@ void ProgressBar::finish() {
  * @param now Timestamp used for elapsed-time and speed calculations.
  */
 void ProgressBar::draw(const std::chrono::steady_clock::time_point now) const {
-    constexpr int width = 40;
+    constexpr int preferred_width = 40;
     const double progress = total_ == 0
                                  ? 1.0
                                  : static_cast<double>(current_) / static_cast<double>(total_);
-    const int filled = static_cast<int>(progress * width);
     const double elapsed = std::chrono::duration<double>(now - start_).count();
     const double speed = elapsed > 0.0
                              ? static_cast<double>(current_) / elapsed / speed_divisor_
@@ -90,19 +119,40 @@ void ProgressBar::draw(const std::chrono::steady_clock::time_point now) const {
                            ? static_cast<double>(total_ - current_) / speed
                            : 0.0;
 
+    // Keep the complete render inside the terminal width. If it wraps, a later
+    // carriage return only reaches the beginning of the last visual row, which
+    // makes the bar appear as a new line on narrow tmux panes.
+    const auto render = [&](const int bar_width) {
+        std::ostringstream output;
+        const int filled = static_cast<int>(progress * bar_width);
+        output << (label_.empty() ? "" : label_ + " ")
+               << '[' << std::string(filled, '=')
+               << std::string(std::max(0, bar_width - filled), ' ')
+               << "] " << std::fixed << std::setprecision(1)
+               << progress * 100.0 << "% " << current_ << '/' << total_
+               << " | " << std::setprecision(2) << speed << ' ' << speed_unit_
+               << " | ETA: " << std::setprecision(1) << eta << " s"
+               << suffix_;
+        return output.str();
+    };
+
+    int width = preferred_width;
+    const int columns = terminal_width();
+    std::string output = render(width);
+    if (columns > 1 && static_cast<int>(output.size()) >= columns) {
+        width = std::max(0, columns - 1);
+        do {
+            output = render(width);
+            --width;
+        } while (width > 0 && static_cast<int>(output.size()) >= columns);
+        output = render(std::max(0, width));
+        if (static_cast<int>(output.size()) >= columns) {
+            output.resize(static_cast<std::size_t>(columns - 1));
+        }
+    }
+
     // Clear the prior render first: a new suffix can be shorter than the old
     // one, and metrics must not leave stale characters in the terminal.
     std::cout << "\x1b[2K\r";
-    if (!label_.empty()) {
-        std::cout << label_ << ' ';
-    }
-    std::cout << '['
-              << std::string(filled, '=')
-              << std::string(std::max(0, width - filled), ' ')
-              << "] " << std::fixed << std::setprecision(1)
-              << progress * 100.0 << "% " << current_ << '/' << total_
-              << " | " << std::setprecision(2) << speed << ' ' << speed_unit_
-              << " | ETA: " << std::setprecision(1) << eta << " s"
-              << suffix_
-              << std::flush;
+    std::cout << output << std::flush;
 }
