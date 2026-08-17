@@ -6,6 +6,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <functional>
