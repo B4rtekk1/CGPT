@@ -29,6 +29,7 @@
 
 namespace {
 constexpr std::size_t kMiB = 1024 * 1024;
+constexpr std::size_t kTokenizerTrainingBytes = std::size_t{1} << 30;
 
 struct Arguments {
     std::filesystem::path input = "data/tokenizer_100mb.txt";
@@ -296,8 +297,15 @@ int main(int argc, char** argv) {
                 return bpe::BpeTokenizer::load(*args.load_directory / "tokenizer.json");
             }
             bpe::TrainerConfig tokenizer_config; tokenizer_config.vocab_size = args.vocab_size;
-            std::cout << "Training BPE tokenizer on the complete input...\n";
-            return bpe::BpeTokenizer::train(std::vector<std::string>{text}, tokenizer_config);
+            const std::size_t tokenizer_bytes = std::min(text.size(), kTokenizerTrainingBytes);
+            // Keep the tokenizer corpus bounded while retaining the complete
+            // input in `text` for the subsequent full-corpus tokenization.
+            std::string tokenizer_text(text.data(), tokenizer_bytes);
+            std::cout << "Training BPE tokenizer on "
+                      << static_cast<double>(tokenizer_bytes) / static_cast<double>(kMiB)
+                      << " MiB (full input will be tokenized)...\n";
+            return bpe::BpeTokenizer::train(
+                std::vector<std::string>{std::move(tokenizer_text)}, tokenizer_config);
         }();
         if (!args.tokenizer_output.parent_path().empty())
             std::filesystem::create_directories(args.tokenizer_output.parent_path());
