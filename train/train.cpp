@@ -174,24 +174,22 @@ int main(int argc, char** argv) {
             std::filesystem::create_directories(args.tokenizer_output.parent_path());
         tokenizer.save(args.tokenizer_output);
 
-        ProgressBar tokenization_bar(text.size(), "Tokenizing", static_cast<double>(kMiB), "MiB/s");
         const std::size_t worker_count = std::max<std::size_t>(
             1, std::thread::hardware_concurrency());
-        const std::size_t chunk_size = std::max<std::size_t>(
-            1, (text.size() + worker_count - 1) / worker_count);
-        std::vector<std::string> chunks;
-        chunks.reserve(worker_count);
-        for (std::size_t begin = 0; begin < text.size();) {
-            std::size_t end = std::min(text.size(), begin + chunk_size);
-            if (end < text.size()) {
-                const std::size_t newline = text.find('\n', end);
-                if (newline != std::string::npos) end = newline + 1;
-            }
-            chunks.emplace_back(text.substr(begin, end - begin));
-            begin = end;
+        constexpr std::size_t blocks_per_worker = 100;
+        const std::size_t block_count = std::min(
+            text.size(), worker_count * blocks_per_worker);
+        std::vector<std::string_view> blocks;
+        blocks.reserve(block_count);
+        for (std::size_t block = 0; block < block_count; ++block) {
+            const std::size_t begin = text.size() * block / block_count;
+            const std::size_t end = text.size() * (block + 1) / block_count;
+            blocks.emplace_back(text.data() + begin, end - begin);
         }
+
+        ProgressBar tokenization_bar(text.size(), "Tokenizing", static_cast<double>(kMiB), "MiB/s");
         const std::vector<std::vector<bpe::TokenId>> encoded_chunks =
-            tokenizer.encode_batch(chunks, worker_count);
+            tokenizer.encode_batch(blocks, worker_count);
         std::vector<bpe::TokenId> tokens;
         for (const auto& chunk : encoded_chunks)
             tokens.insert(tokens.end(), chunk.begin(), chunk.end());
@@ -232,6 +230,9 @@ int main(int argc, char** argv) {
         std::size_t host_batch_index = 0;
         data::Batch& captured_batch = host_batches[host_batch_index];
         std::size_t step = 0;
+        double loss_sum = 0.0;
+        std::size_t loss_count = 0;
+        std::vector<float> host_loss(1);
 
         // All batches have the configured fixed shape (drop_last=true).  Allocate
         // the device buffers and tune cuBLASLt plans before capture, so graph
@@ -260,11 +261,15 @@ int main(int argc, char** argv) {
                 training_graph.launch(cuda_stream);
                 adamw_step_many_async(optimizer_entries, optimizer_options, optimizer_workspace, cuda_stream);
                 ++step; progress.update(step);
+                loss.copy_to_host(host_loss);
+                loss_sum += host_loss[0];
+                ++loss_count;
                 if (step % 50 == 0 || step == total_steps) {
                     if (!adamw_check(optimizer_workspace, cuda_stream))
                         throw std::runtime_error("Non-finite gradient at step " + std::to_string(step));
-                    std::vector<float> host_loss(1); loss.copy_to_host(host_loss);
-                    std::cout << " loss=" << host_loss[0] << std::flush;
+                    std::cout << " avg_loss=" << (loss_sum / static_cast<double>(loss_count)) << std::flush;
+                    loss_sum = 0.0;
+                    loss_count = 0;
                 }
                 if (step < total_steps) {
                     host_batch_index ^= 1U;
