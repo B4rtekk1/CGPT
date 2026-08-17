@@ -1,6 +1,7 @@
 #include "core/cuda_check.h"
 #include "core/cuda_graph.h"
 #include "core/generation.h"
+#include "core/huggingface_export.h"
 #include "core/transformer_model.h"
 #include "core/weight_initialization.h"
 #include "data/dataset_loader.h"
@@ -30,6 +31,8 @@ constexpr std::size_t kMiB = 1024 * 1024;
 struct Arguments {
     std::filesystem::path input = "data/tokenizer_100mb.txt";
     std::filesystem::path tokenizer_output = "train/tokenizer_100mb.json";
+    std::filesystem::path output_directory = "train/huggingface";
+    std::optional<std::filesystem::path> load_directory;
     std::size_t vocab_size = 32'000;
     std::size_t batch_size = 16;
     std::size_t sequence_length = 1024;
@@ -67,6 +70,8 @@ Arguments parse_arguments(int argc, char** argv) {
         };
         if (option == "--input") args.input = value();
         else if (option == "--tokenizer") args.tokenizer_output = value();
+        else if (option == "--output-dir") args.output_directory = value();
+        else if (option == "--load-dir") args.load_directory = value();
         else if (option == "--vocab-size") args.vocab_size = std::stoull(value());
         else if (option == "--batch-size") args.batch_size = std::stoull(value());
         else if (option == "--sequence-length") args.sequence_length = std::stoull(value());
@@ -80,6 +85,8 @@ Arguments parse_arguments(int argc, char** argv) {
         else if (option == "--generate-tokens") args.generate_tokens = std::stoull(value());
         else if (option == "--help") {
             std::cout << "Usage: cgpt_train [--input PATH] [--tokenizer PATH] [--vocab-size N] "
+                         "[--output-dir PATH] "
+                         "[--load-dir PATH] "
                          "[--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N] "
                          "[--learning-rate N] [--validation-fraction N] [--validation-interval N] "
                          "[--validation-batches N] [--prompt TEXT] [--generate-tokens N]\n";
@@ -184,9 +191,15 @@ int main(int argc, char** argv) {
         std::ifstream input(args.input, std::ios::binary);
         std::string text(100 * kMiB, '\0'); input.read(text.data(), static_cast<std::streamsize>(text.size()));
 
-        bpe::TrainerConfig tokenizer_config; tokenizer_config.vocab_size = args.vocab_size;
-        std::cout << "Training BPE tokenizer on 100 MiB...\n";
-        const bpe::BpeTokenizer tokenizer = bpe::BpeTokenizer::train(std::vector<std::string>{text}, tokenizer_config);
+        bpe::BpeTokenizer tokenizer = [&] {
+            if (args.load_directory) {
+                std::cout << "Loading tokenizer from " << *args.load_directory << "...\n";
+                return bpe::BpeTokenizer::load(*args.load_directory / "tokenizer.json");
+            }
+            bpe::TrainerConfig tokenizer_config; tokenizer_config.vocab_size = args.vocab_size;
+            std::cout << "Training BPE tokenizer on 100 MiB...\n";
+            return bpe::BpeTokenizer::train(std::vector<std::string>{text}, tokenizer_config);
+        }();
         if (!args.tokenizer_output.parent_path().empty())
             std::filesystem::create_directories(args.tokenizer_output.parent_path());
         tokenizer.save(args.tokenizer_output);
@@ -236,6 +249,11 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Not enough tokens for one training and validation batch");
         const std::size_t total_steps = args.max_steps ? std::min(args.max_steps, loader.batch_count() * args.epochs) : loader.batch_count() * args.epochs;
         ModelStorage model(tokenizer.vocab_size());
+        if (args.load_directory) {
+            load_huggingface_model(*args.load_directory,
+                {model.embedding, model.mutable_layers, model.final_norm, model.lm_head});
+            std::cout << "Loaded model weights from " << *args.load_directory << '\n';
+        }
         auto [cos_cache, sin_cache] = rotary_cache(args.sequence_length, model.options.block_options.rotary_dim);
         TransformerModelWorkspace forward_workspace(model.options, args.batch_size, args.sequence_length, Dtype::F16);
         TransformerModelBackwardWorkspace backward_workspace(model.options, args.batch_size, args.sequence_length, Dtype::F16);
@@ -281,6 +299,14 @@ int main(int argc, char** argv) {
             suffix += last_validation_loss ? std::to_string(*last_validation_loss) : "n/a";
             progress.set_suffix(std::move(suffix));
         };
+        const auto save_validation_checkpoint = [&] {
+            const std::filesystem::path checkpoint_directory =
+                args.output_directory / "checkpoints" / ("step-" + std::to_string(step));
+            export_huggingface_model(checkpoint_directory, tokenizer, model.weights(), model.options,
+                                     args.sequence_length);
+            std::cout << "\nSaved validation checkpoint at step " << step << " to "
+                      << checkpoint_directory << '\n';
+        };
         const auto run_validation = [&] {
             validation_loader.reset();
             double validation_loss_sum = 0.0;
@@ -302,6 +328,7 @@ int main(int argc, char** argv) {
             }
             last_validation_loss = validation_loss_sum / static_cast<double>(validation_loss_count);
             update_training_metrics();
+            save_validation_checkpoint();
         };
         update_training_metrics();
 
@@ -360,6 +387,8 @@ int main(int argc, char** argv) {
         }
         CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
         progress.finish();
+        export_huggingface_model(args.output_directory, tokenizer, model.weights(), model.options,
+                                 args.sequence_length);
         GenerationOptions generation_options;
         generation_options.max_new_tokens = args.generate_tokens;
         generation_options.max_context_tokens = args.sequence_length;
@@ -368,7 +397,8 @@ int main(int argc, char** argv) {
         generation_options.seed = 42;
         std::cout << "\nGenerated text:\n" << generate_text(tokenizer, args.prompt, model.weights(), cos_cache,
             sin_cache, cublas, model.options, generation_options) << '\n';
-        std::cout << "Completed " << step << " optimizer steps. Tokenizer saved to " << args.tokenizer_output << '\n';
+        std::cout << "Completed " << step << " optimizer steps. Hugging Face model saved to "
+                  << args.output_directory << '\n';
         return EXIT_SUCCESS;
     } catch (const std::exception& error) { std::cerr << "Training failed: " << error.what() << '\n'; return EXIT_FAILURE; }
 }

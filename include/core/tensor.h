@@ -1,6 +1,7 @@
 #pragma once
 
 #include <limits>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -253,6 +254,17 @@ public:
      * @param destination Destination span whose size must match `numel()`.
      */
     void copy_to_host(std::span<float> destination) const;
+
+    /** Copies raw tensor bytes from host memory into this tensor. */
+    void copy_raw_from_host(std::span<const std::uint8_t> source) {
+        if (source.size() != nbytes())
+            throw std::invalid_argument("Tensor::copy_raw_from_host size mismatch");
+        if (device_type_ == DeviceType::CUDA) {
+            CUDA_CHECK(cudaMemcpy(storage_.data(), source.data(), source.size(), cudaMemcpyHostToDevice));
+        } else {
+            std::memcpy(host_storage_.data(), source.data(), source.size());
+        }
+    }
 
 private:
     void swap(Tensor& other) noexcept {

@@ -52,6 +52,7 @@ add_library(cgpt_core STATIC
         src/core/weight_initialization.cu
         src/core/generation.cu
         src/core/cuda_graph.cu
+        src/core/huggingface_export.cpp
         src/ops/attention.cu)
 
 # Cross entropy is dominated by exp/log latency over a very wide vocabulary.

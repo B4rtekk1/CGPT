@@ -8,6 +8,9 @@ data
 !src/data/**
 __pycache__/
 
+# Generated Hugging Face exports and validation checkpoints.
+/train/huggingface/
+
 ### CUDA template
 *.i
 *.ii
