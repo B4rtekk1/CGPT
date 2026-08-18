@@ -21,7 +21,9 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -50,6 +52,7 @@ struct Arguments {
     float validation_fraction = 0.1F;
     std::string prompt = "The";
     std::size_t generate_tokens = 64;
+    bool save_avg_loss = false;
 };
 
 class Stream {
@@ -91,6 +94,7 @@ Arguments parse_arguments(int argc, char** argv) {
         else if (option == "--validation-fraction") args.validation_fraction = std::stof(value());
         else if (option == "--prompt") args.prompt = value();
         else if (option == "--generate-tokens") args.generate_tokens = std::stoull(value());
+        else if (option == "--save-avg-loss") args.save_avg_loss = true;
         else if (option == "--help") {
             std::cout << "Usage: cgpt_train [--input PATH] [--tokenizer PATH] [--vocab-size N] "
                          "[--output-dir PATH] "
@@ -98,7 +102,8 @@ Arguments parse_arguments(int argc, char** argv) {
                          "[--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N] "
                          "[--learning-rate N] [--min-learning-rate N] [--warmup-steps N] "
                          "[--validation-fraction N] [--validation-interval N] "
-                         "[--validation-batches N] [--prompt TEXT] [--generate-tokens N]\n"
+                         "[--validation-batches N] [--prompt TEXT] [--generate-tokens N] "
+                         "[--save-avg-loss]\n"
                          "Input may be plain text or FineWeb JSONL (the `text` field is used).\n";
             std::exit(EXIT_SUCCESS);
         } else throw std::invalid_argument("Unknown option: " + option);
@@ -346,18 +351,33 @@ int main(int argc, char** argv) {
         const std::size_t minimum_split_tokens = args.batch_size * args.sequence_length + 1;
         if (minimum_split_tokens > tokens.size() / 2)
             throw std::runtime_error("Not enough tokens for one training and validation batch");
-        const std::size_t requested_validation_tokens = static_cast<std::size_t>(
-            static_cast<double>(tokens.size()) * args.validation_fraction);
-        const std::size_t validation_tokens = std::clamp(
-            requested_validation_tokens, minimum_split_tokens, tokens.size() - minimum_split_tokens);
-        const auto split = tokens.begin() + static_cast<std::ptrdiff_t>(tokens.size() - validation_tokens);
-        std::vector<bpe::TokenId> training_tokens(tokens.begin(), split);
-        std::vector<bpe::TokenId> validation_tokens_data(split, tokens.end());
+        const std::size_t sample_span = args.sequence_length + 1;
+        const std::size_t available_samples = (tokens.size() - 1) / args.sequence_length;
+        const std::size_t requested_validation_samples = static_cast<std::size_t>(
+            static_cast<double>(available_samples) * args.validation_fraction);
+        const std::size_t validation_samples = std::clamp(
+            requested_validation_samples, args.batch_size, available_samples - args.batch_size);
+        std::vector<std::size_t> sample_indices(available_samples);
+        std::iota(sample_indices.begin(), sample_indices.end(), 0);
+        std::mt19937_64 split_generator(42);
+        std::shuffle(sample_indices.begin(), sample_indices.end(), split_generator);
 
-        data::DataLoaderConfig loader_config{args.batch_size, args.sequence_length, true, true, 42};
+        std::vector<bpe::TokenId> training_tokens;
+        std::vector<bpe::TokenId> validation_tokens_data;
+        training_tokens.reserve((available_samples - validation_samples) * sample_span);
+        validation_tokens_data.reserve(validation_samples * sample_span);
+        for (std::size_t position = 0; position < sample_indices.size(); ++position) {
+            const std::size_t start = sample_indices[position] * args.sequence_length;
+            auto& destination = position < available_samples - validation_samples
+                ? training_tokens : validation_tokens_data;
+            destination.insert(destination.end(), tokens.begin() + static_cast<std::ptrdiff_t>(start),
+                tokens.begin() + static_cast<std::ptrdiff_t>(start + sample_span));
+        }
+
+        data::DataLoaderConfig loader_config{args.batch_size, args.sequence_length, sample_span, true, true, 42};
         data::DatasetLoader loader(
             std::make_shared<const data::TokenDataset>(std::move(training_tokens)), loader_config);
-        data::DataLoaderConfig validation_loader_config{args.batch_size, args.sequence_length, false, true, 42};
+        data::DataLoaderConfig validation_loader_config{args.batch_size, args.sequence_length, sample_span, false, true, 42};
         data::DatasetLoader validation_loader(
             std::make_shared<const data::TokenDataset>(std::move(validation_tokens_data)), validation_loader_config);
         if (loader.batch_count() == 0 || validation_loader.batch_count() == 0)
@@ -408,6 +428,14 @@ int main(int argc, char** argv) {
         std::vector<float> host_validation_loss(1);
         std::optional<double> last_validation_loss;
         std::optional<double> last_average_loss;
+        std::ofstream average_loss_log;
+        if (args.save_avg_loss) {
+            std::filesystem::create_directories(args.output_directory);
+            average_loss_log.open(args.output_directory / "avg_loss.csv", std::ios::trunc);
+            if (!average_loss_log)
+                throw std::runtime_error("Unable to open average-loss log in " + args.output_directory.string());
+            average_loss_log << "step,avg_loss\n";
+        }
         const auto update_training_metrics = [&] {
             std::string suffix = " | avg_loss=";
             suffix += last_average_loss ? std::to_string(*last_average_loss) : "n/a";
@@ -485,6 +513,8 @@ int main(int argc, char** argv) {
                     last_average_loss = loss_sum / static_cast<double>(loss_count);
                     loss_sum = 0.0;
                     loss_count = 0;
+                    if (average_loss_log)
+                        average_loss_log << step << ',' << *last_average_loss << '\n';
                     update_training_metrics();
                 }
                 if (step % args.validation_interval == 0 || step == total_steps)

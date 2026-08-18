@@ -176,9 +176,10 @@ namespace data {
     /** @brief Validates configuration and initializes epoch sampling state. */
     void DatasetLoader::initialize() {
         if (!dataset_) throw std::invalid_argument("DatasetLoader dataset cannot be null");
+        if (config_.sample_stride == 0) config_.sample_stride = config_.sequence_length;
         validate_config(config_);
         sample_count_ = dataset_->size() > 0
-                            ? (dataset_->size() - 1) / config_.sequence_length
+                            ? (dataset_->size() - 1) / config_.sample_stride
                             : 0;
         sequential_ = !config_.shuffle;
         if (sequential_) {
@@ -227,7 +228,7 @@ namespace data {
         const auto tokens = dataset_->tokens();
 
         if (sequential_) {
-            const std::size_t start = next_sample_ * config_.sequence_length;
+                const std::size_t start = next_sample_ * config_.sample_stride;
             // Both arrays are trivially copyable and non-overlapping.  This is the
             // hot path for non-shuffled loaders and lets the standard library use
             // the platform's bulk-copy implementation.
@@ -237,7 +238,7 @@ namespace data {
                         token_count * sizeof(bpe::TokenId));
         } else {
             for (std::size_t item = 0; item < current_batch; ++item) {
-                const std::size_t start = sample_indices_[next_sample_ + item] * config_.sequence_length;
+                const std::size_t start = sample_indices_[next_sample_ + item] * config_.sample_stride;
                 const std::size_t destination = item * config_.sequence_length;
                 const std::size_t bytes = config_.sequence_length * sizeof(bpe::TokenId);
                 std::memcpy(batch.input_ids.data() + destination, tokens.data() + start, bytes);

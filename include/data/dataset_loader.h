@@ -175,6 +175,8 @@ struct DataLoaderConfig {
     std::size_t batch_size = 1;
     /** @brief Number of tokens in each input sequence. */
     std::size_t sequence_length = 1;
+    /** @brief Distance between starts of consecutive samples in the corpus. */
+    std::size_t sample_stride = 0;
     /** @brief Whether samples are shuffled at epoch boundaries. */
     bool shuffle = true;
     /** @brief Whether an incomplete final batch is discarded. */
