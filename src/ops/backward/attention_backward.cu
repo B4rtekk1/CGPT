@@ -205,10 +205,15 @@ namespace {
                                                 (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
                     float score_partial = 0.0f;
                     float d_probability_partial = 0.0f;
+                    // Keep K in registers across the score dot product and the
+                    // dQ accumulation below instead of loading it from global
+                    // memory a second time in the same offset iteration.
+                    float k_reg[kMaxOwnedDims];
 #pragma unroll
                     for (int owned = 0; owned < kOwnedDimensions; ++owned) {
                         const int column = lane + owned * kWarpSize;
-                        score_partial = fmaf(q_reg[owned], static_cast<float>(key[kv_base + column]), score_partial);
+                        k_reg[owned] = static_cast<float>(key[kv_base + column]);
+                        score_partial = fmaf(q_reg[owned], k_reg[owned], score_partial);
                         d_probability_partial = fmaf(do_reg[owned], static_cast<float>(value[kv_base + column]),
                                                      d_probability_partial);
                     }
@@ -223,9 +228,7 @@ namespace {
                     }
 #pragma unroll
                     for (int owned = 0; owned < kOwnedDimensions; ++owned) {
-                        const int d = lane + owned * kWarpSize;
-                        d_query[owned] = fmaf(d_score * scale,
-                                              static_cast<float>(key[kv_base + d]), d_query[owned]);
+                        d_query[owned] = fmaf(d_score * scale, k_reg[owned], d_query[owned]);
                     }
                 }
                 __syncthreads();
@@ -296,10 +299,15 @@ namespace {
                                             (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
                 float score_partial = 0.0f;
                 float d_probability_partial = 0.0f;
+                // K is needed twice this iteration (score, then dQ/dK below). Keep
+                // the lane's owned elements in registers instead of re-issuing the
+                // global load a second time.
+                float k_reg[kMaxOwnedDims];
                 int owned = 0;
 #pragma unroll
                 for (int d = lane; d < dimensions; d += kWarpSize, ++owned) {
-                    score_partial = fmaf(q_reg[owned], static_cast<float>(key[kv_base + d]), score_partial);
+                    k_reg[owned] = static_cast<float>(key[kv_base + d]);
+                    score_partial = fmaf(q_reg[owned], k_reg[owned], score_partial);
                     d_probability_partial = fmaf(do_reg[owned], static_cast<float>(value[kv_base + d]),
                                                  d_probability_partial);
                 }
@@ -311,7 +319,7 @@ namespace {
                 owned = 0;
 #pragma unroll
                 for (int d = lane; d < dimensions; d += kWarpSize, ++owned) {
-                    d_query[owned] = fmaf(d_score * scale, static_cast<float>(key[kv_base + d]), d_query[owned]);
+                    d_query[owned] = fmaf(d_score * scale, k_reg[owned], d_query[owned]);
                     atomic_add(grad_key + kv_base + d, d_score * scale * q_reg[owned]);
                     atomic_add(grad_value + kv_base + d, probability * do_reg[owned]);
                 }
@@ -411,10 +419,13 @@ namespace {
                                                 (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
                     float score_partial = 0.0f;
                     float d_probability_partial = 0.0f;
+                    // Same K-register-caching rationale as the base kernel.
+                    float k_reg[kMaxOwnedDims];
 #pragma unroll
                     for (int owned_index = 0; owned_index < kOwnedDimensions; ++owned_index) {
                         const int d = lane + owned_index * kWarpSize;
-                        score_partial = fmaf(q_reg[owned_index], static_cast<float>(key[kv_base + d]), score_partial);
+                        k_reg[owned_index] = static_cast<float>(key[kv_base + d]);
+                        score_partial = fmaf(q_reg[owned_index], k_reg[owned_index], score_partial);
                         d_probability_partial = fmaf(do_reg[owned_index], static_cast<float>(value[kv_base + d]),
                                                      d_probability_partial);
                     }
@@ -427,9 +438,7 @@ namespace {
                     }
 #pragma unroll
                     for (int owned_index = 0; owned_index < kOwnedDimensions; ++owned_index) {
-                        const int d = lane + owned_index * kWarpSize;
-                        d_query[owned_index] = fmaf(
-                            d_score * scale, static_cast<float>(key[kv_base + d]), d_query[owned_index]);
+                        d_query[owned_index] = fmaf(d_score * scale, k_reg[owned_index], d_query[owned_index]);
                     }
                 }
                 __syncthreads();
@@ -461,10 +470,14 @@ namespace {
                                             (static_cast<std::size_t>(k_pos) * kv_heads + kv_head) * head_dim;
                 float score_partial = 0.0f;
                 float d_probability_partial = 0.0f;
+                // Same rationale as the base kernel: keep K in registers across
+                // the two uses within this iteration instead of a second global load.
+                float k_reg[kMaxOwnedDims];
                 owned = 0;
 #pragma unroll
                 for (int d = lane; d < dimensions; d += kWarpSize, ++owned) {
-                    score_partial = fmaf(q_reg[owned], static_cast<float>(key[kv_base + d]), score_partial);
+                    k_reg[owned] = static_cast<float>(key[kv_base + d]);
+                    score_partial = fmaf(q_reg[owned], k_reg[owned], score_partial);
                     d_probability_partial = fmaf(do_reg[owned], static_cast<float>(value[kv_base + d]),
                                                  d_probability_partial);
                 }
@@ -474,7 +487,7 @@ namespace {
                 owned = 0;
 #pragma unroll
                 for (int d = lane; d < dimensions; d += kWarpSize, ++owned) {
-                    d_query[owned] = fmaf(d_score * scale, static_cast<float>(key[kv_base + d]), d_query[owned]);
+                    d_query[owned] = fmaf(d_score * scale, k_reg[owned], d_query[owned]);
                     atomic_add(grad_key + kv_base + d, d_score * scale * q_reg[owned]);
                     atomic_add(grad_value + kv_base + d, probability * do_reg[owned]);
                 }
@@ -991,14 +1004,41 @@ void flash_gqa_attention_backward_with_lse(
     const int qh = static_cast<int>(options.num_query_heads);
     const int kh = static_cast<int>(options.num_kv_heads);
     const int dim = static_cast<int>(options.head_dim);
+    const float scale = options.attention_scale > 0.0f
+                            ? options.attention_scale
+                            : rsqrtf(static_cast<float>(dim));
+
+    // Tensor-Core fast path. attention_backward_lse_dq_wmma / _dkv_wmma cover
+    // FP16, head_dim==128, and an exact 4:1 GQA ratio -- the dominant decoder
+    // training shape. Every S=QK^T, dP=dO*V^T, dQ=dS*K, dK=dS^T*Q, and
+    // dV=P^T*dO product is done as a 16x16x16 WMMA tile instead of per-lane
+    // scalar fmaf, and dK/dV are written directly with no atomics at all: each
+    // block owns one contiguous K/V tile and iterates over every query
+    // position that attends to it, rather than each query row atomically
+    // scattering into K/V positions it shares with other rows. This code
+    // path previously existed but was never invoked from here. Checked before
+    // the scalar-kernel grid-size validation below, since its own grid
+    // (batch*heads*ceil(seq/16)) is independent of and generally much smaller
+    // than the row-per-warp grid that validation guards.
+    if (query.dtype() == Dtype::F16 && dim == 128 && kh > 0 && qh % kh == 0 && qh / kh == 4) {
+        launch_attention_backward_lse_wmma(
+            static_cast<__half *>(grad_query.raw_data()), static_cast<__half *>(grad_key.raw_data()),
+            static_cast<__half *>(grad_value.raw_data()), static_cast<const __half *>(grad_output.raw_data()),
+            static_cast<const __half *>(output.raw_data()), static_cast<const float *>(logsumexp.raw_data()),
+            static_cast<const __half *>(query.raw_data()), static_cast<const __half *>(key.raw_data()),
+            static_cast<const __half *>(value.raw_data()), batch, qs, ks, qh, kh, scale, options.causal,
+            static_cast<int>(options.query_position_offset), accumulate_grads, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // Scalar-kernel fallback for everything the Tensor-Core path above doesn't
+    // cover (FP32, BF16, non-128 head_dim, or a GQA ratio other than 4).
     const unsigned long long rows = static_cast<unsigned long long>(batch) * qs * qh;
     const unsigned long long blocks = (rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
     if (blocks > static_cast<unsigned long long>(std::numeric_limits<unsigned int>::max())) {
         throw std::invalid_argument("flash_gqa_attention_backward_with_lse: CUDA grid is too large");
     }
-    const float scale = options.attention_scale > 0.0f
-                            ? options.attention_scale
-                            : rsqrtf(static_cast<float>(dim));
     const auto launch = [&]<typename T>() {
         launch_attention_backward_lse(
             static_cast<T *>(grad_query.raw_data()), static_cast<T *>(grad_key.raw_data()),
