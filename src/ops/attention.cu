@@ -197,6 +197,60 @@ __device__ __forceinline__ void load_kv_rows_f16(
     }
 }
 
+
+/** Ampere global-to-shared copy. Uses 16-byte cp.async transactions and
+ * zero-fills out-of-range rows without routing data through registers. */
+template <int HeadDim, int Rows>
+__device__ __forceinline__ void load_kv_rows_f16_async(
+    __half* __restrict__ key_shared,
+    __half* __restrict__ value_shared,
+    const __half* __restrict__ key,
+    const __half* __restrict__ value,
+    int first_row,
+    int valid_rows,
+    std::int64_t source_row_stride
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    static_assert(HeadDim % 8 == 0);
+    constexpr int kVectorsPerRow = HeadDim / 8;
+    constexpr int kVectorCount = Rows * kVectorsPerRow;
+    for (int vector_index = static_cast<int>(threadIdx.x);
+         vector_index < kVectorCount;
+         vector_index += static_cast<int>(blockDim.x)) {
+        const int row = vector_index / kVectorsPerRow;
+        const int column_vector = vector_index % kVectorsPerRow;
+        const int source_row = first_row + row;
+        const bool valid = source_row < valid_rows;
+        const std::int64_t offset = valid
+            ? static_cast<std::int64_t>(source_row) * source_row_stride
+                + column_vector * 8
+            : 0;
+        const void* key_source = key + offset;
+        const void* value_source = value + offset;
+        const unsigned key_destination = static_cast<unsigned>(
+            __cvta_generic_to_shared(key_shared + vector_index * 8));
+        const unsigned value_destination = static_cast<unsigned>(
+            __cvta_generic_to_shared(value_shared + vector_index * 8));
+        const int source_bytes = valid ? 16 : 0;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::
+                     "r"(key_destination), "l"(key_source), "r"(source_bytes));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::
+                     "r"(value_destination), "l"(value_source), "r"(source_bytes));
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+#else
+    load_kv_rows_f16<HeadDim, Rows>(
+        key_shared, value_shared, key, value, first_row, valid_rows,
+        source_row_stride);
+#endif
+}
+
+__device__ __forceinline__ void wait_kv_rows_f16_async() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
 /**
  * @brief Computes one tiled FP16 GQA attention forward pass per query head.
  *
@@ -239,7 +293,8 @@ __device__ __forceinline__ void load_kv_rows_f16(
  *        used when Q contains only newly decoded tokens.
  */
 template <int HeadDim, int BlockM>
-__global__ void flash_gqa_f16_tensor_core_kernel(
+__global__ __launch_bounds__(128, 1)
+void flash_gqa_f16_tensor_core_kernel(
     __half* __restrict__ output,
     float* __restrict__ logsumexp,
     const __half* __restrict__ query,
@@ -290,11 +345,14 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
     auto* query_shared = reinterpret_cast<__half*>(shared_raw);
     auto* ptr = shared_raw + BlockM * HeadDim * sizeof(__half);
 
+    // Two K/V stages allow cp.async for tile t+1 to overlap QK/softmax/PV
+    // computation for tile t. Stages are laid out contiguously so each stage
+    // remains 16-byte aligned.
     auto* key_shared = reinterpret_cast<__half*>(ptr);
-    ptr += kBlockN * HeadDim * sizeof(__half);
+    ptr += 2 * kBlockN * HeadDim * sizeof(__half);
 
     auto* value_shared = reinterpret_cast<__half*>(ptr);
-    ptr += kBlockN * HeadDim * sizeof(__half);
+    ptr += 2 * kBlockN * HeadDim * sizeof(__half);
 
     auto* scores = reinterpret_cast<float*>(ptr);
     ptr += BlockM * kBlockN * sizeof(float);
@@ -302,11 +360,8 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
     auto* probabilities = reinterpret_cast<__half*>(ptr);
     ptr += BlockM * kBlockN * sizeof(__half);
 
-    auto* output_accumulator = reinterpret_cast<__half*>(ptr);
-    ptr += BlockM * HeadDim * sizeof(__half);
-
-    auto* mma_tiles = reinterpret_cast<float*>(ptr);
-    ptr += kWarps * 16 * 16 * sizeof(float);
+    auto* output_accumulator = reinterpret_cast<float*>(ptr);
+    ptr += BlockM * HeadDim * sizeof(float);
 
     auto* running_max = reinterpret_cast<float*>(ptr);
     ptr += BlockM * sizeof(float);
@@ -323,7 +378,7 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
     for (int index = static_cast<int>(threadIdx.x);
          index < BlockM * HeadDim;
          index += kThreads) {
-        output_accumulator[index] = __float2half_rn(0.0F);
+        output_accumulator[index] = 0.0F;
     }
     for (int row = static_cast<int>(threadIdx.x); row < BlockM; row += kThreads) {
         running_max[row] = -INFINITY;
@@ -342,20 +397,44 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
     float* warp_scores = scores + warp_row_begin * kBlockN;
     __half* warp_probabilities =
         probabilities + warp_row_begin * kBlockN;
-    float* warp_mma_tile = mma_tiles + warp * 16 * 16;
 
-    for (int key_begin = 0;
-         key_begin < max_visible_key;
-         key_begin += kBlockN) {
-        load_kv_rows_f16<HeadDim, kBlockN>(
+    // Prime stage zero. The next stage is issued before computing the current
+    // one, which creates a genuine global-memory/compute overlap on SM80+.
+    if (max_visible_key > 0) {
+        load_kv_rows_f16_async<HeadDim, kBlockN>(
             key_shared,
             value_shared,
             key + kv_head_base,
             value + kv_head_base,
-            key_begin,
+            0,
             key_value_sequence,
             kv_row_stride);
+    }
+
+    for (int key_begin = 0, tile_index = 0;
+         key_begin < max_visible_key;
+         key_begin += kBlockN, ++tile_index) {
+        const int stage = tile_index & 1;
+        __half* current_key =
+            key_shared + stage * kBlockN * HeadDim;
+        __half* current_value =
+            value_shared + stage * kBlockN * HeadDim;
+
+        wait_kv_rows_f16_async();
         __syncthreads();
+
+        const int next_key_begin = key_begin + kBlockN;
+        if (next_key_begin < max_visible_key) {
+            const int next_stage = stage ^ 1;
+            load_kv_rows_f16_async<HeadDim, kBlockN>(
+                key_shared + next_stage * kBlockN * HeadDim,
+                value_shared + next_stage * kBlockN * HeadDim,
+                key + kv_head_base,
+                value + kv_head_base,
+                next_key_begin,
+                key_value_sequence,
+                kv_row_stride);
+        }
 
         {
             using namespace nvcuda;
@@ -380,7 +459,7 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
                         query_fragment, warp_query + dimension, HeadDim);
                     wmma::load_matrix_sync(
                         key_fragment,
-                        key_shared + subtile * HeadDim + dimension,
+                        current_key + subtile * HeadDim + dimension,
                         HeadDim);
                     wmma::mma_sync(
                         score_fragment,
@@ -420,9 +499,9 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
             const float new_max = fmaxf(old_max, tile_max);
             const float old_scale = old_max == -INFINITY
                 ? 0.0F
-                : __expf(old_max - new_max);
+                : exp2f((old_max - new_max) * 1.4426950408889634F);
             const float probability =
-                valid ? __expf(score - new_max) : 0.0F;
+                valid ? exp2f((score - new_max) * 1.4426950408889634F) : 0.0F;
 
             float tile_sum = warp_reduce_sum(probability);
             tile_sum = __shfl_sync(0xFFFFFFFFU, tile_sum, 0);
@@ -434,9 +513,7 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
                  dimension < HeadDim;
                  dimension += kWarpSize) {
                 const int accumulator_index = row * HeadDim + dimension;
-                output_accumulator[accumulator_index] = __float2half_rn(
-                    __half2float(output_accumulator[accumulator_index])
-                    * old_scale);
+                output_accumulator[accumulator_index] *= old_scale;
             }
 
             if (lane == 0) {
@@ -458,7 +535,11 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
                  dimension += 16) {
                 wmma::fragment<wmma::accumulator, 16, 16, 16, float>
                     output_fragment;
-                wmma::fill_fragment(output_fragment, 0.0F);
+                wmma::load_matrix_sync(
+                    output_fragment,
+                    output_accumulator + warp_row_begin * HeadDim + dimension,
+                    HeadDim,
+                    wmma::mem_row_major);
 
                 #pragma unroll
                 for (int subtile = 0; subtile < kBlockN; subtile += 16) {
@@ -472,7 +553,7 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
                         kBlockN);
                     wmma::load_matrix_sync(
                         value_fragment,
-                        value_shared + subtile * HeadDim + dimension,
+                        current_value + subtile * HeadDim + dimension,
                         HeadDim);
                     wmma::mma_sync(
                         output_fragment,
@@ -482,23 +563,10 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
                 }
 
                 wmma::store_matrix_sync(
-                    warp_mma_tile,
+                    output_accumulator + warp_row_begin * HeadDim + dimension,
                     output_fragment,
-                    16,
+                    HeadDim,
                     wmma::mem_row_major);
-                __syncwarp();
-
-                for (int index = lane; index < 16 * 16; index += kWarpSize) {
-                    const int local_row = index / 16;
-                    const int column = index % 16;
-                    const int row = warp_row_begin + local_row;
-                    const int accumulator_index =
-                        row * HeadDim + dimension + column;
-                    output_accumulator[accumulator_index] = __float2half_rn(
-                        __half2float(output_accumulator[accumulator_index])
-                        + warp_mma_tile[index]);
-                }
-                __syncwarp();
             }
         }
 
@@ -516,7 +584,7 @@ __global__ void flash_gqa_f16_tensor_core_kernel(
         if (query_position < query_sequence) {
             const float denominator = running_sum[row];
             const float result = denominator > 0.0F
-                ? __half2float(output_accumulator[index]) / denominator
+                ? output_accumulator[index] / denominator
                 : 0.0F;
             const std::int64_t output_offset =
                 query_head_base
@@ -617,17 +685,15 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
     auto* query_shared = reinterpret_cast<__half*>(shared_raw);
     auto* ptr = shared_raw + GroupSize * kBlockM * HeadDim * sizeof(__half);
     auto* key_shared = reinterpret_cast<__half*>(ptr);
-    ptr += kN * HeadDim * sizeof(__half);
+    ptr += 2 * kN * HeadDim * sizeof(__half);
     auto* value_shared = reinterpret_cast<__half*>(ptr);
-    ptr += kN * HeadDim * sizeof(__half);
+    ptr += 2 * kN * HeadDim * sizeof(__half);
     auto* scores = reinterpret_cast<float*>(ptr);
     ptr += GroupSize * kBlockM * kN * sizeof(float);
     auto* probabilities = reinterpret_cast<__half*>(ptr);
     ptr += GroupSize * kBlockM * kN * sizeof(__half);
     auto* output_accumulator = reinterpret_cast<float*>(ptr);
     ptr += GroupSize * kBlockM * HeadDim * sizeof(float);
-    auto* mma_tiles = reinterpret_cast<float*>(ptr);
-    ptr += GroupSize * kBlockM * 16 * sizeof(float);
     auto* running_max = reinterpret_cast<float*>(ptr);
     ptr += GroupSize * kBlockM * sizeof(float);
     auto* running_sum = reinterpret_cast<float*>(ptr);
@@ -680,18 +746,33 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
     float* warp_scores = scores + warp * kBlockM * kN;
     __half* warp_probabilities = probabilities + warp * kBlockM * kN;
     float* warp_output = output_accumulator + warp * kBlockM * HeadDim;
-    float* warp_mma_tile = mma_tiles + warp * kBlockM * 16;
 
-    for (int key_begin = 0; key_begin < max_visible_key; key_begin += kN) {
-        load_kv_rows_f16<HeadDim, kN>(
-            key_shared,
-            value_shared,
-            key + kv_head_base,
-            value + kv_head_base,
-            key_begin,
-            key_value_sequence,
-            kv_row_stride);
+    if (max_visible_key > 0) {
+        load_kv_rows_f16_async<HeadDim, kN>(
+            key_shared, value_shared,
+            key + kv_head_base, value + kv_head_base,
+            0, key_value_sequence, kv_row_stride);
+    }
+
+    for (int key_begin = 0, tile_index = 0;
+         key_begin < max_visible_key;
+         key_begin += kN, ++tile_index) {
+        const int stage = tile_index & 1;
+        __half* current_key = key_shared + stage * kN * HeadDim;
+        __half* current_value = value_shared + stage * kN * HeadDim;
+
+        wait_kv_rows_f16_async();
         __syncthreads();
+
+        const int next_key_begin = key_begin + kN;
+        if (next_key_begin < max_visible_key) {
+            const int next_stage = stage ^ 1;
+            load_kv_rows_f16_async<HeadDim, kN>(
+                key_shared + next_stage * kN * HeadDim,
+                value_shared + next_stage * kN * HeadDim,
+                key + kv_head_base, value + kv_head_base,
+                next_key_begin, key_value_sequence, kv_row_stride);
+        }
 
         using namespace nvcuda;
         #pragma unroll
@@ -709,7 +790,7 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
                     query_fragment, warp_query + dimension, HeadDim);
                 wmma::load_matrix_sync(
                     key_fragment,
-                    key_shared + subtile * HeadDim + dimension,
+                    current_key + subtile * HeadDim + dimension,
                     HeadDim);
                 wmma::mma_sync(
                     score_fragment,
@@ -746,8 +827,8 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
             const float new_max = fmaxf(old_max, tile_max);
             const float old_scale = old_max == -INFINITY
                 ? 0.0F
-                : __expf(old_max - new_max);
-            const float probability = valid ? __expf(score - new_max) : 0.0F;
+                : exp2f((old_max - new_max) * 1.4426950408889634F);
+            const float probability = valid ? exp2f((score - new_max) * 1.4426950408889634F) : 0.0F;
             float tile_sum = warp_reduce_sum(probability);
             tile_sum = __shfl_sync(0xFFFFFFFFU, tile_sum, 0);
 
@@ -774,7 +855,11 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
         for (int dimension = 0; dimension < HeadDim; dimension += 16) {
             wmma::fragment<wmma::accumulator, 16, 16, 16, float>
                 output_fragment;
-            wmma::fill_fragment(output_fragment, 0.0F);
+            wmma::load_matrix_sync(
+                output_fragment,
+                warp_output + dimension,
+                HeadDim,
+                wmma::mem_row_major);
             #pragma unroll
             for (int subtile = 0; subtile < kN; subtile += 16) {
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, __half,
@@ -787,7 +872,7 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
                     kN);
                 wmma::load_matrix_sync(
                     value_fragment,
-                    value_shared + subtile * HeadDim + dimension,
+                    current_value + subtile * HeadDim + dimension,
                     HeadDim);
                 wmma::mma_sync(
                     output_fragment,
@@ -796,18 +881,10 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
                     output_fragment);
             }
             wmma::store_matrix_sync(
-                warp_mma_tile,
+                warp_output + dimension,
                 output_fragment,
-                16,
+                HeadDim,
                 wmma::mem_row_major);
-            __syncwarp();
-            for (int index = lane; index < kBlockM * 16; index += kWarpSize) {
-                const int local_row = index >> 4;
-                const int column = index & 15;
-                warp_output[local_row * HeadDim + dimension + column] +=
-                    warp_mma_tile[index];
-            }
-            __syncwarp();
         }
         __syncthreads();
     }
@@ -845,19 +922,18 @@ void flash_gqa_grouped_f16_tensor_core_kernel(
  * @brief Computes dynamic shared-memory usage of the grouped GQA kernel.
  *
  * The returned size includes Q, K, V, score, probability, float output,
- * temporary WMMA, running-maximum, and running-sum storage.
+ * running-maximum, and running-sum storage.
  */
 template <int HeadDim, int GroupSize>
 constexpr std::size_t grouped_f16_shared_bytes() {
     constexpr int kBlockM = 16;
     constexpr int kN = kGroupedBlockN;
     return static_cast<std::size_t>(GroupSize) * kBlockM * HeadDim * sizeof(__half)
-         + static_cast<std::size_t>(kN) * HeadDim * sizeof(__half)
-         + static_cast<std::size_t>(kN) * HeadDim * sizeof(__half)
+         + 2U * static_cast<std::size_t>(kN) * HeadDim * sizeof(__half)
+         + 2U * static_cast<std::size_t>(kN) * HeadDim * sizeof(__half)
          + static_cast<std::size_t>(GroupSize) * kBlockM * kN * sizeof(float)
          + static_cast<std::size_t>(GroupSize) * kBlockM * kN * sizeof(__half)
          + static_cast<std::size_t>(GroupSize) * kBlockM * HeadDim * sizeof(float)
-         + static_cast<std::size_t>(GroupSize) * kBlockM * 16 * sizeof(float)
          + static_cast<std::size_t>(GroupSize) * kBlockM * sizeof(float)
          + static_cast<std::size_t>(GroupSize) * kBlockM * sizeof(float);
 }
@@ -931,8 +1007,8 @@ void launch_grouped_f16(
 /**
  * @brief Computes dynamic shared-memory usage of the generic tiled kernel.
  *
- * The returned size includes the query tile, one K/V tile, intermediate scores
- * and probabilities, the FP16 online output accumulator, WMMA scratch space,
+ * The returned size includes the query tile, two pipelined K/V tiles, intermediate scores
+ * and probabilities, the FP32 online output accumulator,
  * and softmax statistics.
  *
  * @note With kBlockN == 32, HeadDim=128 at the dispatcher's BlockM=64 needs
@@ -947,14 +1023,12 @@ void launch_grouped_f16(
  */
 template <int HeadDim, int BlockM>
 constexpr std::size_t tiled_f16_shared_bytes() {
-    constexpr int kWarps = BlockM / 16;
     return static_cast<std::size_t>(BlockM) * HeadDim * sizeof(__half)
-         + static_cast<std::size_t>(kBlockN) * HeadDim * sizeof(__half)
-         + static_cast<std::size_t>(kBlockN) * HeadDim * sizeof(__half)
+         + 2U * static_cast<std::size_t>(kBlockN) * HeadDim * sizeof(__half)
+         + 2U * static_cast<std::size_t>(kBlockN) * HeadDim * sizeof(__half)
          + static_cast<std::size_t>(BlockM) * kBlockN * sizeof(float)
          + static_cast<std::size_t>(BlockM) * kBlockN * sizeof(__half)
-         + static_cast<std::size_t>(BlockM) * HeadDim * sizeof(__half)
-         + static_cast<std::size_t>(kWarps) * 16 * 16 * sizeof(float)
+         + static_cast<std::size_t>(BlockM) * HeadDim * sizeof(float)
          + static_cast<std::size_t>(BlockM) * sizeof(float)
          + static_cast<std::size_t>(BlockM) * sizeof(float);
 }

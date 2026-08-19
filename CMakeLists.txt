@@ -118,6 +118,7 @@ add_cgpt_test(kv_cache_test tests/kv_cache_test.cu cgpt_core)
 add_cgpt_test(transformer_block_test tests/transformer_block_test.cu cgpt_core)
 add_cgpt_test(transformer_model_test tests/transformer_model_test.cu cgpt_core)
 add_cgpt_test(adamw_test tests/adamw_test.cu cgpt_core)
+add_cgpt_test(fp16_numerical_stability_test tests/fp16_numerical_stability_test.cu cgpt_core)
 add_cgpt_test(dataset_loader_test tests/dataset_loader_test.cpp cgpt_core)
 add_cgpt_test(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp cgpt_tokenizer)
 add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_tokenizer)
@@ -125,7 +126,7 @@ add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_t
 add_executable(run_all_tests tests/run_all_tests.cpp)
 add_dependencies(run_all_tests
         rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test
-        flash_attention_test embedding_test cross_entropy_test cut_cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test
+        flash_attention_test embedding_test cross_entropy_test cut_cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test fp16_numerical_stability_test
         dataset_loader_test bpe_tokenizer_test bpe_tokenizer_100mb_test)
 if (WIN32)
     add_custom_target(run_all
@@ -155,6 +156,7 @@ set(CGPT_RUN_ALL_ARGUMENTS
                 transformer_block_test $<TARGET_FILE:transformer_block_test>
                 transformer_model_test $<TARGET_FILE:transformer_model_test>
                 adamw_test $<TARGET_FILE:adamw_test>
+                fp16_numerical_stability_test $<TARGET_FILE:fp16_numerical_stability_test>
                 dataset_loader_test $<TARGET_FILE:dataset_loader_test>
                 bpe_tokenizer_test $<TARGET_FILE:bpe_tokenizer_test>
         bpe_tokenizer_100mb_test $<TARGET_FILE:bpe_tokenizer_100mb_test>)
@@ -177,7 +179,7 @@ if (Python3_Interpreter_FOUND)
 endif()
 
 set_tests_properties(
-        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test dataset_loader_test bpe_tokenizer_test
+        rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test fp16_numerical_stability_test dataset_loader_test bpe_tokenizer_test
         PROPERTIES TIMEOUT 30)
 
 # The cross-entropy benchmark processes a GPT-2-sized vocabulary and needs
