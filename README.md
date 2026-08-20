@@ -1,5 +1,7 @@
 # CGPT Training Report
 
+> **CGPT** — a local CUDA-based language model written in C++20.
+
 ## Summary
 
 A complete one-epoch training run was performed for the `104m` model on the approximately 10 GB `FineWeb-Edu` dataset. Training completed successfully after **58,874 optimizer steps**.
@@ -10,6 +12,137 @@ Final losses:
 - validation loss: **3.282484**.
 
 The model and checkpoints were saved in `output/model-104m`.
+
+## Table of contents
+
+- [Summary](#summary)
+- [Quick start](#quick-start)
+  - [Configure and build (Windows / PowerShell)](#configure-and-build-windows--powershell)
+  - [Tests](#tests)
+  - [Text generation](#text-generation)
+  - [Training](#training)
+  - [API documentation](#api-documentation)
+- [Experiment configuration](#experiment-configuration)
+- [Data preparation](#data-preparation)
+- [Training progress](#training-progress)
+- [Comparison with GPT-2](#comparison-with-gpt-2)
+- [Generation result](#generation-result)
+- [Conclusions](#conclusions)
+- [Artifacts](#artifacts)
+
+## Quick start
+
+The project builds a CUDA core library, the `cgpt_train` training executable, the `cgpt_cli` text-generation interface, and a unit-test suite. The main build requirements are:
+
+- CMake `4.3` or newer;
+- a C++20 compiler with CUDA support;
+- the CUDA Toolkit with `cudart`, `cuBLASLt`, and CUPTI;
+- a compatible NVIDIA GPU (CUDA architectures `86` and `90a` are compiled by default).
+
+### Configure and build (Windows / PowerShell)
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release --parallel
+```
+
+If you are using an existing build directory, run:
+
+```powershell
+cmake --build build --config Release --parallel
+```
+
+### Tests
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Alternatively, use the aggregate CMake target:
+
+```powershell
+cmake --build build --config Release --target run_all
+```
+
+To run a single test:
+
+```powershell
+ctest --test-dir build -C Release -R rmsnorm_test --output-on-failure
+```
+
+### Text generation
+
+After building, start the CLI without a prompt to enter REPL mode:
+
+```powershell
+.\build\Release\cgpt_cli.exe
+```
+
+To generate text from a single prompt:
+
+```powershell
+.\build\Release\cgpt_cli.exe `
+  --model .\build\Release\outputdg\step-58874 `
+  --prompt "The future of local AI is" `
+  --max-new-tokens 128 `
+  --temperature 0.8 `
+  --device cuda
+```
+
+To display CLI help and use common generation parameters:
+
+```powershell
+.\build\Release\cgpt_cli.exe --help
+.\build\Release\cgpt_cli.exe --prompt "Hello" --top-k 40 --top-p 0.95 --seed 42
+```
+
+The REPL supports `/help`, `/params`, `/set <parameter> <value>`, and `/exit`.
+
+### Training
+
+Example training command using the configuration described in this report:
+
+```powershell
+.\build\Release\cgpt_train.exe `
+  --input data\fineweb_edu_10gb.jsonl `
+  --tokenizer data\fineweb_edu_tokenizer_32k.json `
+  --output-dir output\model-104m `
+  --model 104m `
+  --vocab-size 32000 `
+  --batch-size 32 `
+  --sequence-length 1024 `
+  --epochs 1 `
+  --learning-rate 3e-4 `
+  --min-learning-rate 3e-5 `
+  --validation-fraction 0.1 `
+  --validation-interval 5000 `
+  --validation-batches 64 `
+  --save-avg-loss
+```
+
+### API documentation
+
+The project includes a `Doxyfile` for generating HTML and LaTeX documentation from the source code and public headers. From the project root, run:
+
+```powershell
+doxygen Doxyfile
+```
+
+The generated documentation is written to the `html` and `latex` directories. To open the HTML documentation locally on Windows:
+
+```powershell
+Start-Process .\html\index.html
+```
+
+Useful helper scripts:
+
+```powershell
+python scripts\download_100mb.py
+python scripts\download_fineweb_edu.py
+.\scripts\profile_kernels.ps1
+```
+
+> Data and model paths may need to be adjusted for the local build directory and CMake generator configuration. Detailed results are provided below.
 
 ## Experiment configuration
 
