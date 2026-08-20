@@ -25,6 +25,7 @@ add_library(cgpt_core STATIC
         src/optim/adamw.cu src/ops/rmsnorm.cu src/ops/swiglu.cu src/ops/rope.cu src/core/tensor.cu src/core/kv_cache.cu
         src/core/transformer_block.cu src/core/transformer_model.cu src/core/weight_initialization.cu src/core/generation.cu
         src/core/cuda_graph.cu src/core/huggingface_export.cpp src/ops/attention.cu
+        src/core/generation_cpu.cpp
         src/ops/cpu/swiglu_cpu.cpp src/ops/cpu/softmax_cpu.cpp
         src/ops/cpu/rope_cpu.cpp src/ops/cpu/rmsnorm_cpu.cpp
         src/ops/cpu/linear_cpu.cpp src/ops/cpu/embedding_cpu.cpp

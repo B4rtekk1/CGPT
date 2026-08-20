@@ -54,6 +54,21 @@ struct TextGenerationResult {
     std::size_t generated_tokens = 0;
 };
 
+/** CPU autoregressive generation. All model and cache tensors must be CPU tensors. */
+[[nodiscard]] std::vector<bpe::TokenId> generate_tokens_cpu(
+    const std::vector<bpe::TokenId>& prompt_tokens,
+    const TransformerModelWeights& weights,
+    const Tensor& cos_cache, const Tensor& sin_cache,
+    const TransformerModelOptions& model_options,
+    const GenerationOptions& generation_options = {});
+
+[[nodiscard]] TextGenerationResult generate_text_with_stats_cpu(
+    const bpe::BpeTokenizer& tokenizer, std::string_view prompt,
+    const TransformerModelWeights& weights,
+    const Tensor& cos_cache, const Tensor& sin_cache,
+    const TransformerModelOptions& model_options,
+    const GenerationOptions& generation_options = {});
+
 /**
  * @brief Generates token IDs autoregressively from a decoder-only Transformer.
  *
