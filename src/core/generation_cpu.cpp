@@ -10,15 +10,248 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <stdexcept>
 
 namespace {
-float read(const Tensor& t,std::size_t i){std::vector<float> x(t.numel());t.copy_to_host(x);return x[i];}
-void copy_tensor(Tensor& dst,const Tensor& src){std::memcpy(dst.raw_data(),src.raw_data(),src.nbytes());}
-void add(Tensor& a,const Tensor& b){auto* d=static_cast<std::uint8_t*>(a.raw_data());const auto* s=static_cast<const std::uint8_t*>(b.raw_data());for(std::size_t i=0;i<a.numel();++i){if(a.dtype()==Dtype::F32)static_cast<float*>(a.raw_data())[i]+=static_cast<const float*>(b.raw_data())[i];else {std::vector<float> av(a.numel()),bv(b.numel());a.copy_to_host(av);b.copy_to_host(bv);for(std::size_t j=0;j<a.numel();++j)av[j]+=bv[j];a.copy_from_host(av);break;}}static_cast<void>(d);static_cast<void>(s);}
-bpe::TokenId sample(const std::vector<float>& logits,const std::vector<bpe::TokenId>& ctx,const GenerationOptions& o,std::mt19937_64& rng){std::vector<float> x=logits;std::vector<std::size_t> count(x.size());for(auto id:ctx)if(id<x.size())++count[id];for(std::size_t i=0;i<x.size();++i)if(count[i]){x[i]=x[i]>=0?x[i]/o.repetition_penalty:x[i]*o.repetition_penalty;x[i]-=o.presence_penalty+o.frequency_penalty*float(count[i]);}std::vector<std::size_t> ids(x.size());for(std::size_t i=0;i<x.size();++i)ids[i]=i;std::sort(ids.begin(),ids.end(),[&](auto a,auto b){return x[a]>x[b];});if(o.top_k&&o.top_k<ids.size())ids.resize(o.top_k);if(o.temperature==0)return static_cast<bpe::TokenId>(ids.front());float mx=x[ids.front()],sum=0;std::vector<float> p(ids.size());for(std::size_t i=0;i<ids.size();++i){p[i]=std::exp((x[ids[i]]-mx)/o.temperature);sum+=p[i];}for(auto& v:p)v/=sum;if(o.top_p<1){float c=0;std::size_t n=p.size();for(std::size_t i=0;i<p.size();++i){c+=p[i];if(c>=o.top_p){n=i+1;break;}}ids.resize(n);p.resize(n);float z=0;for(auto v:p)z+=v;for(auto& v:p)v/=z;}std::discrete_distribution<std::size_t>d(p.begin(),p.end());return static_cast<bpe::TokenId>(ids[d(rng)]);}
-void forward(Tensor& logits,const std::vector<bpe::TokenId>& ids,const TransformerModelWeights& w,const TransformerModelOptions& o,const Tensor& co,const Tensor& si){const auto S=ids.size(),H=o.block_options.hidden_size,Q=o.block_options.num_query_heads,KV=o.block_options.num_kv_heads,D=o.block_options.head_dim,I=o.block_options.intermediate_size;Tensor h({S,H},w.token_embedding.dtype(),DeviceType::CPU);embedding_forward_cpu(h,ids.data(),S,w.token_embedding);for(const auto& l:w.layers){Tensor n({S,H},h.dtype(),DeviceType::CPU);rmsnorm_forward_cpu(n,h,l.attention_norm,o.block_options.rms_epsilon);Tensor qf({S,Q*D},h.dtype(),DeviceType::CPU),kf({S,KV*D},h.dtype(),DeviceType::CPU),vf({S,KV*D},h.dtype(),DeviceType::CPU);linear_forward_cpu(qf,n,l.q_projection);linear_forward_cpu(kf,n,l.k_projection);linear_forward_cpu(vf,n,l.v_projection);Tensor qn({S*Q,D},h.dtype(),DeviceType::CPU),kn({S*KV,D},h.dtype(),DeviceType::CPU);copy_tensor(qn,qf);copy_tensor(kn,kf);Tensor qnw({D},h.dtype(),DeviceType::CPU),knw({D},h.dtype(),DeviceType::CPU);copy_tensor(qnw,l.q_norm);copy_tensor(knw,l.k_norm);Tensor qno(qn.shape(),h.dtype(),DeviceType::CPU),kno(kn.shape(),h.dtype(),DeviceType::CPU);rmsnorm_forward_cpu(qno,qn,qnw,o.block_options.rms_epsilon);rmsnorm_forward_cpu(kno,kn,knw,o.block_options.rms_epsilon);copy_tensor(qf,qno);copy_tensor(kf,kno);Tensor q({1,S,Q,D},h.dtype(),DeviceType::CPU),k({1,S,KV,D},h.dtype(),DeviceType::CPU),v({1,S,KV,D},h.dtype(),DeviceType::CPU);copy_tensor(q,qf);copy_tensor(k,kf);copy_tensor(v,vf);RopeOptions ro{o.block_options.rotary_dim,0};rope_forward_cpu(q,k,co,si,ro);Tensor ao({1,S,Q,D},h.dtype(),DeviceType::CPU);FlashAttentionOptions aoopt{Q,KV,D,0,o.block_options.causal};flash_gqa_attention_forward_cpu(ao,q,k,v,aoopt);Tensor af({S,H},h.dtype(),DeviceType::CPU);copy_tensor(af,ao);Tensor proj({S,H},h.dtype(),DeviceType::CPU);linear_forward_cpu(proj,af,l.o_projection);add(h,proj);Tensor fn({S,H},h.dtype(),DeviceType::CPU);rmsnorm_forward_cpu(fn,h,l.ffn_norm,o.block_options.rms_epsilon);Tensor gate({S,I},h.dtype(),DeviceType::CPU),up({S,I},h.dtype(),DeviceType::CPU);linear_forward_cpu(gate,fn,l.gate_proj);linear_forward_cpu(up,fn,l.up_proj);Tensor act({S,I},h.dtype(),DeviceType::CPU);swiglu_forward_cpu(act,gate,up);Tensor down({S,H},h.dtype(),DeviceType::CPU);linear_forward_cpu(down,act,l.down_proj);add(h,down);}Tensor norm({S,H},h.dtype(),DeviceType::CPU);rmsnorm_forward_cpu(norm,h,w.final_norm,o.block_options.rms_epsilon);linear_forward_cpu(logits,norm,w.lm_head);}
+    void copy_tensor(Tensor &dst, const Tensor &src) {
+        if (dst.nbytes() != src.nbytes() || dst.dtype() != src.dtype() ||
+            dst.device_type() != DeviceType::CPU || src.device_type() != DeviceType::CPU) {
+            throw std::invalid_argument("CPU generation: incompatible tensor copy");
+        }
+        std::memcpy(dst.raw_data(), src.raw_data(), src.nbytes());
+    }
+
+    void add(Tensor &a, const Tensor &b) {
+        if (a.shape() != b.shape() || a.dtype() != b.dtype() ||
+            a.device_type() != DeviceType::CPU || b.device_type() != DeviceType::CPU) {
+            throw std::invalid_argument("CPU generation: incompatible residual tensors");
+        }
+        if (a.dtype() == Dtype::F32) {
+            auto *dst = static_cast<float *>(a.raw_data());
+            const auto *src = static_cast<const float *>(b.raw_data());
+            for (std::size_t i = 0; i < a.numel(); ++i) dst[i] += src[i];
+            return;
+        }
+        std::vector<float> av(a.numel()), bv(b.numel());
+        a.copy_to_host(av);
+        b.copy_to_host(bv);
+        for (std::size_t i = 0; i < a.numel(); ++i) av[i] += bv[i];
+        a.copy_from_host(av);
+    }
+
+    void validate_sampling(const GenerationOptions &o) {
+        if (!std::isfinite(o.temperature) || o.temperature < 0.0F)
+            throw std::invalid_argument("temperature must be finite and non-negative");
+        if (!std::isfinite(o.top_p) || o.top_p <= 0.0F || o.top_p > 1.0F)
+            throw std::invalid_argument("top_p must be in (0, 1]");
+        if (!std::isfinite(o.repetition_penalty) || o.repetition_penalty <= 0.0F)
+            throw std::invalid_argument("repetition_penalty must be finite and positive");
+        if (!std::isfinite(o.presence_penalty) || !std::isfinite(o.frequency_penalty) ||
+            o.presence_penalty < 0.0F || o.frequency_penalty < 0.0F)
+            throw std::invalid_argument("presence and frequency penalties must be finite and non-negative");
+        if (!std::isfinite(o.min_p) || o.min_p < 0.0F || o.min_p > 1.0F)
+            throw std::invalid_argument("min_p must be in [0, 1]");
+    }
+
+    bpe::TokenId sample(const std::vector<float> &logits, const std::vector<bpe::TokenId> &ctx,
+                        const GenerationOptions &o, std::mt19937_64 &rng) {
+        if (logits.empty()) throw std::invalid_argument("cannot sample from empty logits");
+        validate_sampling(o);
+        std::vector<float> adjusted = logits;
+        std::vector<std::size_t> counts(adjusted.size());
+        for (const auto id: ctx) if (id < counts.size()) ++counts[id];
+        for (std::size_t i = 0; i < adjusted.size(); ++i)
+            if (counts[i]) {
+                adjusted[i] = adjusted[i] >= 0.0F
+                                  ? adjusted[i] / o.repetition_penalty
+                                  : adjusted[i] * o.repetition_penalty;
+                adjusted[i] -= o.presence_penalty + o.frequency_penalty * static_cast<float>(counts[i]);
+            }
+
+        if (o.no_repeat_ngram_size > 1 && ctx.size() >= o.no_repeat_ngram_size) {
+            const std::size_t n = o.no_repeat_ngram_size;
+            const std::size_t prefix_begin = ctx.size() - (n - 1);
+            for (std::size_t start = 0; start + n <= ctx.size() - 1; ++start) {
+                bool same_prefix = true;
+                for (std::size_t offset = 0; offset + 1 < n; ++offset) {
+                    if (ctx[start + offset] != ctx[prefix_begin + offset]) {
+                        same_prefix = false;
+                        break;
+                    }
+                }
+                if (same_prefix && ctx[start + n - 1] < adjusted.size())
+                    adjusted[ctx[start + n - 1]] = -std::numeric_limits<float>::infinity();
+            }
+        }
+
+        std::vector<std::size_t> ids;
+        ids.reserve(adjusted.size());
+        for (std::size_t i = 0; i < adjusted.size(); ++i)
+            if (std::isfinite(adjusted[i])) ids.push_back(i);
+        if (ids.empty()) throw std::runtime_error("no valid token remains after logits processing");
+        std::ranges::sort(ids, [&](const auto a, const auto b) { return adjusted[a] > adjusted[b]; });
+        if (o.top_k != 0 && o.top_k < ids.size()) ids.resize(o.top_k);
+        if (o.temperature == 0.0F) return static_cast<bpe::TokenId>(ids.front());
+
+        const float max_logit = adjusted[ids.front()];
+        std::vector<float> probabilities(ids.size());
+        float total = 0.0F;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            probabilities[i] = std::exp((adjusted[ids[i]] - max_logit) / o.temperature);
+            total += probabilities[i];
+        }
+        for (float &probability: probabilities) probability /= total;
+        if (o.min_p > 0.0F && probabilities.size() > 1) {
+            const float cutoff = o.min_p * probabilities.front();
+            std::size_t keep = probabilities.size();
+            for (std::size_t i = 1; i < probabilities.size(); ++i)
+                if (probabilities[i] < cutoff) {
+                    keep = i;
+                    break;
+                }
+            ids.resize(keep);
+            probabilities.resize(keep);
+            float kept_total = 0.0F;
+            for (const float p: probabilities) kept_total += p;
+            for (float &p: probabilities) p /= kept_total;
+        }
+        if (o.top_p < 1.0F) {
+            float cumulative = 0.0F;
+            std::size_t keep = probabilities.size();
+            for (std::size_t i = 0; i < probabilities.size(); ++i) {
+                cumulative += probabilities[i];
+                if (cumulative >= o.top_p) {
+                    keep = i + 1;
+                    break;
+                }
+            }
+            ids.resize(keep);
+            probabilities.resize(keep);
+            float kept_total = 0.0F;
+            for (const float p: probabilities) kept_total += p;
+            for (float &p: probabilities) p /= kept_total;
+        }
+        std::discrete_distribution<std::size_t> distribution(probabilities.begin(), probabilities.end());
+        return static_cast<bpe::TokenId>(ids[distribution(rng)]);
+    }
+
+    void forward(Tensor &logits, const std::vector<bpe::TokenId> &ids, const TransformerModelWeights &w,
+                 const TransformerModelOptions &o, const Tensor &co, const Tensor &si) {
+        const auto S = ids.size(), H = o.block_options.hidden_size, Q = o.block_options.num_query_heads, KV = o.
+                block_options.num_kv_heads, D = o.block_options.head_dim, I = o.block_options.intermediate_size;
+        Tensor h({S, H}, w.token_embedding.dtype(), DeviceType::CPU);
+        embedding_forward_cpu(h, ids.data(), S, w.token_embedding);
+        for (const auto &l: w.layers) {
+            Tensor residual(h.shape(), h.dtype(), DeviceType::CPU);
+            copy_tensor(residual, h);
+            Tensor n({S, H}, h.dtype(), DeviceType::CPU);
+            rmsnorm_forward_cpu(n, residual, l.attention_norm, o.block_options.rms_epsilon);
+            Tensor qf({S, Q * D}, h.dtype(), DeviceType::CPU), kf({S, KV * D}, h.dtype(), DeviceType::CPU), vf(
+                {S, KV * D}, h.dtype(), DeviceType::CPU);
+            linear_forward_cpu(qf, n, l.q_projection);
+            linear_forward_cpu(kf, n, l.k_projection);
+            linear_forward_cpu(vf, n, l.v_projection);
+            Tensor qn({S * Q, D}, h.dtype(), DeviceType::CPU), kn({S * KV, D}, h.dtype(), DeviceType::CPU);
+            copy_tensor(qn, qf);
+            copy_tensor(kn, kf);
+            Tensor qnw({D}, h.dtype(), DeviceType::CPU), knw({D}, h.dtype(), DeviceType::CPU);
+            copy_tensor(qnw, l.q_norm);
+            copy_tensor(knw, l.k_norm);
+            Tensor qno(qn.shape(), h.dtype(), DeviceType::CPU), kno(kn.shape(), h.dtype(), DeviceType::CPU);
+            rmsnorm_forward_cpu(qno, qn, qnw, o.block_options.rms_epsilon);
+            rmsnorm_forward_cpu(kno, kn, knw, o.block_options.rms_epsilon);
+            copy_tensor(qf, qno);
+            copy_tensor(kf, kno);
+            Tensor q({1, S, Q, D}, h.dtype(), DeviceType::CPU), k({1, S, KV, D}, h.dtype(), DeviceType::CPU), v(
+                {1, S, KV, D}, h.dtype(), DeviceType::CPU);
+            copy_tensor(q, qf);
+            copy_tensor(k, kf);
+            copy_tensor(v, vf);
+            RopeOptions ro{o.block_options.rotary_dim, 0};
+            rope_forward_cpu(q, k, co, si, ro);
+            Tensor ao({1, S, Q, D}, h.dtype(), DeviceType::CPU);
+            FlashAttentionOptions aoopt{Q, KV, D, 0, o.block_options.causal};
+            flash_gqa_attention_forward_cpu(ao, q, k, v, aoopt);
+            Tensor af({S, H}, h.dtype(), DeviceType::CPU);
+            copy_tensor(af, ao);
+            Tensor proj({S, H}, h.dtype(), DeviceType::CPU);
+            linear_forward_cpu(proj, af, l.o_projection);
+            Tensor fn({S, H}, h.dtype(), DeviceType::CPU);
+            rmsnorm_forward_cpu(fn, residual, l.ffn_norm, o.block_options.rms_epsilon);
+            Tensor gate({S, I}, h.dtype(), DeviceType::CPU), up({S, I}, h.dtype(), DeviceType::CPU);
+            linear_forward_cpu(gate, fn, l.gate_proj);
+            linear_forward_cpu(up, fn, l.up_proj);
+            Tensor act({S, I}, h.dtype(), DeviceType::CPU);
+            swiglu_forward_cpu(act, gate, up);
+            Tensor down({S, H}, h.dtype(), DeviceType::CPU);
+            linear_forward_cpu(down, act, l.down_proj);
+            add(h, proj);
+            add(h, down);
+        }
+        Tensor norm({S, H}, h.dtype(), DeviceType::CPU);
+        rmsnorm_forward_cpu(norm, h, w.final_norm, o.block_options.rms_epsilon);
+        linear_forward_cpu(logits, norm, w.lm_head);
+    }
 }
-std::vector<bpe::TokenId> generate_tokens_cpu(const std::vector<bpe::TokenId>& prompt,const TransformerModelWeights& w,const Tensor& co,const Tensor& si,const TransformerModelOptions& o,const GenerationOptions& go){if(prompt.empty())throw std::invalid_argument("prompt must contain at least one token");if(!go.max_new_tokens)return prompt;if(!go.max_context_tokens)throw std::invalid_argument("max_context_tokens must be positive");std::mt19937_64 rng(go.seed?go.seed:std::random_device{}());std::vector<bpe::TokenId> result=prompt;for(std::size_t step=0;step<go.max_new_tokens;++step){const std::size_t begin=result.size()>go.max_context_tokens?result.size()-go.max_context_tokens:0;std::vector<bpe::TokenId> ctx(result.begin()+begin,result.end());Tensor logits({ctx.size(),o.vocabulary_size},w.token_embedding.dtype(),DeviceType::CPU);forward(logits,ctx,w,o,co,si);std::vector<float> host(logits.numel());logits.copy_to_host(host);std::vector<float> last(host.end()-o.vocabulary_size,host.end());auto next=sample(last,result,go,rng);result.push_back(next);if(go.eos_token_id&&next==*go.eos_token_id)break;}return result;}
-TextGenerationResult generate_text_with_stats_cpu(const bpe::BpeTokenizer& tok,std::string_view prompt,const TransformerModelWeights& w,const Tensor& co,const Tensor& si,const TransformerModelOptions& o,const GenerationOptions& go){auto p=tok.encode(prompt);auto r=generate_tokens_cpu(p,w,co,si,o,go);return {tok.decode(r),p.size(),r.size()-p.size()};}
+
+std::vector<bpe::TokenId> generate_tokens_cpu(
+    const std::vector<bpe::TokenId> &prompt, const TransformerModelWeights &w,
+    const Tensor &co, const Tensor &si, const TransformerModelOptions &o,
+    const GenerationOptions &go) {
+    if (prompt.empty()) throw std::invalid_argument("prompt must contain at least one token");
+    if (!go.max_new_tokens) return prompt;
+    if (!go.max_context_tokens) throw std::invalid_argument("max_context_tokens must be positive");
+    if (co.device_type() != DeviceType::CPU || si.device_type() != DeviceType::CPU ||
+        co.dim() != 2 || si.dim() != 2 || co.shape() != si.shape() ||
+        co.size(0) < go.max_context_tokens) {
+        throw std::invalid_argument("CPU generation: RoPE caches are incompatible or too short");
+    }
+    if (w.token_embedding.device_type() != DeviceType::CPU ||
+        w.final_norm.device_type() != DeviceType::CPU ||
+        w.lm_head.device_type() != DeviceType::CPU ||
+        w.layers.size() != o.num_layers) {
+        throw std::invalid_argument("CPU generation requires CPU-resident model weights");
+    }
+    validate_sampling(go);
+    std::mt19937_64 rng(go.seed ? go.seed : std::random_device{}());
+    std::vector<bpe::TokenId> result = prompt;
+    for (std::size_t step = 0; step < go.max_new_tokens; ++step) {
+        const std::size_t begin = result.size() > go.max_context_tokens
+                                      ? result.size() - go.max_context_tokens
+                                      : 0;
+        const std::vector<bpe::TokenId> ctx(result.begin() + begin, result.end());
+        Tensor logits({ctx.size(), o.vocabulary_size}, w.token_embedding.dtype(), DeviceType::CPU);
+        forward(logits, ctx, w, o, co, si);
+        std::vector<float> host(logits.numel());
+        logits.copy_to_host(host);
+        const std::vector<float> last(host.end() - o.vocabulary_size, host.end());
+        const auto next = sample(last, result, go, rng);
+        result.push_back(next);
+        if (go.eos_token_id && next == *go.eos_token_id) break;
+    }
+    return result;
+}
+
+TextGenerationResult generate_text_with_stats_cpu(
+    const bpe::BpeTokenizer &tok, std::string_view prompt,
+    const TransformerModelWeights &w, const Tensor &co, const Tensor &si,
+    const TransformerModelOptions &o, const GenerationOptions &go) {
+    GenerationOptions text_options = go;
+    if (!text_options.eos_token_id) {
+        for (const std::string_view name: {"<eos>", "</s>", "<|endoftext|>", "<|end|>"}) {
+            if (const auto token = tok.special_token_id(name)) {
+                text_options.eos_token_id = token;
+                break;
+            }
+        }
+    }
+    const auto prompt_tokens = tok.encode(prompt);
+    const auto all_tokens = generate_tokens_cpu(
+        prompt_tokens, w, co, si, o, text_options);
+    return {
+        tok.decode(all_tokens), prompt_tokens.size(),
+        all_tokens.size() - prompt_tokens.size()
+    };
+}
