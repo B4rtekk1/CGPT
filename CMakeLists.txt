@@ -3,6 +3,7 @@ project(CGPT VERSION 1.0 LANGUAGES CXX CUDA)
 include(CTest)
 enable_testing()
 find_package(CUDAToolkit REQUIRED)
+find_package(OpenMP)
 if (WIN32)
     file(GLOB CGPT_CUPTI_RUNTIME_DLLS "${CUDAToolkit_CUPTI_INCLUDE_DIR}/../lib64/cupti64_*.dll")
     if (NOT CGPT_CUPTI_RUNTIME_DLLS)
@@ -23,10 +24,22 @@ add_library(cgpt_core STATIC
         src/ops/backward/attention_backward.cu src/ops/backward/embedding_backward.cu src/ops/backward/rope_backward.cu
         src/optim/adamw.cu src/ops/rmsnorm.cu src/ops/swiglu.cu src/ops/rope.cu src/core/tensor.cu src/core/kv_cache.cu
         src/core/transformer_block.cu src/core/transformer_model.cu src/core/weight_initialization.cu src/core/generation.cu
-        src/core/cuda_graph.cu src/core/huggingface_export.cpp src/ops/attention.cu)
+        src/core/cuda_graph.cu src/core/huggingface_export.cpp src/ops/attention.cu
+        src/ops/cpu/swiglu_cpu.cpp src/ops/cpu/softmax_cpu.cpp)
 set_source_files_properties(src/ops/cross_entropy.cu src/ops/softmax.cu PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 target_include_directories(cgpt_core PUBLIC ${CGPT_INCLUDE_DIR} ${CGPT_INCLUDE_DIR}/core)
 target_link_libraries(cgpt_core PUBLIC CUDA::cudart CUDA::cublasLt)
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(cgpt_core PUBLIC OpenMP::OpenMP_CXX)
+endif()
+if (MSVC)
+    target_compile_options(cgpt_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+else()
+    target_compile_options(cgpt_core PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-mavx2>
+        $<$<COMPILE_LANGUAGE:CXX>:-mfma>
+        $<$<COMPILE_LANGUAGE:CXX>:-mf16c>)
+endif()
 if (MSVC)
     target_compile_options(cgpt_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
 endif()

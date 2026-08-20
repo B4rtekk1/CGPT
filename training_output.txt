@@ -1,0 +1,52 @@
+./build/cgpt_train \                                                                                  [13/13]
+  --input data/fineweb_edu_10gb.jsonl \
+  --tokenizer data/fineweb_edu_tokenizer_32k.json \
+  --output-dir output/model-104m \
+  --model 104m \
+  --vocab-size 32000 \
+  --batch-size 32 \
+  --sequence-length 1024 \
+  --epochs 1 \
+  --learning-rate 3e-4 \
+  --min-learning-rate 3e-5 \
+  --warmup-steps 0 \
+  --loss-scale 1024 \
+  --validation-fraction 0.1 \
+  --validation-interval 5000 \
+  --validation-batches 64 \
+  --save-avg-loss
+Training BPE tokenizer on 1024 MiB (full input will be tokenized)...
+BPE training [========================================] 100.0% 31740/31740 | 139.66 it/s | ETA: 0.0 s | Total time: 227.26 s
+Tokenizing [========================================] 100.0% 9843688080/9843688080 | 414.98 MiB/s | ETA: 0.0 s | Total time: 22.62 s
+Vocabulary: 32000, tokens: 2143562534
+Training [===                                     ] 8.5% 5000/58874 | 4.62 it/s | ETA: 11664.8 s | loss=3.910492 | validation_loss=3.908841
+Saved validation checkpoint at step 5000 to "output/model-104m/checkpoints/step-5000"
+Training [======                                  ] 17.0% 10000/58874 | 4.62 it/s | ETA: 10579.5 s | loss=3.702029 | validation_loss=3.707374
+Saved validation checkpoint at step 10000 to "output/model-104m/checkpoints/step-10000"
+Training [==========                              ] 25.5% 15000/58874 | 4.62 it/s | ETA: 9495.9 s | loss=3.562318 | validation_loss=3.607797
+Saved validation checkpoint at step 15000 to "output/model-104m/checkpoints/step-15000"
+Training [=============                           ] 34.0% 20000/58874 | 4.62 it/s | ETA: 8413.2 s | loss=3.399266 | validation_loss=3.540929
+Saved validation checkpoint at step 20000 to "output/model-104m/checkpoints/step-20000"
+Training [================                        ] 42.5% 25000/58874 | 4.62 it/s | ETA: 7330.7 s | loss=3.500671 | validation_loss=3.487137
+Saved validation checkpoint at step 25000 to "output/model-104m/checkpoints/step-25000"
+Training [====================                    ] 51.0% 30000/58874 | 4.62 it/s | ETA: 6248.5 s | loss=3.451362 | validation_loss=3.441219
+Saved validation checkpoint at step 30000 to "output/model-104m/checkpoints/step-30000"
+Training [=======================                 ] 59.4% 35000/58874 | 4.62 it/s | ETA: 5166.5 s | loss=3.431984 | validation_loss=3.398644
+Saved validation checkpoint at step 35000 to "output/model-104m/checkpoints/step-35000"
+Training [===========================             ] 67.9% 40000/58874 | 4.62 it/s | ETA: 4084.4 s | loss=3.370052 | validation_loss=3.362667
+Saved validation checkpoint at step 40000 to "output/model-104m/checkpoints/step-40000"
+Training [==============================          ] 76.4% 45000/58874 | 4.62 it/s | ETA: 3002.4 s | loss=3.197763 | validation_loss=3.331056
+Saved validation checkpoint at step 45000 to "output/model-104m/checkpoints/step-45000"
+Training [=================================       ] 84.9% 50000/58874 | 4.62 it/s | ETA: 1920.4 s | loss=3.220727 | validation_loss=3.306455
+Saved validation checkpoint at step 50000 to "output/model-104m/checkpoints/step-50000"
+Training [=====================================   ] 93.4% 55000/58874 | 4.62 it/s | ETA: 838.4 s | loss=3.411847 | validation_loss=3.289633
+Saved validation checkpoint at step 55000 to "output/model-104m/checkpoints/step-55000"
+Training [========================================] 100.0% 58874/58874 | 4.62 it/s | ETA: 0.0 s | loss=3.302037 | validation_loss=3.282484
+Saved validation checkpoint at step 58874 to "output/model-104m/checkpoints/step-58874"
+Training [========================================] 100.0% 58874/58874 | 4.62 it/s | ETA: 0.0 s | loss=3.302037 | validation_loss=3.282484 | Total time: 127
+41.46 s
+
+Generated text:
+The question is whether the water in the ocean is actually fresh. In this case the question is whether the sea is actually fresh.
+<eos>
+Completed 58874 optimizer steps. Hugging Face model saved to "output/model-104m"
