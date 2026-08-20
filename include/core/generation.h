@@ -31,6 +31,16 @@ struct GenerationOptions {
     std::size_t top_k = 0;       // 0 disables top-k filtering.
     /** @brief Cumulative probability threshold; `1.0` disables nucleus filtering. */
     float top_p = 1.0F;          // 1 disables nucleus filtering.
+    /** @brief Penalizes tokens already present in the active context. 1 disables it. */
+    float repetition_penalty = 1.0F;
+    /** @brief Additive penalty applied once to every token present in the context. */
+    float presence_penalty = 0.0F;
+    /** @brief Additive penalty applied for every occurrence in the context. */
+    float frequency_penalty = 0.0F;
+    /** @brief Prevents a previously seen n-gram from being completed again. */
+    std::size_t no_repeat_ngram_size = 0;
+    /** @brief Keeps tokens whose probability is at least min_p * best probability. */
+    float min_p = 0.0F;
     /** @brief Random seed; zero requests a non-deterministic seed. */
     std::uint64_t seed = 0;      // 0 uses a non-deterministic seed.
     /** @brief Optional end-of-sequence token that stops generation when sampled. */
@@ -40,9 +50,11 @@ struct GenerationOptions {
 /**
  * @brief Generates token IDs autoregressively from a decoder-only Transformer.
  *
- * This reference implementation recomputes the complete context on every
- * step. It is intentionally correct and simple; KV-cache acceleration can be
- * added without changing the public sampling options.
+ * This reference implementation recomputes the complete active context on
+ * every step. If the prompt is longer than `max_context_tokens`, its oldest
+ * tokens are truncated for inference while the returned sequence remains
+ * complete. KV-cache acceleration can be added without changing the public
+ * sampling options.
  *
  * @param prompt_tokens Token IDs used as the initial prompt.
  * @param weights Transformer weights used for inference.
@@ -94,4 +106,4 @@ struct GenerationOptions {
     const TransformerModelOptions& model_options,
     const GenerationOptions& generation_options = {},
     cudaStream_t stream = nullptr
-    );
+);

@@ -24,7 +24,12 @@ struct Arguments {
     std::size_t max_context_tokens = 0;
     std::size_t top_k = 0;
     float top_p = 1.0F;
+    float min_p = 0.0F;
     float temperature = 0.8F;
+    float repetition_penalty = 1.0F;
+    float presence_penalty = 0.0F;
+    float frequency_penalty = 0.0F;
+    std::size_t no_repeat_ngram_size = 0;
     std::uint64_t seed = 0;
 };
 
@@ -38,6 +43,11 @@ struct Arguments {
               << "  --temperature X                sampling temperature (default: 0.8)\n"
               << "  --top-k N                      top-k sampling (0 = disabled)\n"
               << "  --top-p X                      nucleus sampling (default: 1.0)\n"
+              << "  --min-p X                      minimum probability sampling (default: 0)\n"
+              << "  --repetition-penalty X        repetition penalty (default: 1.0)\n"
+              << "  --presence-penalty X          one-time token penalty (default: 0)\n"
+              << "  --frequency-penalty X         per-occurrence token penalty (default: 0)\n"
+              << "  --no-repeat-ngram N            block repeated n-grams (default: 0)\n"
               << "  --seed N                       random seed\n";
     if (error.empty()) std::exit(0);
     throw std::invalid_argument("invalid arguments");
@@ -70,6 +80,11 @@ Arguments parse_arguments(int argc, char** argv) {
         else if (option == "--seed") result.seed = value_after<std::uint64_t>(option, i, argc, argv);
         else if (option == "--temperature") result.temperature = float_after(option, i, argc, argv);
         else if (option == "--top-p") result.top_p = float_after(option, i, argc, argv);
+        else if (option == "--min-p") result.min_p = float_after(option, i, argc, argv);
+        else if (option == "--repetition-penalty") result.repetition_penalty = float_after(option, i, argc, argv);
+        else if (option == "--presence-penalty") result.presence_penalty = float_after(option, i, argc, argv);
+        else if (option == "--frequency-penalty") result.frequency_penalty = float_after(option, i, argc, argv);
+        else if (option == "--no-repeat-ngram") result.no_repeat_ngram_size = value_after<std::size_t>(option, i, argc, argv);
         else usage("unknown option: " + option);
     }
     if (result.model.empty()) usage("--model is required");
@@ -147,6 +162,11 @@ std::string generate(const std::string& prompt, const Arguments& args, const bpe
     options.max_new_tokens = args.max_new_tokens;
     options.max_context_tokens = args.max_context_tokens;
     options.temperature = args.temperature; options.top_k = args.top_k; options.top_p = args.top_p; options.seed = args.seed;
+    options.min_p = args.min_p;
+    options.repetition_penalty = args.repetition_penalty;
+    options.presence_penalty = args.presence_penalty;
+    options.frequency_penalty = args.frequency_penalty;
+    options.no_repeat_ngram_size = args.no_repeat_ngram_size;
     return generate_text(tokenizer, prompt, model.weights(), cosine, sine, cublas, model.options, options);
 }
 
