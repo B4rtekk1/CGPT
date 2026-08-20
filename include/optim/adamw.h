@@ -56,7 +56,7 @@ struct AdamWBatchEntry {
     AdamWState* state = nullptr;
 };
 
-/** Reusable device-side reductions for a batched AdamW update. */
+/** Reusable device-side reductions and scalar state for a batched AdamW update. */
 class AdamWWorkspace {
 public:
     /** @brief Constructs an empty optimizer workspace. */
@@ -69,22 +69,27 @@ public:
 private:
     friend void adamw_step_many_async(std::span<const AdamWBatchEntry>,
                                       const AdamWOptions&, AdamWWorkspace&, cudaStream_t);
-    friend bool adamw_check(const AdamWWorkspace&, cudaStream_t);
+    friend bool adamw_check(AdamWWorkspace&, cudaStream_t);
     DeviceBuffer non_finite_;
+    DeviceBuffer observed_non_finite_;
     DeviceBuffer squared_norm_;
+    DeviceBuffer step_;
+    DeviceBuffer scalars_;
+    std::vector<AdamWState*> states_;
+    bool initialized_ = false;
 };
 
 /**
  * @brief Enqueues one global-norm AdamW update for all entries.
  *
- * The function
- * synchronizes the preceding gradient-statistics phase to reject NaN/Inf
- * gradients before changing host-side step counters; the parameter-update
- * kernels themselves remain asynchronous.  The caller must keep entries and
- * tensors alive until stream work completes.
+ * This function does not synchronize. Gradient validation, clipping, Adam
+ * bias correction and the conditional step counter all reside on the GPU. The
+ * host-visible @c AdamWState::step fields are refreshed by @ref adamw_check.
+ * A workspace is associated with one stable set of optimizer states.
  *
- * When the batch contains a NaN or Inf, no update is enqueued and no state
- * counter is advanced.  Use adamw_check() to retrieve that result.
+ * When the batch contains a NaN or Inf, the GPU skips the update and does not
+ * advance its step counter. Use adamw_check() periodically to retrieve any
+ * invalid-gradient condition since the prior check.
  *
  * @param entries Parameter entries participating in the update.
  * @param options Optimizer hyperparameters.
@@ -98,12 +103,13 @@ void adamw_step_many_async(
     cudaStream_t stream = nullptr);
 
 /**
- * @brief Synchronizes the stream and reports whether the last batch was finite.
+ * @brief Synchronizes the stream, refreshes host step counters, and reports
+ * whether every step since the prior check had finite gradients.
  * @param workspace Workspace containing the non-finite flag.
  * @param stream CUDA stream to synchronize.
  * @return `true` if the last batch contained only finite gradients.
  */
-[[nodiscard]] bool adamw_check(const AdamWWorkspace& workspace,
+[[nodiscard]] bool adamw_check(AdamWWorkspace& workspace,
                                cudaStream_t stream = nullptr);
 
 /**

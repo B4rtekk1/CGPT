@@ -33,6 +33,9 @@
 namespace {
 constexpr std::size_t kMiB = 1024 * 1024;
 constexpr std::size_t kTokenizerTrainingBytes = std::size_t{1} << 30;
+// Reading a device scalar on every optimizer step serializes the host with the
+// GPU.  Sample it at the same cadence as the progress display instead.
+constexpr std::size_t kMetricsInterval = 50;
 
 struct Arguments {
     std::filesystem::path input = "data/tokenizer_100mb.txt";
@@ -399,7 +402,6 @@ int main(int argc, char** argv) {
         Tensor logits({args.batch_size * args.sequence_length, tokenizer.vocab_size()}, Dtype::F16);
         Tensor loss({1}, Dtype::F32), grad_logits({args.batch_size * args.sequence_length, tokenizer.vocab_size()}, Dtype::F16);
         Tensor validation_logits({args.batch_size * args.sequence_length, tokenizer.vocab_size()}, Dtype::F16);
-        Tensor validation_loss({1}, Dtype::F32);
         data::DeviceBatch device_batch;
         data::DeviceBatch validation_device_batch;
         std::vector<std::pair<Tensor*, Tensor*>> parameters; append_parameters(model, parameters);
@@ -422,23 +424,20 @@ int main(int argc, char** argv) {
         std::size_t host_batch_index = 0;
         data::Batch& captured_batch = host_batches[host_batch_index];
         std::size_t step = 0;
-        double loss_sum = 0.0;
-        std::size_t loss_count = 0;
-        std::vector<float> host_loss(1);
         std::vector<float> host_validation_loss(1);
         std::optional<double> last_validation_loss;
-        std::optional<double> last_average_loss;
-        std::ofstream average_loss_log;
+        std::optional<double> last_training_loss;
+        std::ofstream loss_log;
         if (args.save_avg_loss) {
             std::filesystem::create_directories(args.output_directory);
-            average_loss_log.open(args.output_directory / "avg_loss.csv", std::ios::trunc);
-            if (!average_loss_log)
-                throw std::runtime_error("Unable to open average-loss log in " + args.output_directory.string());
-            average_loss_log << "step,avg_loss\n";
+            loss_log.open(args.output_directory / "loss.csv", std::ios::trunc);
+            if (!loss_log)
+                throw std::runtime_error("Unable to open loss log in " + args.output_directory.string());
+            loss_log << "step,loss\n";
         }
         const auto update_training_metrics = [&] {
-            std::string suffix = " | avg_loss=";
-            suffix += last_average_loss ? std::to_string(*last_average_loss) : "n/a";
+            std::string suffix = " | loss=";
+            suffix += last_training_loss ? std::to_string(*last_training_loss) : "n/a";
             suffix += " | validation_loss=";
             suffix += last_validation_loss ? std::to_string(*last_validation_loss) : "n/a";
             progress.set_suffix(std::move(suffix));
@@ -453,22 +452,33 @@ int main(int argc, char** argv) {
         };
         const auto run_validation = [&] {
             validation_loader.reset();
-            double validation_loss_sum = 0.0;
+            // Queue all fixed-shape validation batches before one synchronization.
+            // A separate pinned host Batch and loss scalar per iteration keeps the
+            // asynchronous H2D sources and D2H results alive until the stream
+            // reaches the final barrier.
+            std::vector<data::Batch> validation_batches(args.validation_batches);
+            std::vector<Tensor> validation_losses;
+            validation_losses.reserve(args.validation_batches);
             std::size_t validation_loss_count = 0;
-            data::Batch validation_batch;
-            while (validation_loss_count < args.validation_batches && validation_loader.next(validation_batch)) {
+            while (validation_loss_count < args.validation_batches
+                   && validation_loader.next(validation_batches[validation_loss_count])) {
+                const data::Batch& validation_batch = validation_batches[validation_loss_count];
+                validation_losses.emplace_back(std::vector<std::size_t>{1}, Dtype::F32);
                 data::upload_batch(validation_batch, validation_device_batch, cuda_stream);
                 transformer_model_forward(validation_logits,
                     static_cast<const bpe::TokenId*>(validation_device_batch.input_ids.data()), args.batch_size,
                     args.sequence_length, model.weights(), forward_workspace, cos_cache, sin_cache, cublas,
                     cuda_stream, model.options);
-                cross_entropy_forward(validation_loss, validation_logits,
+                cross_entropy_forward(validation_losses.back(), validation_logits,
                     static_cast<const bpe::TokenId*>(validation_device_batch.target_ids.data()),
                     validation_batch.token_count(), cuda_stream);
-                CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
-                validation_loss.copy_to_host(host_validation_loss);
-                validation_loss_sum += host_validation_loss[0];
                 ++validation_loss_count;
+            }
+            CUDA_CHECK(cudaStreamSynchronize(cuda_stream));
+            double validation_loss_sum = 0.0;
+            for (const Tensor& validation_batch_loss : validation_losses) {
+                validation_batch_loss.copy_to_host(host_validation_loss);
+                validation_loss_sum += host_validation_loss[0];
             }
             last_validation_loss = validation_loss_sum / static_cast<double>(validation_loss_count);
             update_training_metrics();
@@ -504,17 +514,14 @@ int main(int argc, char** argv) {
                 optimizer_options.learning_rate = scheduler.learning_rate(step);
                 adamw_step_many_async(optimizer_entries, optimizer_options, optimizer_workspace, cuda_stream);
                 ++step; progress.update(step);
-                loss.copy_to_host(host_loss);
-                loss_sum += host_loss[0];
-                ++loss_count;
-                if (step % 50 == 0 || step == total_steps) {
+                if (step % kMetricsInterval == 0 || step == total_steps) {
                     if (!adamw_check(optimizer_workspace, cuda_stream))
                         throw std::runtime_error("Non-finite gradient at step " + std::to_string(step));
-                    last_average_loss = loss_sum / static_cast<double>(loss_count);
-                    loss_sum = 0.0;
-                    loss_count = 0;
-                    if (average_loss_log)
-                        average_loss_log << step << ',' << *last_average_loss << '\n';
+                    std::vector<float> host_loss(1);
+                    loss.copy_to_host(host_loss);
+                    last_training_loss = host_loss[0];
+                    if (loss_log)
+                        loss_log << step << ',' << *last_training_loss << '\n';
                     update_training_metrics();
                 }
                 if (step % args.validation_interval == 0 || step == total_steps)

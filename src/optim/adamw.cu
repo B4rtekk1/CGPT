@@ -148,21 +148,42 @@ namespace {
     __global__ void adamw_batch_kernel(
         T* parameter, const T* gradient, float* master_parameter,
         float* first_moment, float* second_moment, std::size_t count,
-        float beta1, float beta2, float bias_correction1,
-        float bias_correction2, float learning_rate, float epsilon,
-        float weight_decay, float loss_scale, float max_grad_norm,
-        const unsigned int* non_finite, const float* squared_norm) {
+        float beta1, float beta2, float learning_rate, float epsilon,
+        float weight_decay, float loss_scale, const unsigned int* non_finite,
+        const float* scalars) {
         const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (index >= count || *non_finite != 0U) return;
-        const float norm = sqrtf(*squared_norm);
-        const float clip = (norm > max_grad_norm) ? max_grad_norm / norm : 1.0f;
-        const float grad = static_cast<float>(gradient[index]) / loss_scale * clip;
+        const float grad = static_cast<float>(gradient[index]) / loss_scale * scalars[2];
         const float first = first_moment[index] = beta1 * first_moment[index] + (1.0f - beta1) * grad;
         const float second = second_moment[index] = beta2 * second_moment[index] + (1.0f - beta2) * grad * grad;
-        const float normalized = first / bias_correction1 / (sqrtf(second / bias_correction2) + epsilon);
+        const float normalized = first / scalars[0] / (sqrtf(second / scalars[1]) + epsilon);
         const float updated = master_parameter[index] * (1.0f - learning_rate * weight_decay) - learning_rate * normalized;
         master_parameter[index] = updated;
         parameter[index] = static_cast<T>(updated);
+    }
+
+    /** Prepares one fully device-side optimizer step after gradient reductions. */
+    __global__ void adamw_prepare_step_kernel(
+        unsigned int* non_finite, unsigned int* observed_non_finite,
+        const float* squared_norm, unsigned long long* step,
+        float* scalars, float beta1, float beta2, float max_grad_norm) {
+        if (threadIdx.x != 0 || blockIdx.x != 0) return;
+        const float squared = *squared_norm;
+        if (*non_finite != 0U || !isfinite(squared)) {
+            *non_finite = 1U;
+            atomicExch(observed_non_finite, 1U);
+            return;
+        }
+        const unsigned long long next_step = *step + 1ULL;
+        *step = next_step;
+        scalars[0] = 1.0F - powf(beta1, static_cast<float>(next_step));
+        scalars[1] = 1.0F - powf(beta2, static_cast<float>(next_step));
+        if (isinf(max_grad_norm)) {
+            scalars[2] = 1.0F;
+        } else {
+            const float norm = sqrtf(squared);
+            scalars[2] = norm > max_grad_norm ? max_grad_norm / norm : 1.0F;
+        }
     }
 
     /**
@@ -246,7 +267,11 @@ namespace {
 }
 
 AdamWWorkspace::AdamWWorkspace()
-    : non_finite_(sizeof(unsigned int)), squared_norm_(sizeof(float)) {}
+    : non_finite_(sizeof(unsigned int)),
+      observed_non_finite_(sizeof(unsigned int)),
+      squared_norm_(sizeof(float)),
+      step_(sizeof(unsigned long long)),
+      scalars_(3 * sizeof(float)) {}
 
 void adamw_step_many_async(
     const std::span<const AdamWBatchEntry> entries,
@@ -255,6 +280,29 @@ void adamw_step_many_async(
     const cudaStream_t stream) {
     validate_options(options);
     if (entries.empty()) throw std::invalid_argument("adamw_step_many_async: empty parameter list");
+    if (!workspace.initialized_) {
+        const std::uint64_t initial_step = entries.front().state == nullptr
+            ? 0U : entries.front().state->step;
+        workspace.states_.clear();
+        workspace.states_.reserve(entries.size());
+        for (const auto& entry : entries) {
+            if (entry.state == nullptr || entry.state->step != initial_step)
+                throw std::invalid_argument("adamw_step_many_async: states must share one initial step");
+            workspace.states_.push_back(entry.state);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(workspace.step_.data(), &initial_step,
+            sizeof(initial_step), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemsetAsync(workspace.observed_non_finite_.data(), 0,
+            sizeof(unsigned int), stream));
+        workspace.initialized_ = true;
+    } else if (workspace.states_.size() != entries.size()) {
+        throw std::invalid_argument("adamw_step_many_async: workspace entries changed");
+    } else {
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            if (entries[index].state != workspace.states_[index])
+                throw std::invalid_argument("adamw_step_many_async: workspace states changed");
+        }
+    }
     CUDA_CHECK(cudaMemsetAsync(workspace.non_finite_.data(), 0, sizeof(unsigned int), stream));
     CUDA_CHECK(cudaMemsetAsync(workspace.squared_norm_.data(), 0, sizeof(float), stream));
     constexpr int threads = 256;
@@ -274,25 +322,18 @@ void adamw_step_many_async(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // The next bias-correction factor is held on the host.  Therefore the
-    // validity decision must be known before advancing any host-side counter.
-    // Without this barrier a rejected batch would still consume an Adam step,
-    // causing all following bias corrections to be off by one.
-    unsigned int non_finite = 0;
-    float squared_norm = 0.0f;
-    CUDA_CHECK(cudaMemcpyAsync(&non_finite, workspace.non_finite_.data(), sizeof(non_finite), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(&squared_norm, workspace.squared_norm_.data(), sizeof(squared_norm), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (non_finite != 0U || !std::isfinite(squared_norm)) return;
+    adamw_prepare_step_kernel<<<1, 1, 0, stream>>>(
+        static_cast<unsigned int*>(workspace.non_finite_.data()),
+        static_cast<unsigned int*>(workspace.observed_non_finite_.data()),
+        static_cast<const float*>(workspace.squared_norm_.data()),
+        static_cast<unsigned long long*>(workspace.step_.data()),
+        static_cast<float*>(workspace.scalars_.data()), options.beta1,
+        options.beta2, options.max_grad_norm);
+    CUDA_CHECK(cudaGetLastError());
 
     for (const auto& entry : entries) {
-        if (entry.state->step == std::numeric_limits<std::uint64_t>::max())
-            throw std::overflow_error("adamw_step_many_async: step counter overflow");
-        const auto next_step = entry.state->step + 1;
-        const float bias1 = static_cast<float>(1.0 - std::pow(static_cast<double>(options.beta1), next_step));
-        const float bias2 = static_cast<float>(1.0 - std::pow(static_cast<double>(options.beta2), next_step));
         const auto blocks = static_cast<unsigned int>((entry.parameter->numel() + threads - 1) / threads);
-#define ADAMW_BATCH_LAUNCH(TYPE) adamw_batch_kernel<TYPE><<<blocks, threads, 0, stream>>>(static_cast<TYPE*>(entry.parameter->raw_data()), static_cast<const TYPE*>(entry.gradient->raw_data()), static_cast<float*>(entry.state->master_parameter.raw_data()), static_cast<float*>(entry.state->first_moment.raw_data()), static_cast<float*>(entry.state->second_moment.raw_data()), entry.parameter->numel(), options.beta1, options.beta2, bias1, bias2, options.learning_rate, options.epsilon, options.weight_decay, options.loss_scale, options.max_grad_norm, static_cast<const unsigned int*>(workspace.non_finite_.data()), static_cast<const float*>(workspace.squared_norm_.data()))
+#define ADAMW_BATCH_LAUNCH(TYPE) adamw_batch_kernel<TYPE><<<blocks, threads, 0, stream>>>(static_cast<TYPE*>(entry.parameter->raw_data()), static_cast<const TYPE*>(entry.gradient->raw_data()), static_cast<float*>(entry.state->master_parameter.raw_data()), static_cast<float*>(entry.state->first_moment.raw_data()), static_cast<float*>(entry.state->second_moment.raw_data()), entry.parameter->numel(), options.beta1, options.beta2, options.learning_rate, options.epsilon, options.weight_decay, options.loss_scale, static_cast<const unsigned int*>(workspace.non_finite_.data()), static_cast<const float*>(workspace.scalars_.data()))
         switch (entry.parameter->dtype()) {
             case Dtype::F32: ADAMW_BATCH_LAUNCH(float); break;
             case Dtype::F16: ADAMW_BATCH_LAUNCH(__half); break;
@@ -301,17 +342,20 @@ void adamw_step_many_async(
         }
 #undef ADAMW_BATCH_LAUNCH
         CUDA_CHECK(cudaGetLastError());
-        ++entry.state->step;
     }
 }
 
-bool adamw_check(const AdamWWorkspace& workspace, const cudaStream_t stream) {
-    unsigned int non_finite = 0;
-    float squared_norm = 0.0f;
-    CUDA_CHECK(cudaMemcpyAsync(&non_finite, workspace.non_finite_.data(), sizeof(non_finite), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(&squared_norm, workspace.squared_norm_.data(), sizeof(squared_norm), cudaMemcpyDeviceToHost, stream));
+bool adamw_check(AdamWWorkspace& workspace, const cudaStream_t stream) {
+    unsigned int observed_non_finite = 0;
+    unsigned long long step = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&observed_non_finite, workspace.observed_non_finite_.data(),
+        sizeof(observed_non_finite), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(&step, workspace.step_.data(), sizeof(step), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    return non_finite == 0 && std::isfinite(squared_norm);
+    for (AdamWState* state : workspace.states_) state->step = step;
+    CUDA_CHECK(cudaMemsetAsync(workspace.observed_non_finite_.data(), 0,
+        sizeof(unsigned int), stream));
+    return observed_non_finite == 0U;
 }
 
 /**
