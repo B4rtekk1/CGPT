@@ -1,4 +1,5 @@
 #include "ops/cpu/swiglu_cpu.h"
+#include "core/simd_math.h"
 #include <immintrin.h>
 #include <cmath>
 #include <cstdint>
@@ -6,23 +7,6 @@
 #include <stdexcept>
 
 namespace {
-    inline __m256 fast_exp(__m256 x) {
-        x = _mm256_max_ps(_mm256_set1_ps(-88.3762627f), _mm256_min_ps(_mm256_set1_ps(88.3762627f), x));
-        const __m256 f = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.4426950409f)), 0x00);
-        const __m256 r = _mm256_add_ps(x, _mm256_mul_ps(f, _mm256_set1_ps(-0.693359375f)));
-        __m256 p = _mm256_set1_ps(1.98756915e-4f);
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.39819995e-3f));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.3334519e-3f));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1665796e-2f));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666665e-1f));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(.5f));
-        p = _mm256_fmadd_ps(p, _mm256_mul_ps(r, r), r);
-        p = _mm256_add_ps(p, _mm256_set1_ps(1.f));
-        return _mm256_mul_ps(p, _mm256_castsi256_ps(
-                                 _mm256_add_epi32(_mm256_slli_epi32(_mm256_cvtps_epi32(f), 23),
-                                                  _mm256_set1_epi32(127 << 23))));
-    }
-
     inline __m256 load8(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32) return _mm256_loadu_ps(static_cast<const float *>(p) + i);
         if (t == Dtype::F16) return _mm256_cvtph_ps(
@@ -95,9 +79,7 @@ namespace {
             std::size_t i = 0;
             for (; i + 31 < w; i += 32)for (int k = 0; k < 4; ++k) {
                 auto x = load8(g, o.dtype(), k * 8 + i), y = load8(u, o.dtype(), k * 8 + i);
-                auto z = _mm256_mul_ps(
-                    x, _mm256_rcp_ps(_mm256_add_ps(_mm256_set1_ps(1),
-                                                   fast_exp(_mm256_sub_ps(_mm256_setzero_ps(), x)))));
+                auto z = cgpt::cpu::simd::silu256_ps(x);
                 store8(d, o.dtype(), rr * w + i + k * 8, _mm256_mul_ps(z, y));
             }
             for (; i < w; ++i) {

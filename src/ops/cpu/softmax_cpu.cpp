@@ -1,4 +1,5 @@
 #include "ops/cpu/softmax_cpu.h"
+#include "core/simd_math.h"
 #include <immintrin.h>
 #include <algorithm>
 #include <cmath>
@@ -7,23 +8,6 @@
 #include <stdexcept>
 
 namespace {
-    inline __m256 expv(__m256 x) {
-        x = _mm256_max_ps(_mm256_set1_ps(-88.3762627f), _mm256_min_ps(_mm256_set1_ps(88.3762627f), x));
-        const auto f = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.4426950409f)), 0x00);
-        const auto r = _mm256_add_ps(x, _mm256_mul_ps(f, _mm256_set1_ps(-.693359375f)));
-        __m256 p = _mm256_set1_ps(1.98756915e-4f);
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.39819995e-3f));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.3334519e-3f));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1665796e-2f));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666665e-1f));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(.5f));
-        p = _mm256_fmadd_ps(p, _mm256_mul_ps(r, r), r);
-        p = _mm256_add_ps(p, _mm256_set1_ps(1));
-        return _mm256_mul_ps(p, _mm256_castsi256_ps(
-                                 _mm256_add_epi32(_mm256_slli_epi32(_mm256_cvtps_epi32(f), 23),
-                                                  _mm256_set1_epi32(127 << 23))));
-    }
-
     inline __m256 load8(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32)return _mm256_loadu_ps(static_cast<const float *>(p) + i);
         if (t == Dtype::F16)return _mm256_cvtph_ps(
@@ -89,10 +73,10 @@ void softmax_forward_cpu(Tensor &output, const Tensor &input) {
         const auto vm = _mm256_set1_ps(m);
         i = 0;
         for (; i + 31 < cols; i += 32) {
-            s0 = _mm256_add_ps(s0, expv(_mm256_sub_ps(load8(src, t, base + i), vm)));
-            s1 = _mm256_add_ps(s1, expv(_mm256_sub_ps(load8(src, t, base + i + 8), vm)));
-            s2 = _mm256_add_ps(s2, expv(_mm256_sub_ps(load8(src, t, base + i + 16), vm)));
-            s3 = _mm256_add_ps(s3, expv(_mm256_sub_ps(load8(src, t, base + i + 24), vm)));
+            s0 = _mm256_add_ps(s0, cgpt::cpu::simd::exp256_ps(_mm256_sub_ps(load8(src, t, base + i), vm)));
+            s1 = _mm256_add_ps(s1, cgpt::cpu::simd::exp256_ps(_mm256_sub_ps(load8(src, t, base + i + 8), vm)));
+            s2 = _mm256_add_ps(s2, cgpt::cpu::simd::exp256_ps(_mm256_sub_ps(load8(src, t, base + i + 16), vm)));
+            s3 = _mm256_add_ps(s3, cgpt::cpu::simd::exp256_ps(_mm256_sub_ps(load8(src, t, base + i + 24), vm)));
         }
         _mm256_store_ps(q, _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)));
         float sum = 0;
