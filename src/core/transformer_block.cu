@@ -13,6 +13,7 @@
 #include <cuda_fp16.h>
 
 #include <stdexcept>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -226,7 +227,10 @@ void transformer_block_forward(
     const CublasLtContext& cublas_context,
     cudaStream_t stream,
     const TransformerBlockOptions& options,
-    std::size_t position_offset
+    std::size_t position_offset,
+    Tensor* key_cache,
+    Tensor* value_cache,
+    const std::size_t cache_length
 ) {
     validate_options(options);
 
@@ -323,6 +327,43 @@ void transformer_block_forward(
         RopeOptions{options.rotary_dim, position_offset}
     );
 
+    const Tensor* attention_key = &workspace.key;
+    const Tensor* attention_value = &workspace.value;
+    std::optional<Tensor> active_key;
+    std::optional<Tensor> active_value;
+    if (key_cache != nullptr || value_cache != nullptr) {
+        if (key_cache == nullptr || value_cache == nullptr ||
+            key_cache->shape().size() != 4 || value_cache->shape() != key_cache->shape() ||
+            key_cache->size(0) != batch || key_cache->size(1) < cache_length + sequence ||
+            key_cache->size(2) != options.num_kv_heads || key_cache->size(3) != options.head_dim ||
+            key_cache->dtype() != workspace.key.dtype() || value_cache->dtype() != workspace.value.dtype()) {
+            throw std::invalid_argument("invalid transformer KV cache shape");
+        }
+        const std::size_t token_bytes = options.num_kv_heads * options.head_dim * sizeof(__half);
+        for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
+            auto* key_destination = static_cast<std::byte*>(key_cache->raw_data()) +
+                (batch_index * key_cache->size(1) + cache_length) * token_bytes;
+            auto* value_destination = static_cast<std::byte*>(value_cache->raw_data()) +
+                (batch_index * value_cache->size(1) + cache_length) * token_bytes;
+            const auto* key_source = static_cast<const std::byte*>(workspace.key.raw_data()) +
+                batch_index * sequence * token_bytes;
+            const auto* value_source = static_cast<const std::byte*>(workspace.value.raw_data()) +
+                batch_index * sequence * token_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(key_destination, key_source, sequence * token_bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(value_destination, value_source, sequence * token_bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        active_key.emplace(Tensor::device_view(
+            {batch, cache_length + sequence, options.num_kv_heads, options.head_dim},
+            key_cache->raw_data(), key_cache->dtype()));
+        active_value.emplace(Tensor::device_view(
+            {batch, cache_length + sequence, options.num_kv_heads, options.head_dim},
+            value_cache->raw_data(), value_cache->dtype()));
+        attention_key = &*active_key;
+        attention_value = &*active_value;
+    }
+
     FlashAttentionOptions flash_attention_options{};
     flash_attention_options.num_query_heads = options.num_query_heads;
     flash_attention_options.num_kv_heads = options.num_kv_heads;
@@ -334,8 +375,8 @@ void transformer_block_forward(
         workspace.attention_output,
         workspace.attention_logsumexp,
         workspace.query,
-        workspace.key,
-        workspace.value,
+        *attention_key,
+        *attention_value,
         stream,
         flash_attention_options
     );

@@ -147,6 +147,39 @@ void transformer_model_forward(
                    stream, block.linear_options);
 }
 
+void transformer_model_forward_cached(
+    Tensor& logits, const bpe::TokenId* const device_token_ids,
+    const TransformerModelWeights& weights, TransformerModelWorkspace& workspace,
+    KVCache& kv_cache, const std::size_t cache_length,
+    const Tensor& cos_cache, const Tensor& sin_cache,
+    const CublasLtContext& cublas_context, cudaStream_t stream,
+    const TransformerModelOptions& options
+) {
+    if (device_token_ids == nullptr || workspace.layers.size() != options.num_layers ||
+        workspace.hidden.shape() != std::vector<std::size_t>{1, options.block_options.hidden_size} ||
+        logits.shape() != std::vector<std::size_t>{1, options.vocabulary_size}) {
+        throw std::invalid_argument("cached transformer model: invalid workspace or token IDs");
+    }
+    embedding_forward(workspace.hidden, device_token_ids, 1, weights.token_embedding, stream);
+    for (std::size_t layer = 0; layer < options.num_layers; ++layer) {
+        auto key_cache = Tensor::device_view(
+            {1, kv_cache.config().max_sequence_length, options.block_options.num_kv_heads,
+             options.block_options.head_dim}, kv_cache.key_sequence(layer, 0), Dtype::F16);
+        auto value_cache = Tensor::device_view(
+            {1, kv_cache.config().max_sequence_length, options.block_options.num_kv_heads,
+             options.block_options.head_dim}, kv_cache.value_sequence(layer, 0), Dtype::F16);
+        transformer_block_forward(workspace.layer_output, workspace.hidden, weights.layers[layer],
+            workspace.layers[layer], cos_cache, sin_cache, cublas_context, stream,
+            options.block_options, cache_length, &key_cache, &value_cache, cache_length);
+        std::swap(workspace.hidden, workspace.layer_output);
+        kv_cache.advance_sequence_length(layer, 0, 1);
+    }
+    rmsnorm_forward(workspace.normalized, workspace.hidden, weights.final_norm,
+                    options.block_options.rms_epsilon, stream);
+    linear_forward(logits, workspace.normalized, weights.lm_head, cublas_context,
+                   stream, options.block_options.linear_options);
+}
+
 void transformer_model_backward(
     const Tensor& grad_logits, const bpe::TokenId* const device_token_ids,
     const std::size_t batch_size, const std::size_t sequence_length,

@@ -3,6 +3,7 @@
 #include "core/cublas_context.h"
 #include "core/tensor.h"
 #include "core/transformer_block.h"
+#include "core/kv_cache.h"
 #include "ops/embedding.h"
 
 #include <cstddef>
@@ -138,6 +139,21 @@ void transformer_model_forward(
     cudaStream_t stream,
     const TransformerModelOptions& options,
     std::size_t position_offset = 0
+);
+
+/** Runs one-token decode using the supplied per-layer KV cache. */
+void transformer_model_forward_cached(
+    Tensor& logits,
+    const bpe::TokenId* device_token_ids,
+    const TransformerModelWeights& weights,
+    TransformerModelWorkspace& workspace,
+    KVCache& kv_cache,
+    std::size_t cache_length,
+    const Tensor& cos_cache,
+    const Tensor& sin_cache,
+    const CublasLtContext& cublas_context,
+    cudaStream_t stream,
+    const TransformerModelOptions& options
 );
 
 /**

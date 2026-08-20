@@ -1,4 +1,5 @@
 #include "core/generation.h"
+#include "core/kv_cache.h"
 
 #include "core/cuda_check.h"
 #include "ops/embedding.h"
@@ -146,43 +147,74 @@ std::vector<bpe::TokenId> generate_tokens(
 
     std::mt19937_64 rng(options.seed == 0 ? std::random_device{}() : options.seed);
     std::vector<bpe::TokenId> result = prompt_tokens;
-    for (std::size_t step = 0; step < options.max_new_tokens; ++step) {
-        const std::size_t begin = result.size() > options.max_context_tokens
-            ? result.size() - options.max_context_tokens : 0;
-        // Avoid debug-iterator arithmetic here: generation is also used from
-        // the Debug build, where MSVC turns an invalid seek into a modal abort.
-        const std::vector<bpe::TokenId> context(
-            result.data() + begin, result.data() + result.size());
-        Tensor logits({context.size(), model_options.vocabulary_size}, weights.token_embedding.dtype());
-        TransformerModelWorkspace workspace(model_options, 1, context.size(), weights.token_embedding.dtype());
-        bpe::TokenId* device_ids = nullptr;
-        CUDA_CHECK(cudaMalloc(&device_ids, context.size() * sizeof(bpe::TokenId)));
-        try {
-            embedding_upload_token_ids(device_ids, context, stream);
-            transformer_model_forward(logits, device_ids, 1, context.size(), weights, workspace,
-                                     cos_cache, sin_cache, cublas_context, stream, model_options);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::vector<float> host_logits(logits.numel());
-            logits.copy_to_host(host_logits);
-            if (host_logits.size() < model_options.vocabulary_size) {
-                throw std::runtime_error("generation logits are smaller than the vocabulary");
-            }
-            const std::size_t last_row = host_logits.size() - model_options.vocabulary_size;
-            std::vector<float> last_logits(
-                host_logits.data() + last_row, host_logits.data() + host_logits.size());
-            const bpe::TokenId next = sample(last_logits, context, options, rng);
+    const std::size_t begin = prompt_tokens.size() > options.max_context_tokens
+        ? prompt_tokens.size() - options.max_context_tokens : 0;
+    const std::vector<bpe::TokenId> context(prompt_tokens.begin() + begin, prompt_tokens.end());
+
+    KVCache kv_cache({model_options.num_layers, 1, options.max_context_tokens,
+                      model_options.block_options.num_kv_heads,
+                      model_options.block_options.head_dim});
+    TransformerModelWorkspace prefill_workspace(
+        model_options, 1, context.size(), weights.token_embedding.dtype());
+    Tensor prefill_logits({context.size(), model_options.vocabulary_size}, weights.token_embedding.dtype());
+    bpe::TokenId* device_ids = nullptr;
+    CUDA_CHECK(cudaMalloc(&device_ids, std::max(context.size(), std::size_t{1}) * sizeof(bpe::TokenId)));
+    try {
+        embedding_upload_token_ids(device_ids, context, stream);
+        transformer_model_forward(prefill_logits, device_ids, 1, context.size(), weights,
+                                  prefill_workspace, cos_cache, sin_cache, cublas_context,
+                                  stream, model_options);
+        for (std::size_t layer = 0; layer < model_options.num_layers; ++layer) {
+            kv_cache.write(layer, 1, 0, context.size(),
+                           static_cast<const __half*>(prefill_workspace.layers[layer].key.raw_data()),
+                           static_cast<const __half*>(prefill_workspace.layers[layer].value.raw_data()),
+                           stream);
+            kv_cache.set_sequence_length(layer, 0, context.size());
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<float> host_logits(prefill_logits.numel());
+        prefill_logits.copy_to_host(host_logits);
+        const std::size_t vocab = model_options.vocabulary_size;
+        std::vector<float> last_logits(host_logits.end() - vocab, host_logits.end());
+        TransformerModelWorkspace decode_workspace(model_options, 1, 1, weights.token_embedding.dtype());
+        Tensor decode_logits({1, model_options.vocabulary_size}, weights.token_embedding.dtype());
+        std::vector<float> next_logits(vocab);
+        std::size_t cache_length = context.size();
+        for (std::size_t step = 0; step < options.max_new_tokens; ++step) {
+            const bpe::TokenId next = sample(last_logits, result, options, rng);
             result.push_back(next);
             if (options.eos_token_id && next == *options.eos_token_id) break;
-        } catch (...) {
-            cudaFree(device_ids);
-            throw;
+            if (step + 1 == options.max_new_tokens) break;
+            if (cache_length >= options.max_context_tokens) break;
+            CUDA_CHECK(cudaMemcpyAsync(device_ids, &next, sizeof(next),
+                                       cudaMemcpyHostToDevice, stream));
+            transformer_model_forward_cached(decode_logits, device_ids, weights, decode_workspace,
+                                             kv_cache, cache_length, cos_cache, sin_cache,
+                                             cublas_context, stream, model_options);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            decode_logits.copy_to_host(next_logits);
+            last_logits = next_logits;
+            ++cache_length;
         }
-        CUDA_CHECK(cudaFree(device_ids));
+    } catch (...) {
+        cudaFree(device_ids);
+        throw;
     }
+    CUDA_CHECK(cudaFree(device_ids));
     return result;
 }
 
 std::string generate_text(
+    const bpe::BpeTokenizer& tokenizer, std::string_view prompt,
+    const TransformerModelWeights& weights, const Tensor& cos_cache, const Tensor& sin_cache,
+    const CublasLtContext& cublas_context, const TransformerModelOptions& model_options,
+    const GenerationOptions& options, cudaStream_t stream
+) {
+    return generate_text_with_stats(tokenizer, prompt, weights, cos_cache, sin_cache,
+                                    cublas_context, model_options, options, stream).text;
+}
+
+TextGenerationResult generate_text_with_stats(
     const bpe::BpeTokenizer& tokenizer, std::string_view prompt,
     const TransformerModelWeights& weights, const Tensor& cos_cache, const Tensor& sin_cache,
     const CublasLtContext& cublas_context, const TransformerModelOptions& model_options,
@@ -200,6 +232,9 @@ std::string generate_text(
             }
         }
     }
-    return tokenizer.decode(generate_tokens(tokenizer.encode(prompt), weights, cos_cache, sin_cache,
-                                            cublas_context, model_options, text_options, stream));
+    const auto prompt_tokens = tokenizer.encode(prompt);
+    const auto all_tokens = generate_tokens(prompt_tokens, weights, cos_cache, sin_cache,
+                                            cublas_context, model_options, text_options, stream);
+    return {tokenizer.decode(all_tokens), prompt_tokens.size(),
+            all_tokens.size() - prompt_tokens.size()};
 }

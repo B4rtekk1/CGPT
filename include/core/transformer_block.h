@@ -199,7 +199,10 @@ void transformer_block_forward(
     const CublasLtContext& cublas_context,
     cudaStream_t stream,
     const TransformerBlockOptions& options,
-    std::size_t position_offset = 0
+    std::size_t position_offset = 0,
+    Tensor* key_cache = nullptr,
+    Tensor* value_cache = nullptr,
+    std::size_t cache_length = 0
     );
 
 /**

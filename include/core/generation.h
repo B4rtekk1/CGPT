@@ -47,14 +47,20 @@ struct GenerationOptions {
     std::optional<bpe::TokenId> eos_token_id;
 };
 
+/** @brief Text returned together with the exact number of generated tokens. */
+struct TextGenerationResult {
+    std::string text;
+    std::size_t prompt_tokens = 0;
+    std::size_t generated_tokens = 0;
+};
+
 /**
  * @brief Generates token IDs autoregressively from a decoder-only Transformer.
  *
- * This reference implementation recomputes the complete active context on
- * every step. If the prompt is longer than `max_context_tokens`, its oldest
- * tokens are truncated for inference while the returned sequence remains
- * complete. KV-cache acceleration can be added without changing the public
- * sampling options.
+ * The implementation performs a prompt prefill followed by incremental
+ * single-token decoding with a per-layer KV cache. If the prompt is longer
+ * than `max_context_tokens`, its oldest tokens are truncated for inference
+ * while the returned sequence remains complete.
  *
  * @param prompt_tokens Token IDs used as the initial prompt.
  * @param weights Transformer weights used for inference.
@@ -97,6 +103,19 @@ struct GenerationOptions {
  * @return Generated text decoded from the generated token IDs.
  */
 [[nodiscard]] std::string generate_text(
+    const bpe::BpeTokenizer& tokenizer,
+    std::string_view prompt,
+    const TransformerModelWeights& weights,
+    const Tensor& cos_cache,
+    const Tensor& sin_cache,
+    const CublasLtContext& cublas_context,
+    const TransformerModelOptions& model_options,
+    const GenerationOptions& generation_options = {},
+    cudaStream_t stream = nullptr
+);
+
+/** @brief Generates text and reports exact prompt/output token counts. */
+[[nodiscard]] TextGenerationResult generate_text_with_stats(
     const bpe::BpeTokenizer& tokenizer,
     std::string_view prompt,
     const TransformerModelWeights& weights,

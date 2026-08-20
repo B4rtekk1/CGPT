@@ -14,6 +14,7 @@
  */
 class DeviceBuffer {
 public:
+    struct BorrowedTag {};
     /** @brief Constructs an empty device buffer. */
     DeviceBuffer() = default;
 
@@ -24,6 +25,9 @@ public:
     explicit DeviceBuffer(std::size_t bytes) {
         allocate(bytes);
     }
+
+    DeviceBuffer(void* data, std::size_t bytes, BorrowedTag)
+        : data_(data), bytes_(bytes), owns_(false) {}
 
     /** @brief Releases the owned device allocation, if any. */
     ~DeviceBuffer() {
@@ -42,7 +46,8 @@ public:
      */
     DeviceBuffer(DeviceBuffer&& other) noexcept
             : data_(std::exchange(other.data_, nullptr)),
-              bytes_(std::exchange(other.bytes_, 0)) {}
+              bytes_(std::exchange(other.bytes_, 0)),
+              owns_(std::exchange(other.owns_, true)) {}
 
     /**
      * @brief Transfers ownership from another device buffer.
@@ -54,6 +59,7 @@ public:
             release();
             data_ = std::exchange(other.data_, nullptr);
             bytes_ = std::exchange(other.bytes_, 0);
+            owns_ = std::exchange(other.owns_, true);
         }
         return *this;
     }
@@ -80,6 +86,7 @@ public:
         release();
         data_ = new_data;
         bytes_ = bytes;
+        owns_ = true;
     }
 
     /**
@@ -89,11 +96,12 @@ public:
      * is safe.
      */
     void release() noexcept {
-        if (data_ != nullptr) {
+        if (data_ != nullptr && owns_) {
             CUDA_CHECK(cudaFree(data_));
-            data_ = nullptr;
-            bytes_ = 0;
         }
+        data_ = nullptr;
+        bytes_ = 0;
+        owns_ = true;
     }
 
     /**
@@ -123,5 +131,6 @@ public:
 private:
     void* data_ = nullptr;
     std::size_t bytes_ = 0;
+    bool owns_ = true;
 
 };

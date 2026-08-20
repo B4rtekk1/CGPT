@@ -5,9 +5,11 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -20,7 +22,7 @@ struct Arguments {
     std::filesystem::path model;
     std::filesystem::path tokenizer;
     std::string prompt;
-    std::size_t max_new_tokens = 64;
+    std::size_t max_new_tokens = 128;
     std::size_t max_context_tokens = 0;
     std::size_t top_k = 0;
     float top_p = 1.0F;
@@ -38,7 +40,7 @@ struct Arguments {
     std::cerr << "Usage: cgpt_cli --model <model.safetensors|directory> [options]\n"
               << "  --tokenizer <tokenizer.json>   tokenizer path (default: next to the model)\n"
               << "  --prompt <text>                generate once; without it, start the REPL\n"
-              << "  --max-new-tokens N             number of new tokens (default: 64)\n"
+              << "  --max-new-tokens N             number of new tokens (default: 128)\n"
               << "  --context N                    maximum context length\n"
               << "  --temperature X                sampling temperature (default: 0.8)\n"
               << "  --top-k N                      top-k sampling (0 = disabled)\n"
@@ -156,8 +158,9 @@ std::pair<Tensor, Tensor> rotary_cache(std::size_t length, std::size_t dim) {
     c.copy_from_host(cosines); s.copy_from_host(sines); return {std::move(c), std::move(s)};
 }
 
-std::string generate(const std::string& prompt, const Arguments& args, const bpe::BpeTokenizer& tokenizer,
-                     ModelStorage& model, const Tensor& cosine, const Tensor& sine, const CublasLtContext& cublas) {
+TextGenerationResult generate(const std::string& prompt, const Arguments& args,
+                              const bpe::BpeTokenizer& tokenizer, ModelStorage& model,
+                              const Tensor& cosine, const Tensor& sine, const CublasLtContext& cublas) {
     GenerationOptions options;
     options.max_new_tokens = args.max_new_tokens;
     options.max_context_tokens = args.max_context_tokens;
@@ -167,7 +170,22 @@ std::string generate(const std::string& prompt, const Arguments& args, const bpe
     options.presence_penalty = args.presence_penalty;
     options.frequency_penalty = args.frequency_penalty;
     options.no_repeat_ngram_size = args.no_repeat_ngram_size;
-    return generate_text(tokenizer, prompt, model.weights(), cosine, sine, cublas, model.options, options);
+    return generate_text_with_stats(tokenizer, prompt, model.weights(), cosine, sine,
+                                     cublas, model.options, options);
+}
+
+void print_generation(const std::string& prompt, const Arguments& args,
+                      const bpe::BpeTokenizer& tokenizer, ModelStorage& model,
+                      const Tensor& cosine, const Tensor& sine, const CublasLtContext& cublas) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = generate(prompt, args, tokenizer, model, cosine, sine, cublas);
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cout << result.text << '\n';
+    const double tokens_per_second = elapsed > 0.0
+        ? static_cast<double>(result.generated_tokens) / elapsed : 0.0;
+    std::cerr << "[generated " << result.generated_tokens << " tokens in "
+              << std::fixed << std::setprecision(2) << elapsed << " s | "
+              << tokens_per_second << " tok/s]\n";
 }
 
 } // namespace
@@ -193,10 +211,13 @@ int main(int argc, char** argv) {
         const auto [cosine, sine] = rotary_cache(runtime_args.max_context_tokens, block.rotary_dim);
         const CublasLtContext cublas;
         std::cout << "Model loaded. Enter a prompt (type 'exit' or 'quit' to stop).\n";
-        if (!args.prompt.empty()) { std::cout << generate(args.prompt, runtime_args, tokenizer, model, cosine, sine, cublas) << '\n'; return 0; }
+        if (!args.prompt.empty()) {
+            print_generation(args.prompt, runtime_args, tokenizer, model, cosine, sine, cublas);
+            return 0;
+        }
         for (std::string prompt; std::cout << "> " && std::getline(std::cin, prompt); ) {
             if (prompt == "exit" || prompt == "quit") break;
-            try { std::cout << generate(prompt, runtime_args, tokenizer, model, cosine, sine, cublas) << "\n"; }
+            try { print_generation(prompt, runtime_args, tokenizer, model, cosine, sine, cublas); }
             catch (const std::exception& error) { std::cerr << "Generation error: " << error.what() << "\n"; }
         }
         return 0;

@@ -28,6 +28,13 @@ enum class DeviceType {
  */
 class Tensor {
 public:
+    /** Creates a non-owning view over contiguous CUDA memory. */
+    [[nodiscard]] static Tensor device_view(
+        std::vector<std::size_t> shape, void* data, Dtype dtype) {
+        return Tensor(std::move(shape), DeviceType::CUDA, dtype,
+                      DeviceBuffer::BorrowedTag{}, data);
+    }
+
     /**
      * @brief Constructs a tensor with the requested shape and storage type.
      * @param shape Tensor dimensions. Every dimension must be non-zero.
@@ -57,6 +64,17 @@ public:
         Dtype dtype,
         DeviceType device_type = DeviceType::CUDA
     ) : Tensor(std::move(shape), device_type, dtype) {}
+
+private:
+    Tensor(std::vector<std::size_t> shape, DeviceType device_type, Dtype dtype,
+           DeviceBuffer::BorrowedTag, void* data)
+        : shape_(std::move(shape)),
+          device_type_(validate_device_type(device_type)),
+          dtype_(validate_storage_dtype(dtype)),
+          element_count_(element_count(shape_)),
+          storage_(data, dtype_bytes(element_count_, dtype_), DeviceBuffer::BorrowedTag{}) {}
+
+public:
 
     /** @brief Creates a deep copy of another tensor. */
     Tensor(const Tensor& other)
