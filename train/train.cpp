@@ -44,6 +44,7 @@ struct Arguments {
     std::optional<std::filesystem::path> load_directory;
     std::size_t vocab_size = 32'000;
     std::size_t batch_size = 8;
+    bool batch_size_explicit = false;
     std::size_t sequence_length = 1024;
     std::size_t epochs = 10;
     std::size_t max_steps = 0; // 0 means all batches from every requested epoch.
@@ -57,6 +58,7 @@ struct Arguments {
     // 8 x 1024-token batch. AdamW divides it back out before updating.
     float loss_scale = 1024.0F;
     float validation_fraction = 0.1F;
+    std::string model_profile = "small";
     std::string prompt = "The";
     std::size_t generate_tokens = 64;
     bool save_avg_loss = false;
@@ -89,7 +91,10 @@ Arguments parse_arguments(int argc, char** argv) {
         else if (option == "--output-dir") args.output_directory = value();
         else if (option == "--load-dir") args.load_directory = value();
         else if (option == "--vocab-size") args.vocab_size = std::stoull(value());
-        else if (option == "--batch-size") args.batch_size = std::stoull(value());
+        else if (option == "--batch-size") {
+            args.batch_size = std::stoull(value());
+            args.batch_size_explicit = true;
+        }
         else if (option == "--sequence-length") args.sequence_length = std::stoull(value());
         else if (option == "--epochs") args.epochs = std::stoull(value());
         else if (option == "--max-steps") args.max_steps = std::stoull(value());
@@ -99,6 +104,7 @@ Arguments parse_arguments(int argc, char** argv) {
         else if (option == "--min-learning-rate") args.min_learning_rate = std::stof(value());
         else if (option == "--warmup-steps") args.warmup_steps = std::stoull(value());
         else if (option == "--loss-scale") args.loss_scale = std::stof(value());
+        else if (option == "--model") args.model_profile = value();
         else if (option == "--validation-fraction") args.validation_fraction = std::stof(value());
         else if (option == "--prompt") args.prompt = value();
         else if (option == "--generate-tokens") args.generate_tokens = std::stoull(value());
@@ -107,7 +113,7 @@ Arguments parse_arguments(int argc, char** argv) {
             std::cout << "Usage: cgpt_train [--input PATH] [--tokenizer PATH] [--vocab-size N] "
                          "[--output-dir PATH] "
                          "[--load-dir PATH] "
-                         "[--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N] "
+                         "[--model small|104m] [--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N] "
                          "[--learning-rate N] [--min-learning-rate N] [--warmup-steps N] [--loss-scale N] "
                          "[--validation-fraction N] [--validation-interval N] "
                          "[--validation-batches N] [--prompt TEXT] [--generate-tokens N] "
@@ -126,14 +132,20 @@ Arguments parse_arguments(int argc, char** argv) {
     if (!std::isfinite(args.validation_fraction) || args.validation_fraction <= 0.0F ||
         args.validation_fraction >= 1.0F)
         throw std::invalid_argument("validation-fraction must be between 0 and 1");
+    if (args.model_profile != "small" && args.model_profile != "104m")
+        throw std::invalid_argument("model must be 'small' or '104m'");
     return args;
 }
 
-TransformerModelOptions model_options(const std::size_t vocabulary_size) {
-    // About 25.3M trainable parameters with a 32k-token vocabulary.  The
-    // 4 query-heads to 1 KV-head layout and 128-wide heads select the
-    // optimized GQA 4:1 Tensor-Core forward/backward path.
-    return {vocabulary_size, 4, {512, 1024, 4, 1, 128, 128, 1.0e-5F, true, {ComputeType::F32}}};
+TransformerModelOptions model_options(const std::size_t vocabulary_size,
+                                      const std::string_view profile) {
+    if (profile == "small") {
+        // About 25.3M parameters at a 32k vocabulary.
+        return {vocabulary_size, 4, {512, 1024, 4, 1, 128, 128, 1.0e-5F, true, {ComputeType::F32}}};
+    }
+    // About 104.1M parameters at a 32k vocabulary.  This retains the 4:1
+    // GQA layout optimized by the Tensor-Core attention forward/backward path.
+    return {vocabulary_size, 8, {1024, 2048, 8, 2, 128, 128, 1.0e-5F, true, {ComputeType::F32}}};
 }
 
 /**
@@ -323,7 +335,9 @@ std::pair<Tensor, Tensor> rotary_cache(std::size_t sequence_length, std::size_t 
 
 int main(int argc, char** argv) {
     try {
-        const Arguments args = parse_arguments(argc, argv);
+        Arguments args = parse_arguments(argc, argv);
+        if (args.model_profile == "104m" && !args.batch_size_explicit)
+            args.batch_size = 1;
         if (!std::filesystem::exists(args.input)) throw std::runtime_error("Missing input: " + args.input.string());
         std::string text = load_training_text(args.input);
 
@@ -410,7 +424,7 @@ int main(int argc, char** argv) {
             ? (total_steps > 1 ? std::max<std::size_t>(1, total_steps / 50) : 0)
             : args.warmup_steps;
         LearningRateScheduler scheduler({args.learning_rate, args.min_learning_rate, warmup_steps, total_steps});
-        ModelStorage model(model_options(tokenizer.vocab_size()));
+        ModelStorage model(model_options(tokenizer.vocab_size(), args.model_profile));
         if (args.load_directory) {
             load_huggingface_model(*args.load_directory,
                 {model.embedding, model.mutable_layers, model.final_norm, model.embedding});
