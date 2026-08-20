@@ -1,3 +1,13 @@
+/**
+ * @file attention_cpu.cpp
+ * @brief CPU implementation of grouped-query scaled dot-product attention.
+ *
+ * The implementation supports multi-head attention, grouped-query attention,
+ * optional causal masking, optional log-sum-exp output, and F32/F16/BF16 tensor
+ * storage. Dot products use AVX2 and FMA, while independent batch/query/head
+ * tasks are parallelized with OpenMP.
+ */
+
 #include "ops/cpu/attention_cpu.h"
 
 #include <immintrin.h>
@@ -9,6 +19,14 @@
 #include <stdexcept>
 
 namespace {
+    /**
+     * @brief Loads one tensor element and converts it to F32.
+     *
+     * @param p Pointer to the beginning of the tensor storage.
+     * @param t Tensor element type.
+     * @param i Element index.
+     * @return The requested value represented as F32.
+     */
     float load1(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32)return static_cast<const float *>(p)[i];
         const auto h = static_cast<const std::uint16_t *>(p)[i];
@@ -19,6 +37,14 @@ namespace {
         return x;
     }
 
+    /**
+     * @brief Loads eight tensor elements and converts them to F32 lanes.
+     *
+     * @param p Pointer to the beginning of the tensor storage.
+     * @param t Tensor element type.
+     * @param i Index of the first element to load.
+     * @return Eight values represented as an AVX F32 vector.
+     */
     __m256 load8(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32)return _mm256_loadu_ps(static_cast<const float *>(p) + i);
         const auto *h = static_cast<const std::uint16_t *>(p) + i;
@@ -27,6 +53,16 @@ namespace {
             _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(h))), 16));
     }
 
+    /**
+     * @brief Converts and stores one F32 value in tensor storage.
+     *
+     * BF16 conversion uses round-to-nearest-even before truncation.
+     *
+     * @param p Pointer to the beginning of the destination tensor storage.
+     * @param t Destination tensor element type.
+     * @param i Destination element index.
+     * @param x F32 value to store.
+     */
     void store1(void *p, Dtype t, std::size_t i, float x) {
         if (t == Dtype::F32) {
             static_cast<float *>(p)[i] = x;
@@ -42,6 +78,20 @@ namespace {
         static_cast<std::uint16_t *>(p)[i] = static_cast<std::uint16_t>((b + 0x7fff + ((b >> 16) & 1)) >> 16);
     }
 
+    /**
+     * @brief Computes an F32 dot product between two tensor slices.
+     *
+     * Blocks of eight values are accumulated with AVX2 FMA instructions. Any
+     * remaining elements are processed with scalar `std::fma` operations.
+     *
+     * @param a Pointer to the first tensor storage.
+     * @param b Pointer to the second tensor storage.
+     * @param t Common tensor element type.
+     * @param ia Starting element index in @p a.
+     * @param ib Starting element index in @p b.
+     * @param d Number of elements in each slice.
+     * @return Dot product accumulated in F32.
+     */
     float dot8(const void *a, const void *b, Dtype t, std::size_t ia, std::size_t ib, std::size_t d) {
         __m256 s = _mm256_setzero_ps();
         std::size_t i = 0;
@@ -54,6 +104,26 @@ namespace {
         return r;
     }
 
+    /**
+     * @brief Validates grouped-query attention tensors and options.
+     *
+     * Query and output tensors use layout `[batch, query_sequence,
+     * query_heads, head_dim]`. Key and value tensors use layout `[batch,
+     * key_sequence, kv_heads, head_dim]`. The number of query heads must be an
+     * integer multiple of the number of key/value heads.
+     *
+     * @param out Attention output tensor.
+     * @param q Query tensor.
+     * @param k Key tensor.
+     * @param v Value tensor.
+     * @param o Attention configuration.
+     * @param lse Optional F32 tensor with shape
+     *        `[batch, query_sequence, query_heads]`.
+     *
+     * @throws std::invalid_argument If tensor devices, shapes, data types,
+     *         attention dimensions, causal ranges, or the optional LSE tensor
+     *         are incompatible.
+     */
     void validate(Tensor &out, const Tensor &q, const Tensor &k, const Tensor &v, const FlashAttentionOptions &o,
                   Tensor *lse) {
         if (out.device_type() != DeviceType::CPU || q.device_type() != DeviceType::CPU || k.device_type() !=
@@ -72,6 +142,31 @@ namespace {
                 "CPU attention: invalid logsumexp tensor");
     }
 
+    /**
+     * @brief Executes grouped-query scaled dot-product attention.
+     *
+     * Each query head is mapped to one key/value head by contiguous grouping.
+     * Scores are scaled by `o.attention_scale` when it is positive; otherwise
+     * the conventional `1 / sqrt(head_dim)` scale is used. Softmax is evaluated
+     * with maximum subtraction for numerical stability.
+     *
+     * In causal mode, query position `qi` may attend through
+     * `o.query_position_offset + qi`. The implementation computes each output
+     * directly without materializing a complete attention probability tensor.
+     * Independent `[batch, query, query_head]` tasks are parallelized with
+     * OpenMP.
+     *
+     * @param out Attention output with the same shape and type as @p q.
+     * @param lse Optional F32 log-sum-exp output, or `nullptr` when not needed.
+     * @param q Query tensor with shape `[B, QS, H, D]`.
+     * @param k Key tensor with shape `[B, KS, KV, D]`.
+     * @param v Value tensor with shape `[B, KS, KV, D]`.
+     * @param o Attention options describing the head counts, head dimension,
+     *        scaling, causal mode, and query position offset.
+     *
+     * @throws std::invalid_argument If validation of the tensors or options
+     *         fails.
+     */
     void apply(Tensor &out, Tensor *lse, const Tensor &q, const Tensor &k, const Tensor &v,
                const FlashAttentionOptions &o) {
         validate(out, q, k, v, o, lse);
@@ -113,8 +208,39 @@ namespace {
     }
 }
 
+/**
+ * @brief Computes grouped-query attention without returning log-sum-exp values.
+ *
+ * @param o Output tensor with the same shape and type as @p q.
+ * @param q Query tensor with shape `[B, QS, num_query_heads, head_dim]`.
+ * @param k Key tensor with shape `[B, KS, num_kv_heads, head_dim]`.
+ * @param v Value tensor with the same shape as @p k.
+ * @param x Attention configuration.
+ *
+ * @throws std::invalid_argument If the tensors or options are incompatible.
+ *
+ * @note The implementation requires AVX2 and FMA. F16 execution additionally
+ *       requires F16C support.
+ */
 void flash_gqa_attention_forward_cpu(Tensor &o, const Tensor &q, const Tensor &k, const Tensor &v,
                                      const FlashAttentionOptions &x) { apply(o, nullptr, q, k, v, x); }
 
+/**
+ * @brief Computes grouped-query attention and per-query log-sum-exp values.
+ *
+ * @param o Output tensor with the same shape and type as @p q.
+ * @param l F32 tensor with shape `[B, QS, num_query_heads]` receiving
+ *        `log(sum(exp(score)))` for each query head.
+ * @param q Query tensor with shape `[B, QS, num_query_heads, head_dim]`.
+ * @param k Key tensor with shape `[B, KS, num_kv_heads, head_dim]`.
+ * @param v Value tensor with the same shape as @p k.
+ * @param x Attention configuration.
+ *
+ * @throws std::invalid_argument If the tensors, options, or LSE output are
+ *         incompatible.
+ *
+ * @note The implementation requires AVX2 and FMA. F16 execution additionally
+ *       requires F16C support.
+ */
 void flash_gqa_attention_forward_with_lse_cpu(Tensor &o, Tensor &l, const Tensor &q, const Tensor &k, const Tensor &v,
                                               const FlashAttentionOptions &x) { apply(o, &l, q, k, v, x); }
