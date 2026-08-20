@@ -23,7 +23,12 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 # Keep native cubins for the original Ampere target and Hopper/H100.  The
 # runtime launch heuristic selects suitable block geometry for the detected
 # device; compiling both targets keeps that selection free of JIT surprises.
-set(CMAKE_CUDA_ARCHITECTURES "86-real;90a-real" CACHE STRING "CUDA architectures")
+# Keep these native cubins even when an older CMake cache (for example one
+# created on Turing) already contains CMAKE_CUDA_ARCHITECTURES.  The attention
+# kernel selects its mma.sync/cp.async implementation through __CUDA_ARCH__,
+# so retaining a stale sm_75 cache silently compiles the scalar fallback on
+# Ampere and loses the intended FlashAttention-2 pipeline.
+set(CMAKE_CUDA_ARCHITECTURES "86-real;90a-real" CACHE STRING "CUDA architectures" FORCE)
 
 set(CGPT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -169,7 +174,7 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
     add_custom_target(profile_kernels
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/profile_kernels.py
-                    --build-dir ${CMAKE_BINARY_DIR}
+                    --build-dir $<TARGET_FILE_DIR:run_all_tests>
                     --output ${CMAKE_CURRENT_SOURCE_DIR}/kernel_profile.md
             DEPENDS run_all_tests
             USES_TERMINAL
