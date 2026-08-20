@@ -26,7 +26,8 @@ add_library(cgpt_core STATIC
         src/core/transformer_block.cu src/core/transformer_model.cu src/core/weight_initialization.cu src/core/generation.cu
         src/core/cuda_graph.cu src/core/huggingface_export.cpp src/ops/attention.cu
         src/ops/cpu/swiglu_cpu.cpp src/ops/cpu/softmax_cpu.cpp
-        src/ops/cpu/rope_cpu.cpp src/ops/cpu/rmsnorm_cpu.cpp)
+        src/ops/cpu/rope_cpu.cpp src/ops/cpu/rmsnorm_cpu.cpp
+        src/ops/cpu/linear_cpu.cpp src/ops/cpu/embedding_cpu.cpp)
 set_source_files_properties(src/ops/cross_entropy.cu src/ops/softmax.cu PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 target_include_directories(cgpt_core PUBLIC ${CGPT_INCLUDE_DIR} ${CGPT_INCLUDE_DIR}/core)
 target_link_libraries(cgpt_core PUBLIC CUDA::cudart CUDA::cublasLt)
