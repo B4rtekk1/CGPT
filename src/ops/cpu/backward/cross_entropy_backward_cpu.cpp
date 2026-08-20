@@ -10,6 +10,20 @@
 #include <vector>
 
 namespace {
+    /**
+     * @brief Loads one floating-point tensor element and converts it to F32.
+     *
+     * The source storage may use F32, IEEE F16, or BF16 representation.
+     * Computation is performed in single precision regardless of the storage
+     * format.
+     *
+     * @param p Pointer to the source tensor storage.
+     * @param t Element type of the source tensor.
+     * @param i Linear element index to read.
+     * @return The selected element represented as an F32 value.
+     *
+     * @note Reading F16 values requires CPU support for F16C.
+     */
     float load1(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32) return static_cast<const float *>(p)[i];
         const auto h = static_cast<const std::uint16_t *>(p)[i];
@@ -20,6 +34,17 @@ namespace {
         return x;
     }
 
+    /**
+     * @brief Converts and stores one F32 value in tensor storage.
+     *
+     * F16 conversion uses F16C instructions. BF16 conversion applies
+     * round-to-nearest-even rounding before truncating the lower 16 bits.
+     *
+     * @param p Pointer to the destination tensor storage.
+     * @param t Destination element type.
+     * @param i Linear element index to write.
+     * @param x F32 value to convert and store.
+     */
     void store1(void *p, Dtype t, std::size_t i, float x) {
         if (t == Dtype::F32) {
             static_cast<float *>(p)[i] = x;
@@ -35,6 +60,20 @@ namespace {
         static_cast<std::uint16_t *>(p)[i] = static_cast<std::uint16_t>((b + 0x7fff + ((b >> 16) & 1)) >> 16);
     }
 
+    /**
+     * @brief Validates arguments for the fused cross-entropy forward/backward pass.
+     *
+     * @param loss Scalar F32 output tensor with shape `[1]`.
+     * @param gradient Gradient tensor with the same shape and dtype as @p logits.
+     * @param logits Two-dimensional CPU tensor with shape `[n, vocabulary_size]`.
+     * @param targets Pointer to an array of @p n target token identifiers.
+     * @param n Number of rows in @p logits and number of target identifiers.
+     * @param scale Positive finite multiplier applied to the mean-loss gradient.
+     *
+     * @throws std::invalid_argument If a pointer is null, @p n is zero, tensor
+     * devices, shapes, or dtypes are incompatible, the vocabulary is empty, or
+     * @p scale is not finite and positive.
+     */
     void validate(const Tensor &loss, const Tensor &gradient, const Tensor &logits,
                   const bpe::TokenId *targets, std::size_t n, float scale) {
         if (!targets || !n || logits.device_type() != DeviceType::CPU || logits.dim() != 2 ||
@@ -47,6 +86,40 @@ namespace {
     }
 }
 
+/**
+ * @brief Computes mean cross-entropy loss and its logits gradient on the CPU.
+ *
+ * For every row, the function evaluates a numerically stable softmax using the
+ * maximum-logit subtraction method. For a valid target index @f$y_r@f$, the
+ * per-row loss is
+ * @f[
+ *     L_r = \log\left(\sum_j e^{z_{r,j}}\right) - z_{r,y_r},
+ * @f]
+ * and the logits gradient is
+ * @f[
+ *     \frac{\partial L}{\partial z_{r,j}} =
+ *     \frac{scale}{n}\left(softmax(z_r)_j - \mathbf{1}[j=y_r]\right).
+ * @f]
+ *
+ * The returned loss is the unscaled arithmetic mean of valid per-row losses.
+ * Rows whose target identifier lies outside the vocabulary contribute zero to
+ * the loss, while their gradient remains the scaled softmax distribution.
+ *
+ * Rows are processed independently with OpenMP, and intermediate arithmetic is
+ * accumulated in F32 for F32, F16, and BF16 storage formats.
+ *
+ * @param loss Destination scalar F32 tensor with shape `[1]`.
+ * @param gradient Destination tensor for gradients with respect to @p logits.
+ * @param logits Input logits with shape `[n, vocabulary_size]`.
+ * @param targets Pointer to @p n target token identifiers.
+ * @param n Number of samples represented by @p logits.
+ * @param scale Positive multiplier applied to the mean gradient.
+ *
+ * @throws std::invalid_argument If tensor devices, shapes, dtypes, targets, or
+ * @p scale are invalid.
+ *
+ * @note F16 tensor support requires the F16C instruction set.
+ */
 void cross_entropy_forward_backward_cpu(
     Tensor &loss, Tensor &gradient, const Tensor &logits,
     const bpe::TokenId *targets, std::size_t n, float scale) {

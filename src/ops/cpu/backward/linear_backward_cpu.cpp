@@ -7,6 +7,19 @@
 #include <stdexcept>
 
 namespace {
+    /**
+     * @brief Loads one floating-point value and converts it to single precision.
+     *
+     * The source buffer may contain F32, IEEE F16, or BF16 elements. Half-precision
+     * values are expanded to F32 before arithmetic is performed.
+     *
+     * @param p Pointer to the source tensor storage.
+     * @param t Element type of the source storage.
+     * @param i Linear element index to read.
+     * @return The selected element represented as an F32 value.
+     *
+     * @note F16 conversion requires the F16C instruction set.
+     */
     float load1(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32)return static_cast<const float *>(p)[i];
         const auto h = static_cast<const std::uint16_t *>(p)[i];
@@ -17,6 +30,17 @@ namespace {
         return x;
     }
 
+    /**
+     * @brief Stores one F32 value in a tensor using the requested element format.
+     *
+     * F16 values are converted with F16C instructions. BF16 values use
+     * round-to-nearest-even truncation of the lower 16 mantissa bits.
+     *
+     * @param p Pointer to the destination tensor storage.
+     * @param t Element type of the destination storage.
+     * @param i Linear element index to write.
+     * @param x F32 value to convert and store.
+     */
     void store1(void *p, Dtype t, std::size_t i, float x) {
         if (t == Dtype::F32) {
             static_cast<float *>(p)[i] = x;
@@ -32,6 +56,23 @@ namespace {
         static_cast<std::uint16_t *>(p)[i] = static_cast<std::uint16_t>((b + 0x7fff + ((b >> 16) & 1)) >> 16);
     }
 
+    /**
+     * @brief Validates tensors used by the CPU linear-layer backward pass.
+     *
+     * The implementation expects a forward operation equivalent to
+     * `Y = X * W^T + b`, where the weight matrix has shape `[O, I]`. All leading
+     * input dimensions are interpreted as a flattened row dimension.
+     *
+     * @param gi Gradient with respect to the input; must have the same shape as @p x.
+     * @param gw Gradient with respect to the weights; must have the same shape as @p w.
+     * @param gb Gradient with respect to the bias; must have shape `[O]`.
+     * @param go Upstream output gradient with final dimension `O`.
+     * @param x Forward input tensor with final dimension `I`.
+     * @param w Forward weight matrix with shape `[O, I]`.
+     *
+     * @throws std::invalid_argument If a tensor is not CPU-resident, has an
+     * incompatible shape or dtype, or does not use a floating-point format.
+     */
     void validate(const Tensor &gi, const Tensor &gw, const Tensor &gb, const Tensor &go, const Tensor &x,
                   const Tensor &w) {
         if (gi.device_type() != DeviceType::CPU || gw.device_type() != DeviceType::CPU || gb.device_type() !=
@@ -49,6 +90,45 @@ namespace {
     }
 }
 
+/**
+ * @brief Computes input, weight, and bias gradients for a CPU linear layer.
+ *
+ * For the forward transformation
+ * @f[
+ *     Y = XW^T + b,
+ * @f]
+ * this function evaluates
+ * @f[
+ *     \nabla_X L = \nabla_Y L\,W,
+ * @f]
+ * @f[
+ *     \nabla_W L = (\nabla_Y L)^T X,
+ * @f]
+ * and
+ * @f[
+ *     \nabla_b L = \sum_r \nabla_Y L_r.
+ * @f]
+ *
+ * All leading dimensions of @p x and @p go are flattened into a row dimension.
+ * Arithmetic is accumulated in F32 even when tensor storage uses F16 or BF16.
+ * Independent gradient regions are parallelized with OpenMP.
+ *
+ * @param gi Destination gradient with respect to the input. Shape equals @p x.
+ * @param gw Destination gradient with respect to the weights. Shape equals @p w.
+ * @param gb Destination gradient with respect to the bias. Shape is `[O]`.
+ * @param go Upstream gradient with shape `[..., O]`.
+ * @param x Forward input with shape `[..., I]`.
+ * @param w Forward weights with shape `[O, I]`.
+ * @param o Backward options controlling whether input, weight, and bias
+ * gradients are accumulated into their existing destination values.
+ *
+ * @throws std::invalid_argument If tensor devices, shapes, or dtypes are
+ * incompatible.
+ *
+ * @note The implementation requires CPU support for F16C when F16 tensors are
+ * used. The scalar dot products use fused multiply-add operations where
+ * available.
+ */
 void linear_backward_cpu(Tensor &gi, Tensor &gw, Tensor &gb, const Tensor &go, const Tensor &x, const Tensor &w,
                          const LinearBackwardOptions &o) {
     validate(gi, gw, gb, go, x, w);

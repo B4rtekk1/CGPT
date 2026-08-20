@@ -6,6 +6,16 @@
 #include <stdexcept>
 
 namespace {
+    /**
+     * @brief Loads one tensor element and expands it to F32.
+     *
+     * @param p Pointer to the source tensor storage.
+     * @param t Source element type: F32, F16, or BF16.
+     * @param i Linear element index.
+     * @return The selected element represented as an F32 value.
+     *
+     * @note F16 conversion requires the F16C instruction set.
+     */
     float load1(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32)return static_cast<const float *>(p)[i];
         const auto h = static_cast<const std::uint16_t *>(p)[i];
@@ -16,6 +26,17 @@ namespace {
         return x;
     }
 
+    /**
+     * @brief Converts and stores one F32 value in tensor storage.
+     *
+     * BF16 conversion uses round-to-nearest-even rounding. F16 conversion is
+     * performed by the F16C instruction set.
+     *
+     * @param p Pointer to the destination tensor storage.
+     * @param t Destination element type.
+     * @param i Linear element index.
+     * @param x F32 value to store.
+     */
     void store1(void *p, Dtype t, std::size_t i, float x) {
         if (t == Dtype::F32) {
             static_cast<float *>(p)[i] = x;
@@ -32,6 +53,41 @@ namespace {
     }
 }
 
+/**
+ * @brief Accumulates gradients for an embedding weight matrix on the CPU.
+ *
+ * For every token position `token` and embedding feature `feature`, the
+ * upstream gradient is added to the row selected by `ids[token]`:
+ * @f[
+ *     \nabla_W[\mathrm{id}_{token}, feature] \mathrel{+}=
+ *     \nabla_Y[token, feature].
+ * @f]
+ *
+ * The weight-gradient tensor has shape `[vocabulary_size, hidden_size]`.
+ * The upstream gradient may have any number of leading dimensions, provided its
+ * final dimension equals `hidden_size` and its total element count equals
+ * `count * hidden_size`.
+ *
+ * Work is parallelized over embedding features. This avoids concurrent writes
+ * between OpenMP workers even when the same token identifier occurs multiple
+ * times.
+ *
+ * @param gw Destination gradient for the embedding weight matrix.
+ * @param go Upstream gradient for all token positions.
+ * @param ids Pointer to an array containing @p count token identifiers.
+ * @param count Number of token identifiers and embedding rows represented by
+ * @p go.
+ * @param o Backward options controlling gradient accumulation and out-of-range
+ * token handling.
+ *
+ * @throws std::invalid_argument If @p ids is null, @p count is zero, tensors
+ * are not compatible CPU floating-point tensors, or their shapes are invalid.
+ *
+ * @note When `accumulate_weight` is false, every gradient element is cleared
+ * before token contributions are accumulated.
+ * @note When `bounds_check` is true, token identifiers outside the vocabulary
+ * are ignored. Disabling bounds checking requires every identifier to be valid.
+ */
 void embedding_backward_cpu(Tensor &gw, const Tensor &go, const bpe::TokenId *ids, std::size_t count,
                             const EmbeddingBackwardOptions &o) {
     if (!ids || !count || gw.device_type() != DeviceType::CPU || go.device_type() != DeviceType::CPU || gw.dim() != 2 ||
