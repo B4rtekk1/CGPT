@@ -100,6 +100,11 @@ set_target_properties(cgpt_train PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_R
 add_executable(cgpt_cli src/cli.cpp)
 target_link_libraries(cgpt_cli PRIVATE cgpt_core cgpt_tokenizer CUDA::cudart)
 set_target_properties(cgpt_cli PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_custom_command(TARGET cgpt_cli POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/outputdg/step-58874"
+        "$<TARGET_FILE_DIR:cgpt_cli>/outputdg/step-58874"
+        COMMENT "Copying default cgpt_cli model")
 
 add_custom_target(run_all
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure

@@ -9,9 +9,11 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -20,6 +22,41 @@
 #include <vector>
 
 namespace {
+    namespace ansi {
+        constexpr std::string_view reset = "\033[0m";
+        constexpr std::string_view cyan = "\033[36m";
+        constexpr std::string_view blue = "\033[94m";
+        constexpr std::string_view magenta = "\033[95m";
+        constexpr std::string_view green = "\033[32m";
+        constexpr std::string_view yellow = "\033[33m";
+        constexpr std::string_view dim = "\033[2m";
+    }
+
+    void print_banner(std::ostream &out) {
+        constexpr std::string_view c[] = {
+            "  ###### ", " ##      ", " ##      ", " ##      ", "  ###### "
+        };
+        constexpr std::string_view g[] = {
+            "  ###### ", " ##      ", " ##  ### ", " ##   ## ", "  ###### "
+        };
+        constexpr std::string_view p[] = {
+            " ####### ", " ##   ## ", " ####### ", " ##      ", " ##      "
+        };
+        constexpr std::string_view t[] = {
+            " ####### ", "    ##   ", "    ##   ", "    ##   ", "    ##   "
+        };
+
+        for (std::size_t row = 0; row < std::size(c); ++row) {
+            out << ansi::cyan << c[row]
+                << ansi::blue << "  " << g[row]
+                << ansi::magenta << "  " << p[row]
+                << ansi::yellow << "  " << t[row]
+                << ansi::reset << '\n';
+        }
+        constexpr std::string_view subtitle = "Fast, local text generation from the command line";
+        out << ansi::dim << subtitle << ansi::reset << "\n\n";
+    }
+
     struct Arguments {
         std::filesystem::path model;
         std::filesystem::path tokenizer;
@@ -40,8 +77,11 @@ namespace {
     };
 
     [[noreturn]] void usage(const std::string &error = {}) {
+        print_banner(std::cerr);
         if (!error.empty()) std::cerr << "Error: " << error << "\n\n";
-        std::cerr << "Usage: cgpt_cli --model <model.safetensors|directory> [options]\n"
+        std::cerr << ansi::blue << "Usage" << ansi::reset
+                << ": cgpt_cli [--model <model.safetensors|directory>] [options]\n"
+                << "  --model <...>                  model path (default: outputdg/step-58874 next to executable)\n"
                 << "  --tokenizer <tokenizer.json>   tokenizer path (default: next to the model)\n"
                 << "  --prompt <text>                generate once; without it, start the REPL\n"
                 << "  --max-new-tokens N             number of new tokens (default: 128)\n"
@@ -55,7 +95,12 @@ namespace {
                 << "  --frequency-penalty X         per-occurrence token penalty (default: 0)\n"
                 << "  --no-repeat-ngram N            block repeated n-grams (default: 0)\n"
                 << "  --seed N                       random seed\n"
-                << "  --device auto|cpu|cuda         execution device (default: auto)\n";
+                << "  --device auto|cpu|cuda         execution device (default: auto)\n"
+                << "\nREPL commands:\n"
+                << "  /set <parameter> <value>       change generation parameter\n"
+                << "  /params                        show current generation parameters\n"
+                << "  /help                          show this help\n"
+                << "  /exit                           leave the REPL\n";
         if (error.empty()) std::exit(0);
         throw std::invalid_argument("invalid arguments");
     }
@@ -69,6 +114,69 @@ namespace {
     float float_after(const std::string &option, int &index, int argc, char **argv) {
         if (index + 1 >= argc) usage("missing value for " + option);
         try { return std::stof(argv[++index]); } catch (...) { usage("invalid value for " + option); }
+    }
+
+    void print_parameters(const Arguments &args) {
+        std::cout << "Current parameters:\n"
+                  << "  max-new-tokens: " << args.max_new_tokens << '\n'
+                  << "  context: " << args.max_context_tokens << '\n'
+                  << "  temperature: " << args.temperature << '\n'
+                  << "  top-k: " << args.top_k << '\n'
+                  << "  top-p: " << args.top_p << '\n'
+                  << "  min-p: " << args.min_p << '\n'
+                  << "  repetition-penalty: " << args.repetition_penalty << '\n'
+                  << "  presence-penalty: " << args.presence_penalty << '\n'
+                  << "  frequency-penalty: " << args.frequency_penalty << '\n'
+                  << "  no-repeat-ngram: " << args.no_repeat_ngram_size << '\n'
+                  << "  seed: " << args.seed << '\n';
+    }
+
+    bool handle_repl_command(const std::string &line, Arguments &args, const std::size_t model_context) {
+        if (line == "/help") {
+            std::cout << "REPL commands:\n"
+                      << "  /set <parameter> <value>  change a generation parameter\n"
+                      << "  /params                   show current parameters\n"
+                      << "  /help                     show this help\n"
+                      << "  /exit                     leave the REPL\n";
+            return true;
+        }
+        if (line == "/params") {
+            print_parameters(args);
+            return true;
+        }
+        if (line == "/exit" || line == "/quit") return false;
+        if (line.rfind("/set ", 0) != 0) return true;
+
+        std::istringstream input(line.substr(5));
+        std::string parameter, value;
+        if (!(input >> parameter >> value)) {
+            std::cerr << "Usage: /set <parameter> <value>\n";
+            return true;
+        }
+        try {
+            if (parameter == "max-new-tokens") args.max_new_tokens = std::stoull(value);
+            else if (parameter == "context") {
+                const auto context = std::stoull(value);
+                if (context == 0 || context > model_context) throw std::out_of_range("context");
+                args.max_context_tokens = context;
+            } else if (parameter == "top-k") args.top_k = std::stoull(value);
+            else if (parameter == "seed") args.seed = std::stoull(value);
+            else if (parameter == "no-repeat-ngram") args.no_repeat_ngram_size = std::stoull(value);
+            else if (parameter == "temperature") args.temperature = std::stof(value);
+            else if (parameter == "top-p") args.top_p = std::stof(value);
+            else if (parameter == "min-p") args.min_p = std::stof(value);
+            else if (parameter == "repetition-penalty") args.repetition_penalty = std::stof(value);
+            else if (parameter == "presence-penalty") args.presence_penalty = std::stof(value);
+            else if (parameter == "frequency-penalty") args.frequency_penalty = std::stof(value);
+            else {
+                std::cerr << "Unknown parameter: " << parameter << '\n';
+                return true;
+            }
+            std::cout << "Updated " << parameter << " = " << value << '\n';
+        } catch (...) {
+            std::cerr << "Invalid value for " << parameter << ": " << value << '\n';
+        }
+        return true;
     }
 
     Arguments parse_arguments(int argc, char **argv) {
@@ -105,7 +213,6 @@ namespace {
                                                         option, i, argc, argv);
             else usage("unknown option: " + option);
         }
-        if (result.model.empty()) usage("--model is required");
         return result;
     }
 
@@ -224,22 +331,27 @@ namespace {
         const auto start = std::chrono::steady_clock::now();
         const auto result = generate(prompt, args, tokenizer, model, cosine, sine, cublas);
         const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        std::cout << result.text << '\n';
+        std::cout << ansi::green << result.text << ansi::reset << '\n';
         const double tokens_per_second = elapsed > 0.0
                                              ? static_cast<double>(result.generated_tokens) / elapsed
                                              : 0.0;
-        std::cerr << "[generated " << result.generated_tokens << " tokens in "
+        std::cerr << ansi::dim << "[generated " << result.generated_tokens << " tokens in "
                 << std::fixed << std::setprecision(2) << elapsed << " s | "
-                << tokens_per_second << " tok/s]\n";
+                << tokens_per_second << " tok/s]" << ansi::reset << "\n";
     }
 } // namespace
 
 int main(int argc, char **argv) {
     try {
         const Arguments args = parse_arguments(argc, argv);
-        const std::filesystem::path directory = std::filesystem::is_directory(args.model)
-                                                    ? args.model
-                                                    : args.model.parent_path();
+        print_banner(std::cout);
+        const auto executable_directory = std::filesystem::absolute(std::filesystem::path(argv[0])).parent_path();
+        const auto model_path = args.model.empty()
+                                    ? executable_directory / "outputdg" / "step-58874"
+                                    : args.model;
+        const std::filesystem::path directory = std::filesystem::is_directory(model_path)
+                                                    ? model_path
+                                                    : model_path.parent_path();
         const auto config_path = directory / "config.json";
         const auto tokenizer_path = args.tokenizer.empty() ? directory / "tokenizer.json" : args.tokenizer;
         const std::string config = read_file(config_path);
@@ -263,18 +375,27 @@ int main(int argc, char **argv) {
         if (runtime_args.max_context_tokens > context) throw std::runtime_error(
             "--context exceeds max_position_embeddings");
         const DeviceType device = runtime_args.cpu ? DeviceType::CPU : DeviceType::CUDA;
+        std::cout << ansi::yellow << "Loading model..." << ansi::reset << '\n';
         ModelStorage model({json_size(config, "vocab_size"), json_size(config, "num_hidden_layers"), block}, device);
         load_huggingface_model(directory, model.mutable_weights());
         const auto tokenizer = bpe::BpeTokenizer::load(tokenizer_path);
         const auto [cosine, sine] = rotary_cache(runtime_args.max_context_tokens, block.rotary_dim, device);
         std::unique_ptr<CublasLtContext> cublas;
         if (!runtime_args.cpu) cublas = std::make_unique<CublasLtContext>();
-        std::cout << "Model loaded. Enter a prompt (type 'exit' or 'quit' to stop).\n";
+        std::cout << ansi::green << "[OK] Model loaded" << ansi::reset
+                << "  " << ansi::dim << "device: " << (runtime_args.cpu ? "CPU" : "CUDA")
+                << ", context: " << runtime_args.max_context_tokens << " tokens" << ansi::reset << '\n'
+                << ansi::dim << "Type 'exit' or 'quit' to stop.\n" << ansi::reset;
         if (!args.prompt.empty()) {
             print_generation(args.prompt, runtime_args, tokenizer, model, cosine, sine, cublas.get());
             return 0;
         }
-        for (std::string prompt; std::cout << "> " && std::getline(std::cin, prompt);) {
+        for (std::string prompt; std::cout << ansi::blue << "\nYou > " << ansi::reset
+                                           && std::getline(std::cin, prompt);) {
+            if (!prompt.empty() && prompt.front() == '/') {
+                if (!handle_repl_command(prompt, runtime_args, context)) break;
+                continue;
+            }
             if (prompt == "exit" || prompt == "quit") break;
             try { print_generation(prompt, runtime_args, tokenizer, model, cosine, sine, cublas.get()); } catch (const
                 std::exception &error) { std::cerr << "Generation error: " << error.what() << "\n"; }
