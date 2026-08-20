@@ -10,8 +10,9 @@
 namespace {
     inline __m256 load8(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32)return _mm256_loadu_ps(static_cast<const float *>(p) + i);
-        if (t == Dtype::F16)return _mm256_cvtph_ps(
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(static_cast<const std::uint16_t *>(p) + i)));
+        if (t == Dtype::F16)
+            return _mm256_cvtph_ps(
+                _mm_loadu_si128(reinterpret_cast<const __m128i *>(static_cast<const std::uint16_t *>(p) + i)));
         return _mm256_castsi256_ps(_mm256_slli_epi32(
             _mm256_cvtepu16_epi32(
                 _mm_loadu_si128(reinterpret_cast<const __m128i *>(static_cast<const std::uint16_t *>(p) + i))), 16));
@@ -45,8 +46,9 @@ namespace {
 void softmax_forward_cpu(Tensor &output, const Tensor &input) {
     if (output.device_type() != DeviceType::CPU || input.device_type() != DeviceType::CPU || input.dim() != 2 || input.
         size(0) == 0 || input.size(1) == 0 || output.shape() != input.shape() || output.dtype() != input.dtype() || !
-        is_floating_point(input.dtype()))throw std::invalid_argument(
-        "CPU softmax: matching non-empty 2D CPU floating-point tensors required");
+        is_floating_point(input.dtype()))
+        throw std::invalid_argument(
+            "CPU softmax: matching non-empty 2D CPU floating-point tensors required");
     const auto rows = input.size(0);
     const auto cols = input.size(1);
     const Dtype t = input.dtype();

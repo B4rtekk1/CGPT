@@ -28,7 +28,8 @@ add_library(cgpt_core STATIC
         src/ops/cpu/swiglu_cpu.cpp src/ops/cpu/softmax_cpu.cpp
         src/ops/cpu/rope_cpu.cpp src/ops/cpu/rmsnorm_cpu.cpp
         src/ops/cpu/linear_cpu.cpp src/ops/cpu/embedding_cpu.cpp
-        src/ops/cpu/cross_entropy_cpu.cpp src/ops/cpu/attention_cpu.cpp)
+        src/ops/cpu/cross_entropy_cpu.cpp src/ops/cpu/attention_cpu.cpp
+        src/ops/cpu/backward/swiglu_backward_cpu.cpp src/ops/cpu/backward/rope_backward_cpu.cpp)
 set_source_files_properties(src/ops/cross_entropy.cu src/ops/softmax.cu PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 target_include_directories(cgpt_core PUBLIC ${CGPT_INCLUDE_DIR} ${CGPT_INCLUDE_DIR}/core)
 target_link_libraries(cgpt_core PUBLIC CUDA::cudart CUDA::cublasLt)

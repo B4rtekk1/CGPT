@@ -36,8 +36,9 @@ void embedding_forward_cpu(Tensor &out, const bpe::TokenId *ids, std::size_t cou
                            const EmbeddingOptions &opts) {
     if (!ids || !count || out.device_type() != DeviceType::CPU || w.device_type() != DeviceType::CPU || w.dim() != 2 ||
         out.dim() < 1 || out.dtype() != w.dtype() || !is_floating_point(w.dtype()) || out.shape().back() != w.shape()[1]
-        || out.numel() != count * w.shape()[1])throw std::invalid_argument(
-        "CPU embedding: incompatible tensors or token count");
+        || out.numel() != count * w.shape()[1])
+        throw std::invalid_argument(
+            "CPU embedding: incompatible tensors or token count");
     const auto vocab = w.shape()[0], hidden = w.shape()[1];
     const Dtype t = w.dtype();
     const auto *src = w.raw_data();

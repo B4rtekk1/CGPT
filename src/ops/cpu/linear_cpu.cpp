@@ -47,15 +47,20 @@ namespace {
             !is_floating_point(in.dtype()) || in.dtype() != w.dtype() || out.dtype() != in.dtype() ||
             (bias && (bias->dim() != 1 || bias->dtype() != in.dtype() || bias->shape()[0] != w.shape()[0])))
             throw std::invalid_argument("CPU linear: incompatible CPU floating-point tensors");
-        if (in.shape().back() != w.shape()[1] || out.shape().back() != w.shape()[0]) throw std::invalid_argument(
-            "CPU linear: shape mismatch");
-        for (std::size_t i = 0; i + 1 < in.dim(); ++i) if (out.shape()[i] != in.shape()[i]) throw std::invalid_argument(
-            "CPU linear: leading shape mismatch");
+        if (in.shape().back() != w.shape()[1] || out.shape().back() != w.shape()[0])
+            throw std::invalid_argument(
+                "CPU linear: shape mismatch");
+        for (std::size_t i = 0; i + 1 < in.dim(); ++i)
+            if (out.shape()[i] != in.shape()[i])
+                throw std::invalid_argument(
+                    "CPU linear: leading shape mismatch");
     }
 
     void apply(Tensor &out, const Tensor &in, const Tensor &w, const Tensor *bias) {
         validate(out, in, w, bias);
-        const auto rows = in.numel() / in.shape().back(), I = in.shape().back(), O = w.shape()[0];
+        const auto rows = in.numel() / in.shape().back();
+        const auto I = in.shape().back();
+        const auto O = w.shape()[0];
         const auto t = in.dtype();
         const auto *x = in.raw_data();
         const auto *weights = w.raw_data();
@@ -86,8 +91,9 @@ namespace {
                     _mm256_store_ps(q, v[z]);
                     float s = 0;
                     for (float n: q)s += n;
-                    for (std::size_t j = i; j < I; ++j)s = std::fma(load1(x, t, rb + j),
-                                                                    load1(weights, t, (o + z) * I + j), s);
+                    for (std::size_t j = i; j < I; ++j)
+                        s = std::fma(load1(x, t, rb + j),
+                                     load1(weights, t, (o + z) * I + j), s);
                     if (b)s += load1(b, t, o + z);
                     sums[z] = s;
                     store1(y, t, ob + o + z, s);

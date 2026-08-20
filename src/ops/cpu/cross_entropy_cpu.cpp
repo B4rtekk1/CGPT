@@ -44,14 +44,16 @@ namespace {
     void validate_loss(const Tensor &loss, const Tensor &logits, const bpe::TokenId *targets, std::size_t n) {
         if (!targets || !n || logits.device_type() != DeviceType::CPU || logits.dim() != 2 || !
             is_floating_point(logits.dtype()) || logits.size(0) != n || !logits.size(1) || loss.device_type() !=
-            DeviceType::CPU || loss.dtype() != Dtype::F32 || loss.shape() != std::vector<std::size_t>{1})throw
-                std::invalid_argument("CPU cross entropy: invalid tensors or targets");
+            DeviceType::CPU || loss.dtype() != Dtype::F32 || loss.shape() != std::vector<std::size_t>{1})
+            throw
+                    std::invalid_argument("CPU cross entropy: invalid tensors or targets");
     }
 
     void validate_gradient(const Tensor &gradient, const Tensor &logits, float scale) {
         if (gradient.device_type() != DeviceType::CPU || gradient.dtype() != logits.dtype() || gradient.shape() !=
-            logits.shape() || !std::isfinite(scale) || scale <= 0)throw std::invalid_argument(
-            "CPU cross entropy: invalid gradient or scale");
+            logits.shape() || !std::isfinite(scale) || scale <= 0)
+            throw std::invalid_argument(
+                "CPU cross entropy: invalid gradient or scale");
     }
 
     float row_loss(const void *data, Dtype t, std::size_t base, std::size_t vocab, bpe::TokenId target) {
@@ -76,8 +78,9 @@ void cross_entropy_forward_cpu(Tensor &loss, const Tensor &logits, const bpe::To
     const auto *p = logits.raw_data();
     float total = 0;
 #pragma omp parallel for reduction(+:total) schedule(static)
-    for (std::int64_t r = 0; r < static_cast<std::int64_t>(n); ++r)total += row_loss(p, logits.dtype(),
-                                                                       std::size_t(r) * vocab, vocab, targets[r]);
+    for (std::int64_t r = 0; r < static_cast<std::int64_t>(n); ++r)
+        total += row_loss(p, logits.dtype(),
+                          std::size_t(r) * vocab, vocab, targets[r]);
     *static_cast<float *>(loss.raw_data()) = total / float(n);
 }
 
