@@ -172,7 +172,10 @@ void load_one_tensor(const std::string& header, std::ifstream& input, const std:
     }
     const std::size_t offsets_begin = object.find("\"data_offsets\":[");
     if (offsets_begin == std::string::npos) throw std::runtime_error("Missing offsets for tensor: " + name);
-    cursor = offsets_begin + 17;
+    // `"data_offsets":[` is 16 bytes long. Starting at the first value is
+    // important for zero offsets: advancing one byte too far lands on `]`
+    // and produces the misleading "Invalid safetensors number" error.
+    cursor = offsets_begin + 16;
     const std::size_t start = parse_number(object, cursor);
     const std::size_t end = parse_number(object, cursor);
     if (end < start || end - start != tensor.nbytes())

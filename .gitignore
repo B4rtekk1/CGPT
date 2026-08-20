@@ -1,6 +1,7 @@
 build
 build-vs
 data
+outputdg/
 # The training corpus stays ignored, but these are C++ source directories.
 !include/data/
 !include/data/**
