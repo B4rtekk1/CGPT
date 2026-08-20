@@ -1,3 +1,12 @@
+/**
+ * @file linear_cpu.cpp
+ * @brief AVX2-accelerated CPU implementation of a dense linear transformation.
+ *
+ * The implementation evaluates `output = input * weight^T + bias` over the
+ * final dimension of an arbitrary-rank input tensor. F32, F16, and BF16 values
+ * are accumulated in single precision and converted back to the source type.
+ */
+
 #include "ops/cpu/linear_cpu.h"
 
 #include <immintrin.h>
@@ -8,6 +17,17 @@
 #include <stdexcept>
 
 namespace {
+    /**
+     * @brief Loads eight consecutive tensor elements as an AVX2 float vector.
+     *
+     * F32 values are loaded directly, F16 values are converted with F16C, and
+     * BF16 values are expanded into the upper half of F32 lanes.
+     *
+     * @param p Pointer to the beginning of the tensor storage.
+     * @param t Data type of the stored elements.
+     * @param i Index of the first element to load.
+     * @return Eight values converted to single precision.
+     */
     inline __m256 load8(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32) return _mm256_loadu_ps(static_cast<const float *>(p) + i);
         const auto *h = static_cast<const std::uint16_t *>(p) + i;
@@ -16,30 +36,65 @@ namespace {
             _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(h))), 16));
     }
 
+    /**
+     * @brief Loads one tensor element and converts it to single precision.
+     *
+     * @param p Pointer to the beginning of the tensor storage.
+     * @param t Data type of the stored elements.
+     * @param i Zero-based element index.
+     * @return Element value converted to `float`.
+     */
     inline float load1(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32) return static_cast<const float *>(p)[i];
         const auto h = static_cast<const std::uint16_t *>(p)[i];
         if (t == Dtype::F16) return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));
-        std::uint32_t bits = std::uint32_t(h) << 16;
+        std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
         float x;
         std::memcpy(&x, &bits, 4);
         return x;
     }
 
+    /**
+     * @brief Stores one single-precision value in the requested tensor format.
+     *
+     * F16 conversion uses F16C. BF16 conversion applies round-to-nearest-even
+     * before truncating the low 16 bits.
+     *
+     * @param p Pointer to the beginning of the tensor storage.
+     * @param t Destination element data type.
+     * @param i Zero-based destination element index.
+     * @param x Value to store.
+     */
     inline void store1(void *p, Dtype t, std::size_t i, float x) {
         if (t == Dtype::F32) {
             static_cast<float *>(p)[i] = x;
             return;
         }
         if (t == Dtype::F16) {
-            static_cast<std::uint16_t *>(p)[i] = std::uint16_t(_mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(x), 0)));
+            static_cast<std::uint16_t *>(p)[i] = static_cast<std::uint16_t>(_mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(x), 0)));
             return;
         }
         std::uint32_t bits;
         std::memcpy(&bits, &x, 4);
-        static_cast<std::uint16_t *>(p)[i] = std::uint16_t((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+        static_cast<std::uint16_t *>(p)[i] = static_cast<std::uint16_t>((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
     }
 
+    /**
+     * @brief Validates tensor placement, data types, ranks, and dimensions.
+     *
+     * The expected layout is an input tensor ending in `I`, a row-major weight
+     * matrix of shape `[O, I]`, an output tensor ending in `O`, and an optional
+     * bias vector of shape `[O]`. All leading input and output dimensions must
+     * match.
+     *
+     * @param out Preallocated output tensor.
+     * @param in Input tensor with rank of at least one.
+     * @param w Weight matrix.
+     * @param bias Optional bias vector, or `nullptr` when bias is disabled.
+     *
+     * @throws std::invalid_argument If any tensor is incompatible with the
+     *         required CPU linear-operation layout.
+     */
     inline void validate(const Tensor &out, const Tensor &in, const Tensor &w, const Tensor *bias) {
         if (out.device_type() != DeviceType::CPU || in.device_type() != DeviceType::CPU || w.device_type() !=
             DeviceType::CPU ||
@@ -56,6 +111,24 @@ namespace {
                     "CPU linear: leading shape mismatch");
     }
 
+    /**
+     * @brief Executes the dense linear transformation with an optional bias.
+     *
+     * All leading input dimensions are flattened into independent rows. Each
+     * OpenMP iteration processes one row. The vectorized path computes eight
+     * output channels concurrently and accumulates eight input features per
+     * AVX2 FMA operation. Remaining input and output elements use scalar FMA.
+     *
+     * @param out Preallocated output tensor ending in the output size `O`.
+     * @param in Input tensor ending in the input size `I`.
+     * @param w Row-major weight matrix with shape `[O, I]`.
+     * @param bias Optional bias vector with shape `[O]`.
+     *
+     * @throws std::invalid_argument If validation of the supplied tensors fails.
+     *
+     * @note Accumulation is performed in F32 for F32, F16, and BF16 storage.
+     * @note The function requires a build target supporting AVX2, FMA, and F16C.
+     */
     void apply(Tensor &out, const Tensor &in, const Tensor &w, const Tensor *bias) {
         validate(out, in, w, bias);
         const auto rows = in.numel() / in.shape().back();
@@ -68,7 +141,7 @@ namespace {
         auto *y = out.raw_data();
 #pragma omp parallel for schedule(static)
         for (std::int64_t r = 0; r < static_cast<std::int64_t>(rows); ++r) {
-            const std::size_t rb = std::size_t(r) * I, ob = std::size_t(r) * O;
+            const std::size_t rb = static_cast<std::size_t>(r) * I, ob = static_cast<std::size_t>(r) * O;
             std::size_t o = 0;
             for (; o + 7 < O; o += 8) {
                 __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
@@ -84,8 +157,8 @@ namespace {
                     a6 = _mm256_fmadd_ps(vx, load8(weights, t, (o + 6) * I + i), a6);
                     a7 = _mm256_fmadd_ps(vx, load8(weights, t, (o + 7) * I + i), a7);
                 }
-                float sums[8];
                 for (int z = 0; z < 8; ++z) {
+                    float sums[8];
                     __m256 v[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
                     alignas(32) float q[8];
                     _mm256_store_ps(q, v[z]);
@@ -108,5 +181,35 @@ namespace {
     }
 }
 
+/**
+ * @brief Applies a bias-free dense linear transformation on the CPU.
+ *
+ * Computes `o = i * w^T` over the final input dimension. The weight tensor is
+ * interpreted as a row-major matrix of shape `[output_features, input_features]`.
+ *
+ * @param o Preallocated output tensor whose final dimension is the number of
+ *          output features.
+ * @param i Input tensor whose final dimension is the number of input features.
+ * @param w Weight matrix with shape `[output_features, input_features]`.
+ *
+ * @throws std::invalid_argument If tensor placement, types, ranks, or shapes are
+ *         incompatible.
+ */
 void linear_forward_cpu(Tensor &o, const Tensor &i, const Tensor &w) { apply(o, i, w, nullptr); }
+
+/**
+ * @brief Applies a biased dense linear transformation on the CPU.
+ *
+ * Computes `o = i * w^T + b` over the final input dimension. The bias is
+ * broadcast across every flattened input row.
+ *
+ * @param o Preallocated output tensor whose final dimension is the number of
+ *          output features.
+ * @param i Input tensor whose final dimension is the number of input features.
+ * @param w Weight matrix with shape `[output_features, input_features]`.
+ * @param b Bias vector with shape `[output_features]`.
+ *
+ * @throws std::invalid_argument If tensor placement, types, ranks, or shapes are
+ *         incompatible.
+ */
 void linear_forward_cpu(Tensor &o, const Tensor &i, const Tensor &w, const Tensor &b) { apply(o, i, w, &b); }

@@ -1,3 +1,12 @@
+/**
+ * @file softmax_cpu.cpp
+ * @brief AVX2-optimized CPU implementation of row-wise softmax.
+ *
+ * This translation unit implements numerically stable softmax for non-empty
+ * two-dimensional CPU tensors. Computation is performed in single precision,
+ * while F32, F16, and BF16 tensor storage formats are supported.
+ */
+
 #include "ops/cpu/softmax_cpu.h"
 #include "core/simd_math.h"
 #include <immintrin.h>
@@ -8,6 +17,18 @@
 #include <stdexcept>
 
 namespace {
+    /**
+     * @brief Loads eight tensor elements and converts them to FP32.
+     *
+     * F32 values are loaded directly with AVX2. F16 values are converted using
+     * the F16C conversion instruction, while BF16 values are widened by placing
+     * their bits in the upper half of FP32 words.
+     *
+     * @param p Pointer to the beginning of the tensor storage.
+     * @param t Storage data type of the tensor.
+     * @param i Index of the first element to load.
+     * @return Eight values packed in an AVX register as FP32.
+     */
     inline __m256 load8(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32)return _mm256_loadu_ps(static_cast<const float *>(p) + i);
         if (t == Dtype::F16)
@@ -18,6 +39,14 @@ namespace {
                 _mm_loadu_si128(reinterpret_cast<const __m128i *>(static_cast<const std::uint16_t *>(p) + i))), 16));
     }
 
+    /**
+     * @brief Loads one tensor element and converts it to FP32.
+     *
+     * @param p Pointer to the beginning of the tensor storage.
+     * @param t Storage data type of the tensor.
+     * @param i Element index.
+     * @return Element value represented as FP32.
+     */
     inline float load1(const void *p, Dtype t, std::size_t i) {
         if (t == Dtype::F32)return static_cast<const float *>(p)[i];
         auto h = static_cast<const std::uint16_t *>(p)[i];
@@ -28,6 +57,17 @@ namespace {
         return x;
     }
 
+    /**
+     * @brief Converts and stores one FP32 value in tensor storage.
+     *
+     * BF16 conversion uses round-to-nearest-even. F16 conversion is performed
+     * with the F16C conversion instruction.
+     *
+     * @param p Pointer to the beginning of the destination tensor storage.
+     * @param t Storage data type of the destination tensor.
+     * @param i Destination element index.
+     * @param x FP32 value to store.
+     */
     inline void store1(void *p, Dtype t, std::size_t i, float x) {
         if (t == Dtype::F32) {
             static_cast<float *>(p)[i] = x;
@@ -43,6 +83,32 @@ namespace {
     }
 }
 
+/**
+ * @brief Computes row-wise softmax for a two-dimensional CPU tensor.
+ *
+ * For each input row, the function computes
+ * \f[
+ *     y_i = \frac{\exp(x_i - m)}{\sum_j \exp(x_j - m)},
+ *     \qquad m = \max_j x_j,
+ * \f]
+ * where subtracting the row maximum improves numerical stability.
+ *
+ * Rows are processed in parallel with OpenMP. The maximum and exponential sum
+ * reductions use AVX2 with four independent accumulators for blocks of 32
+ * elements. Arithmetic is performed in FP32 regardless of tensor storage type.
+ *
+ * @param output Destination tensor receiving normalized probabilities. Must be
+ *               a non-empty, two-dimensional CPU tensor with the same shape and
+ *               data type as @p input.
+ * @param input Source tensor containing unnormalized logits.
+ *
+ * @throws std::invalid_argument If either tensor is not CPU-resident, if the
+ *         tensors differ in shape or data type, if the input is empty or not
+ *         two-dimensional, or if its data type is not floating-point.
+ *
+ * @note Supported storage types are the floating-point types recognized by
+ *       is_floating_point(), including F32, F16, and BF16.
+ */
 void softmax_forward_cpu(Tensor &output, const Tensor &input) {
     if (output.device_type() != DeviceType::CPU || input.device_type() != DeviceType::CPU || input.dim() != 2 || input.
         size(0) == 0 || input.size(1) == 0 || output.shape() != input.shape() || output.dtype() != input.dtype() || !
