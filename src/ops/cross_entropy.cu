@@ -19,9 +19,8 @@
 
 namespace {
 
-// The benchmark uses a wide GPT vocabulary (50k+ values per row). 512
-// threads gives the reduction and the exp pass twice as many independent
-// memory/math lanes, which is useful here despite the extra reduction warp.
+// A GPT-sized vocabulary keeps all 16 warps busy while each thread owns
+// enough values to expose instruction-level parallelism to the exp pipeline.
 constexpr int kThreads = 512;
 constexpr int kWarpSize = 32;
 constexpr int kWarps = kThreads / kWarpSize;
@@ -174,10 +173,10 @@ void cross_entropy_fused_kernel(
     const float maximum = block_reduce_max(local_max, warp_scratch);
 
 
-    // Reuse the output buffer for the unnormalized softmax.  The old version
-    // evaluated exp() once to obtain the denominator and again to form the
-    // gradient.  Centered exponentials are in [0, 1], so they are safe to
-    // stage in all supported output dtypes.
+    // Accumulate the normalizer in FP32.  The final pass is intentionally
+    // recomputed from logits rather than staging exponentials in gradient:
+    // this removes a full gradient read plus an intermediate global write,
+    // and avoids quantizing the intermediate for FP16/BF16 gradients.
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     float sum2 = 0.0f;
@@ -195,17 +194,12 @@ void cross_entropy_fused_kernel(
         sum2 += e2;
         sum3 += e3;
 
-        row_gradient[column] = from_float<T>(e0);
-        row_gradient[column + kStride] = from_float<T>(e1);
-        row_gradient[column + 2 * kStride] = from_float<T>(e2);
-        row_gradient[column + 3 * kStride] = from_float<T>(e3);
     }
 
     float local_sum = (sum0 + sum1) + (sum2 + sum3);
     for (; column < vocabulary_size; column += kStride) {
         const float e = __expf(to_float(row_logits[column]) - maximum);
         local_sum += e;
-        row_gradient[column] = from_float<T>(e);
     }
     const float denominator = block_reduce_sum(local_sum, warp_scratch);
     const float inv_denominator = __frcp_rn(denominator);
@@ -222,10 +216,10 @@ void cross_entropy_fused_kernel(
 
     column = tid;
     for (; column + 3 * kStride < vocabulary_size; column += kUnrolledStride) {
-        float v0 = to_float(row_gradient[column]) * inv_denominator;
-        float v1 = to_float(row_gradient[column + kStride]) * inv_denominator;
-        float v2 = to_float(row_gradient[column + 2 * kStride]) * inv_denominator;
-        float v3 = to_float(row_gradient[column + 3 * kStride]) * inv_denominator;
+        float v0 = __expf(to_float(row_logits[column]) - maximum) * inv_denominator;
+        float v1 = __expf(to_float(row_logits[column + kStride]) - maximum) * inv_denominator;
+        float v2 = __expf(to_float(row_logits[column + 2 * kStride]) - maximum) * inv_denominator;
+        float v3 = __expf(to_float(row_logits[column + 3 * kStride]) - maximum) * inv_denominator;
 
         if (valid_target) {
             const auto target_column = static_cast<std::size_t>(target);
@@ -242,7 +236,7 @@ void cross_entropy_fused_kernel(
     }
 
     for (; column < vocabulary_size; column += kStride) {
-        float value = to_float(row_gradient[column]) * inv_denominator;
+        float value = __expf(to_float(row_logits[column]) - maximum) * inv_denominator;
         if (valid_target && column == static_cast<std::size_t>(target)) value -= 1.0f;
         row_gradient[column] = from_float<T>(value * inv_rows);
     }
