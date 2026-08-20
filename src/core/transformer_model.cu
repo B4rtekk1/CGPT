@@ -1,3 +1,5 @@
+/** @file transformer_model.cu CUDA implementation of Transformer model workspaces and passes. */
+
 #include "core/transformer_model.h"
 
 #include "core/cuda_check.h"
@@ -13,59 +15,106 @@
 #include <string>
 
 namespace {
-
-void validate_options(const TransformerModelOptions& options) {
-    const auto& block = options.block_options;
-    if (options.vocabulary_size == 0 || options.num_layers == 0 ||
-        block.hidden_size == 0 || block.intermediate_size == 0 ||
-        block.num_query_heads == 0 || block.num_kv_heads == 0 || block.head_dim == 0) {
-        throw std::invalid_argument("transformer model dimensions must be non-zero");
+    /**
+     * @brief Validates the structural dimensions of a Transformer model.
+     *
+     * Verifies non-zero dimensions, `num_query_heads * head_dim == hidden_size`,
+     * and a valid grouped-query-attention head ratio.
+     *
+     * @param options Model configuration.
+     *
+     * @throws std::invalid_argument If any structural requirement is violated.
+     */
+    void validate_options(const TransformerModelOptions &options) {
+        const auto &block = options.block_options;
+        if (options.vocabulary_size == 0 || options.num_layers == 0 ||
+            block.hidden_size == 0 || block.intermediate_size == 0 ||
+            block.num_query_heads == 0 || block.num_kv_heads == 0 || block.head_dim == 0) {
+            throw std::invalid_argument("transformer model dimensions must be non-zero");
+        }
+        if (block.num_query_heads * block.head_dim != block.hidden_size) {
+            throw std::invalid_argument("transformer model query heads times head_dim must equal hidden_size");
+        }
+        if (block.num_kv_heads > block.num_query_heads ||
+            block.num_query_heads % block.num_kv_heads != 0) {
+            throw std::invalid_argument("transformer model has an invalid GQA head configuration");
+        }
     }
-    if (block.num_query_heads * block.head_dim != block.hidden_size) {
-        throw std::invalid_argument("transformer model query heads times head_dim must equal hidden_size");
-    }
-    if (block.num_kv_heads > block.num_query_heads ||
-        block.num_query_heads % block.num_kv_heads != 0) {
-        throw std::invalid_argument("transformer model has an invalid GQA head configuration");
-    }
-}
 
-TransformerBlockWorkspace make_block_workspace(
-    const TransformerModelOptions& options,
-    const std::size_t batch_size,
-    const std::size_t sequence_length,
-    const Dtype dtype
-) {
-    const auto& block = options.block_options;
-    const std::size_t rows = batch_size * sequence_length;
-    return {
-        Tensor({rows, block.hidden_size}, dtype),
-        Tensor({batch_size, sequence_length, block.num_query_heads, block.head_dim}, dtype),
-        Tensor({batch_size, sequence_length, block.num_kv_heads, block.head_dim}, dtype),
-        Tensor({batch_size, sequence_length, block.num_kv_heads, block.head_dim}, dtype),
-        Tensor({batch_size, sequence_length, block.num_query_heads, block.head_dim}, dtype),
-        Tensor({batch_size, sequence_length, block.num_kv_heads, block.head_dim}, dtype),
-        Tensor({batch_size, sequence_length, block.num_query_heads, block.head_dim}, dtype),
-        Tensor({batch_size, sequence_length, block.num_query_heads}, Dtype::F32),
-        Tensor({rows, block.hidden_size}, dtype),
-        Tensor({rows, block.intermediate_size}, dtype),
-        Tensor({rows, block.intermediate_size}, dtype),
-        Tensor({rows, block.intermediate_size}, dtype),
-        Tensor({rows, block.hidden_size}, dtype)
-    };
-}
 
-void require_cuda_tensor(const Tensor& tensor, const std::vector<std::size_t>& shape,
-                         const Dtype dtype, const char* name) {
-    if (tensor.device_type() != DeviceType::CUDA || tensor.dtype() != dtype || tensor.shape() != shape) {
-        throw std::invalid_argument(std::string("transformer model: invalid ") + name + " tensor");
+    /**
+     * @brief Allocates a forward workspace for one Transformer layer.
+     *
+     * @param options Model and block dimensions.
+     * @param batch_size Number of sequences.
+     * @param sequence_length Number of tokens per sequence.
+     * @param dtype Floating-point activation storage type.
+     * @return Fully allocated block workspace with Q/K/V, attention, normalization,
+     * and feed-forward intermediates.
+     */
+    TransformerBlockWorkspace make_block_workspace(
+        const TransformerModelOptions &options,
+        const std::size_t batch_size,
+        const std::size_t sequence_length,
+        const Dtype dtype
+    ) {
+        const auto &block = options.block_options;
+        const std::size_t rows = batch_size * sequence_length;
+        return {
+            Tensor({rows, block.hidden_size}, dtype),
+            Tensor({batch_size, sequence_length, block.num_query_heads, block.head_dim}, dtype),
+            Tensor({batch_size, sequence_length, block.num_kv_heads, block.head_dim}, dtype),
+            Tensor({batch_size, sequence_length, block.num_kv_heads, block.head_dim}, dtype),
+            Tensor({batch_size, sequence_length, block.num_query_heads, block.head_dim}, dtype),
+            Tensor({batch_size, sequence_length, block.num_kv_heads, block.head_dim}, dtype),
+            Tensor({batch_size, sequence_length, block.num_query_heads, block.head_dim}, dtype),
+            Tensor({batch_size, sequence_length, block.num_query_heads}, Dtype::F32),
+            Tensor({rows, block.hidden_size}, dtype),
+            Tensor({rows, block.intermediate_size}, dtype),
+            Tensor({rows, block.intermediate_size}, dtype),
+            Tensor({rows, block.intermediate_size}, dtype),
+            Tensor({rows, block.hidden_size}, dtype)
+        };
     }
-}
 
+
+    /**
+     * @brief Requires an exact CUDA tensor device, dtype, and shape.
+     *
+     * @param tensor Tensor to validate.
+     * @param shape Expected shape.
+     * @param dtype Expected storage dtype.
+     * @param name Diagnostic tensor name.
+     *
+     * @throws std::invalid_argument If any property differs.
+     */
+    void require_cuda_tensor(const Tensor &tensor, const std::vector<std::size_t> &shape,
+                             const Dtype dtype, const char *name) {
+        if (tensor.device_type() != DeviceType::CUDA || tensor.dtype() != dtype || tensor.shape() != shape) {
+            throw std::invalid_argument(std::string("transformer model: invalid ") + name + " tensor");
+        }
+    }
 } // namespace
 
+
+/**
+ * @brief Allocates forward activations for a complete Transformer model.
+ *
+ * One block workspace and one saved layer-input tensor are allocated per model
+ * layer. Top-level tensors store embedding output, alternating layer output,
+ * and final normalized activations.
+ *
+ * @param options Model configuration.
+ * @param batch_size Number of sequences.
+ * @param sequence_length Number of tokens per sequence.
+ * @param dtype Floating-point activation storage type.
+ *
+ * @throws std::invalid_argument If model dimensions, batch size, sequence
+ * length, or dtype are invalid.
+ * @throws std::overflow_error If `batch_size * sequence_length` overflows.
+ */
 TransformerModelWorkspace::TransformerModelWorkspace(
-    const TransformerModelOptions& options,
+    const TransformerModelOptions &options,
     const std::size_t batch_size,
     const std::size_t sequence_length,
     const Dtype dtype
@@ -82,12 +131,26 @@ TransformerModelWorkspace::TransformerModelWorkspace(
     layers.reserve(options.num_layers);
     for (std::size_t layer = 0; layer < options.num_layers; ++layer) {
         layers.push_back(make_block_workspace(options, batch_size, sequence_length, dtype));
-        layer_inputs.emplace_back(std::vector<std::size_t>{batch_size * sequence_length, options.block_options.hidden_size}, dtype);
+        layer_inputs.emplace_back(std::vector<std::size_t>{
+                                      batch_size * sequence_length, options.block_options.hidden_size
+                                  }, dtype);
     }
 }
 
+
+/**
+ * @brief Allocates temporary tensors for full-model backpropagation.
+ *
+ * @param options Model configuration.
+ * @param batch_size Number of sequences.
+ * @param sequence_length Number of tokens per sequence.
+ * @param dtype Floating-point gradient storage type.
+ *
+ * @throws std::invalid_argument If dimensions are non-positive or dtype is not
+ * floating point.
+ */
 TransformerModelBackwardWorkspace::TransformerModelBackwardWorkspace(
-    const TransformerModelOptions& options, const std::size_t batch_size,
+    const TransformerModelOptions &options, const std::size_t batch_size,
     const std::size_t sequence_length, const Dtype dtype)
     : grad_normalized({batch_size * sequence_length, options.block_options.hidden_size}, dtype),
       grad_hidden({batch_size * sequence_length, options.block_options.hidden_size}, dtype),
@@ -95,19 +158,47 @@ TransformerModelBackwardWorkspace::TransformerModelBackwardWorkspace(
       lm_head_bias({options.vocabulary_size}, dtype) {
     validate_options(options);
     if (batch_size == 0 || sequence_length == 0 || !is_floating_point(dtype))
-        throw std::invalid_argument("transformer model backward workspace requires positive dimensions and a floating dtype");
+        throw std::invalid_argument(
+            "transformer model backward workspace requires positive dimensions and a floating dtype");
     layers.reserve(options.num_layers);
     for (std::size_t layer = 0; layer < options.num_layers; ++layer)
         layers.emplace_back(options.block_options, batch_size, sequence_length, dtype);
 }
 
+
+/**
+ * @brief Executes a full batched Transformer forward pass on CUDA.
+ *
+ * Token IDs are embedded, passed through every Transformer block, normalized,
+ * and projected to vocabulary logits. Inputs to each layer are saved in the
+ * workspace for later backward propagation.
+ *
+ * @param logits Destination tensor with shape `[B*S, vocabulary_size]`.
+ * @param device_token_ids Device pointer to `B*S` token identifiers.
+ * @param batch_size Number of sequences.
+ * @param sequence_length Number of tokens per sequence.
+ * @param weights Model parameters resident on CUDA.
+ * @param workspace Preallocated forward workspace.
+ * @param cos_cache RoPE cosine cache.
+ * @param sin_cache RoPE sine cache.
+ * @param cublas_context cuBLASLt execution context.
+ * @param stream CUDA stream used for execution.
+ * @param options Model configuration.
+ * @param position_offset Absolute position of the first token.
+ *
+ * @throws std::invalid_argument If token IDs, options, weights, workspaces, or
+ * output tensors are incompatible.
+ * @throws std::overflow_error If the flattened row count overflows.
+ *
+ * @note Operations are enqueued asynchronously on @p stream.
+ */
 void transformer_model_forward(
-    Tensor& logits, const bpe::TokenId* const device_token_ids,
+    Tensor &logits, const bpe::TokenId *const device_token_ids,
     const std::size_t batch_size, const std::size_t sequence_length,
-    const TransformerModelWeights& weights, TransformerModelWorkspace& workspace,
-    const Tensor& cos_cache, const Tensor& sin_cache,
-    const CublasLtContext& cublas_context, cudaStream_t stream,
-    const TransformerModelOptions& options, const std::size_t position_offset
+    const TransformerModelWeights &weights, TransformerModelWorkspace &workspace,
+    const Tensor &cos_cache, const Tensor &sin_cache,
+    const CublasLtContext &cublas_context, cudaStream_t stream,
+    const TransformerModelOptions &options, const std::size_t position_offset
 ) {
     validate_options(options);
     if (device_token_ids == nullptr || batch_size == 0 || sequence_length == 0) {
@@ -117,12 +208,13 @@ void transformer_model_forward(
         throw std::overflow_error("transformer model row count overflows");
     }
     const std::size_t rows = batch_size * sequence_length;
-    const auto& block = options.block_options;
+    const auto &block = options.block_options;
     const Dtype dtype = weights.token_embedding.dtype();
     if (!is_floating_point(dtype) || weights.layers.size() != options.num_layers) {
         throw std::invalid_argument("transformer model weights have an invalid dtype or layer count");
     }
-    require_cuda_tensor(weights.token_embedding, {options.vocabulary_size, block.hidden_size}, dtype, "token_embedding");
+    require_cuda_tensor(weights.token_embedding, {options.vocabulary_size, block.hidden_size}, dtype,
+                        "token_embedding");
     require_cuda_tensor(weights.final_norm, {block.hidden_size}, dtype, "final_norm");
     require_cuda_tensor(weights.lm_head, {options.vocabulary_size, block.hidden_size}, dtype, "lm_head");
     require_cuda_tensor(workspace.hidden, {rows, block.hidden_size}, dtype, "workspace.hidden");
@@ -138,7 +230,8 @@ void transformer_model_forward(
         CUDA_CHECK(cudaMemcpyAsync(workspace.layer_inputs[layer].raw_data(), workspace.hidden.raw_data(),
             workspace.hidden.nbytes(), cudaMemcpyDeviceToDevice, stream));
         transformer_block_forward(workspace.layer_output, workspace.hidden, weights.layers[layer],
-            workspace.layers[layer], cos_cache, sin_cache, cublas_context, stream, block, position_offset);
+                                  workspace.layers[layer], cos_cache, sin_cache, cublas_context, stream, block,
+                                  position_offset);
         std::swap(workspace.hidden, workspace.layer_output);
     }
     rmsnorm_forward(workspace.normalized, workspace.hidden, weights.final_norm,
@@ -147,13 +240,39 @@ void transformer_model_forward(
                    stream, block.linear_options);
 }
 
+
+/**
+ * @brief Executes single-token autoregressive inference using a KV cache.
+ *
+ * The function requires a one-token workspace (`B = 1`, `S = 1`). For every
+ * layer it creates tensor views over the cache, appends the new key/value pair,
+ * attends over the active prefix, and advances that layer's sequence length.
+ *
+ * @param logits Destination tensor with shape `[1, vocabulary_size]`.
+ * @param device_token_ids Device pointer to one token identifier.
+ * @param weights Model parameters.
+ * @param workspace One-token model workspace.
+ * @param kv_cache Per-layer key/value cache.
+ * @param cache_length Number of tokens already present before this step.
+ * @param cos_cache RoPE cosine cache.
+ * @param sin_cache RoPE sine cache.
+ * @param cublas_context cuBLASLt execution context.
+ * @param stream CUDA stream used for execution.
+ * @param options Model configuration.
+ *
+ * @throws std::invalid_argument If token IDs or one-token workspace shapes are
+ * invalid, or if delegated operators reject the model/cache configuration.
+ *
+ * @note Cache views are currently constructed with F16 storage.
+ * @note Operations are asynchronous with respect to the host.
+ */
 void transformer_model_forward_cached(
-    Tensor& logits, const bpe::TokenId* const device_token_ids,
-    const TransformerModelWeights& weights, TransformerModelWorkspace& workspace,
-    KVCache& kv_cache, const std::size_t cache_length,
-    const Tensor& cos_cache, const Tensor& sin_cache,
-    const CublasLtContext& cublas_context, cudaStream_t stream,
-    const TransformerModelOptions& options
+    Tensor &logits, const bpe::TokenId *const device_token_ids,
+    const TransformerModelWeights &weights, TransformerModelWorkspace &workspace,
+    KVCache &kv_cache, const std::size_t cache_length,
+    const Tensor &cos_cache, const Tensor &sin_cache,
+    const CublasLtContext &cublas_context, cudaStream_t stream,
+    const TransformerModelOptions &options
 ) {
     if (device_token_ids == nullptr || workspace.layers.size() != options.num_layers ||
         workspace.hidden.shape() != std::vector<std::size_t>{1, options.block_options.hidden_size} ||
@@ -163,14 +282,18 @@ void transformer_model_forward_cached(
     embedding_forward(workspace.hidden, device_token_ids, 1, weights.token_embedding, stream);
     for (std::size_t layer = 0; layer < options.num_layers; ++layer) {
         auto key_cache = Tensor::device_view(
-            {1, kv_cache.config().max_sequence_length, options.block_options.num_kv_heads,
-             options.block_options.head_dim}, kv_cache.key_sequence(layer, 0), Dtype::F16);
+            {
+                1, kv_cache.config().max_sequence_length, options.block_options.num_kv_heads,
+                options.block_options.head_dim
+            }, kv_cache.key_sequence(layer, 0), Dtype::F16);
         auto value_cache = Tensor::device_view(
-            {1, kv_cache.config().max_sequence_length, options.block_options.num_kv_heads,
-             options.block_options.head_dim}, kv_cache.value_sequence(layer, 0), Dtype::F16);
+            {
+                1, kv_cache.config().max_sequence_length, options.block_options.num_kv_heads,
+                options.block_options.head_dim
+            }, kv_cache.value_sequence(layer, 0), Dtype::F16);
         transformer_block_forward(workspace.layer_output, workspace.hidden, weights.layers[layer],
-            workspace.layers[layer], cos_cache, sin_cache, cublas_context, stream,
-            options.block_options, cache_length, &key_cache, &value_cache, cache_length);
+                                  workspace.layers[layer], cos_cache, sin_cache, cublas_context, stream,
+                                  options.block_options, cache_length, &key_cache, &value_cache, cache_length);
         std::swap(workspace.hidden, workspace.layer_output);
         kv_cache.advance_sequence_length(layer, 0, 1);
     }
@@ -180,20 +303,51 @@ void transformer_model_forward_cached(
                    stream, options.block_options.linear_options);
 }
 
+
+/**
+ * @brief Backpropagates vocabulary-logit gradients through the full model.
+ *
+ * The routine differentiates the LM head and final RMSNorm, traverses
+ * Transformer layers in reverse order, and finally accumulates gradients into
+ * the token-embedding table. When input embeddings and the LM head are tied,
+ * the lookup gradient is added to the classifier gradient already stored in the
+ * shared tensor.
+ *
+ * @param grad_logits Upstream gradient with shape `[B*S, vocabulary_size]`.
+ * @param device_token_ids Device pointer to `B*S` token identifiers.
+ * @param batch_size Number of sequences.
+ * @param sequence_length Number of tokens per sequence.
+ * @param weights Forward model parameters.
+ * @param gradients Destination model-gradient tensors.
+ * @param forward_workspace Forward activations saved by transformer_model_forward().
+ * @param backward_workspace Preallocated backward workspace.
+ * @param cos_cache RoPE cosine cache.
+ * @param sin_cache RoPE sine cache.
+ * @param cublas_context cuBLASLt execution context.
+ * @param stream CUDA stream used for execution.
+ * @param options Model configuration.
+ * @param position_offset Position offset used during the forward pass.
+ *
+ * @throws std::invalid_argument If model state, gradient tensors, token IDs, or
+ * workspace shapes are incompatible.
+ *
+ * @note Operations are asynchronous with respect to the host.
+ */
 void transformer_model_backward(
-    const Tensor& grad_logits, const bpe::TokenId* const device_token_ids,
+    const Tensor &grad_logits, const bpe::TokenId *const device_token_ids,
     const std::size_t batch_size, const std::size_t sequence_length,
-    const TransformerModelWeights& weights, const TransformerModelGradients gradients,
-    const TransformerModelWorkspace& forward_workspace, TransformerModelBackwardWorkspace& backward_workspace,
-    const Tensor& cos_cache, const Tensor& sin_cache, const CublasLtContext& cublas_context,
-    cudaStream_t stream, const TransformerModelOptions& options, const std::size_t position_offset) {
+    const TransformerModelWeights &weights, const TransformerModelGradients gradients,
+    const TransformerModelWorkspace &forward_workspace, TransformerModelBackwardWorkspace &backward_workspace,
+    const Tensor &cos_cache, const Tensor &sin_cache, const CublasLtContext &cublas_context,
+    cudaStream_t stream, const TransformerModelOptions &options, const std::size_t position_offset) {
     validate_options(options);
     if (device_token_ids == nullptr || batch_size == 0 || sequence_length == 0 ||
         gradients.layers.size() != options.num_layers || forward_workspace.layers.size() != options.num_layers ||
-        forward_workspace.layer_inputs.size() != options.num_layers || backward_workspace.layers.size() != options.num_layers)
+        forward_workspace.layer_inputs.size() != options.num_layers || backward_workspace.layers.size() != options.
+        num_layers)
         throw std::invalid_argument("transformer model backward: invalid model state or token IDs");
     const std::size_t rows = batch_size * sequence_length;
-    const auto& block = options.block_options;
+    const auto &block = options.block_options;
     const Dtype dtype = weights.token_embedding.dtype();
     if (grad_logits.device_type() != DeviceType::CUDA || grad_logits.dtype() != dtype ||
         grad_logits.shape() != std::vector<std::size_t>{rows, options.vocabulary_size} ||
@@ -204,16 +358,18 @@ void transformer_model_backward(
 
     LinearBackwardOptions linear_options{block.linear_options.compute_type, block.linear_options.workspace_bytes};
     linear_backward(backward_workspace.grad_normalized, gradients.lm_head, backward_workspace.lm_head_bias,
-        grad_logits, forward_workspace.normalized, weights.lm_head, cublas_context, stream, linear_options);
+                    grad_logits, forward_workspace.normalized, weights.lm_head, cublas_context, stream, linear_options);
     rmsnorm_backward(backward_workspace.grad_hidden, gradients.final_norm, backward_workspace.grad_normalized,
-        forward_workspace.hidden, weights.final_norm, block.rms_epsilon, stream);
+                     forward_workspace.hidden, weights.final_norm, block.rms_epsilon, stream);
 
-    Tensor* current = &backward_workspace.grad_hidden;
-    Tensor* previous = &backward_workspace.grad_previous;
+    Tensor *current = &backward_workspace.grad_hidden;
+    Tensor *previous = &backward_workspace.grad_previous;
     for (std::size_t reverse = options.num_layers; reverse-- > 0;) {
-        transformer_block_backward(*previous, *current, forward_workspace.layer_inputs[reverse], weights.layers[reverse],
-            gradients.layers[reverse], forward_workspace.layers[reverse], backward_workspace.layers[reverse],
-            cos_cache, sin_cache, cublas_context, stream, block, position_offset);
+        transformer_block_backward(*previous, *current, forward_workspace.layer_inputs[reverse],
+                                   weights.layers[reverse],
+                                   gradients.layers[reverse], forward_workspace.layers[reverse],
+                                   backward_workspace.layers[reverse],
+                                   cos_cache, sin_cache, cublas_context, stream, block, position_offset);
         std::swap(current, previous);
     }
     // With tied embeddings, linear_backward has already written the output
@@ -221,5 +377,5 @@ void transformer_model_backward(
     // gradient from the input lookup; untied models retain the old overwrite
     // behaviour.
     embedding_backward(gradients.token_embedding, *current, device_token_ids, rows, stream,
-        EmbeddingBackwardOptions{.accumulate_weight = &gradients.token_embedding == &gradients.lm_head});
+                       EmbeddingBackwardOptions{.accumulate_weight = &gradients.token_embedding == &gradients.lm_head});
 }

@@ -1,3 +1,5 @@
+"""Download a size-limited streaming sample from FineWeb-Edu."""
+
 import argparse
 import json
 from pathlib import Path

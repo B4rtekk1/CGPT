@@ -1,3 +1,5 @@
+"""Download and decompress a fixed-size Wikimedia text sample."""
+
 from __future__ import annotations
 
 import argparse
@@ -37,7 +39,7 @@ def download_text(url: str, output: Path, size: int) -> None:
                         destination.write(chunk)
                         written += len(chunk)
                         print(
-                            f"\rPobrano: {written / 1024 / 1024:7.2f} / "
+                            f"\rDownloaded: {written / 1024 / 1024:7.2f} / "
                             f"{size / 1024 / 1024:.2f} MiB",
                             end="",
                             flush=True,
@@ -57,7 +59,7 @@ def download_text(url: str, output: Path, size: int) -> None:
     if written < size:
         output.unlink(missing_ok=True)
         raise RuntimeError(
-            f"Źródło zakończyło się po {written} bajtach; wymagano {size}."
+            f"The source ended after {written} bytes; {size} bytes were required."
         )
 
 
@@ -68,21 +70,21 @@ def main() -> int:
     )
     parser.add_argument(
         "--size-mib", type=int, default=100,
-        help="Rozmiar wyjścia w MiB (domyślnie: 100).",
+        help="Output size in MiB (default: 100).",
     )
-    parser.add_argument("--url", default=DEFAULT_URL, help="Źródło dumpa .bz2.")
+    parser.add_argument("--url", default=DEFAULT_URL, help="URL of the .bz2 dump.")
     args = parser.parse_args()
 
     if args.size_mib <= 0:
-        parser.error("--size-mib musi być większe od zera")
+        parser.error("--size-mib must be greater than zero")
 
     try:
         download_text(args.url, args.output, args.size_mib * 1024 * 1024)
     except (OSError, RuntimeError, urllib.error.URLError) as error:
-        print(f"Błąd pobierania: {error}", file=sys.stderr)
+        print(f"Download failed: {error}", file=sys.stderr)
         return 1
 
-    print(f"Zapisano {args.output} ({args.output.stat().st_size} bajtów).")
+    print(f"Saved {args.output} ({args.output.stat().st_size} bytes).")
     return 0
 
 

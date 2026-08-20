@@ -1,3 +1,5 @@
+/** @file Hugging Face safetensors export and import implementation. */
+
 #include "core/huggingface_export.h"
 
 #include "core/cuda_check.h"
@@ -14,6 +16,12 @@
 #include <vector>
 
 namespace {
+/**
+ * @brief Host-side description of one tensor being written to safetensors.
+ *
+ * The structure retains the external tensor name, a non-owning source pointer,
+ * a host byte copy, and the tensor's byte offset in the safetensors data region.
+ */
 struct ExportTensor {
     std::string name;
     const Tensor* tensor;
@@ -21,6 +29,14 @@ struct ExportTensor {
     std::size_t offset = 0;
 };
 
+/**
+ * @brief Encodes a string as a JSON string literal.
+ *
+ * Quotes, backslashes, newlines, carriage returns, and tabs are escaped.
+ *
+ * @param value Unquoted string value.
+ * @return JSON string literal including surrounding quotation marks.
+ */
 std::string json_string(const std::string_view value) {
     std::ostringstream result;
     result << '"';
@@ -38,6 +54,14 @@ std::string json_string(const std::string_view value) {
     return result.str();
 }
 
+/**
+ * @brief Converts an internal floating-point dtype to safetensors notation.
+ *
+ * @param dtype Internal tensor element type.
+ * @return One of `F16`, `BF16`, or `F32`.
+ *
+ * @throws std::invalid_argument If @p dtype is not supported by this exporter.
+ */
 std::string safetensors_dtype(const Dtype dtype) {
     switch (dtype) {
         case Dtype::F16: return "F16";
@@ -47,6 +71,16 @@ std::string safetensors_dtype(const Dtype dtype) {
     }
 }
 
+/**
+ * @brief Copies a tensor's raw storage into its host export buffer.
+ *
+ * CUDA tensors are copied synchronously with cudaMemcpyDeviceToHost. CPU
+ * tensors are copied directly with std::memcpy.
+ *
+ * @param output Export descriptor whose tensor is copied into `bytes`.
+ *
+ * @throws CudaError If a CUDA device-to-host copy fails.
+ */
 void copy_tensor_bytes(ExportTensor& output) {
     output.bytes.resize(output.tensor->nbytes());
     if (output.tensor->device_type() == DeviceType::CUDA) {
@@ -57,10 +91,23 @@ void copy_tensor_bytes(ExportTensor& output) {
     }
 }
 
+/**
+ * @brief Appends a named, non-owning tensor reference to an export list.
+ *
+ * @param tensors Destination list.
+ * @param name Safetensors/Hugging Face parameter name.
+ * @param tensor Tensor whose storage will be exported later.
+ */
 void add_tensor(std::vector<ExportTensor>& tensors, std::string name, const Tensor& tensor) {
     tensors.push_back({std::move(name), &tensor});
 }
 
+/**
+ * @brief Serializes a tensor shape as a compact JSON array.
+ *
+ * @param tensor Tensor whose dimensions are serialized.
+ * @return JSON array such as `[4096,4096]`.
+ */
 std::string shape_json(const Tensor& tensor) {
     std::ostringstream result;
     result << '[';
@@ -72,6 +119,19 @@ std::string shape_json(const Tensor& tensor) {
     return result.str();
 }
 
+/**
+ * @brief Writes the Hugging Face `config.json` for the CGPT architecture.
+ *
+ * The generated configuration describes vocabulary size, hidden and
+ * intermediate widths, layer and head counts, head dimension, context length,
+ * RMSNorm epsilon, RoPE base, parallel residual behavior, and tied embeddings.
+ *
+ * @param path Destination configuration file.
+ * @param options Transformer architecture configuration.
+ * @param max_position_embeddings Maximum supported sequence length.
+ *
+ * @throws std::runtime_error If the output file cannot be created.
+ */
 void write_config(const std::filesystem::path& path, const TransformerModelOptions& options,
                   const std::size_t max_position_embeddings) {
     const auto& block = options.block_options;
@@ -96,6 +156,25 @@ void write_config(const std::filesystem::path& path, const TransformerModelOptio
            << "}\n";
 }
 
+/**
+ * @brief Writes model tensors to one safetensors file.
+ *
+ * All tensors are first copied into host byte buffers. The function constructs
+ * a JSON header containing dtype, shape, and half-open data offsets, pads that
+ * header to an eight-byte boundary, writes its little-endian 64-bit size, and
+ * finally writes each tensor's raw bytes in registration order.
+ *
+ * @param path Destination `model.safetensors` path.
+ * @param tensors Tensor descriptors to serialize. Their byte buffers and
+ * offsets are populated by this function.
+ *
+ * @throws std::invalid_argument If a tensor dtype is unsupported.
+ * @throws std::overflow_error If the combined data-region size overflows
+ * std::size_t.
+ * @throws std::runtime_error If the file cannot be created or completely
+ * written.
+ * @throws CudaError If copying a CUDA tensor to host fails.
+ */
 void write_safetensors(const std::filesystem::path& path, std::vector<ExportTensor>& tensors) {
     std::size_t data_size = 0;
     for (ExportTensor& tensor : tensors) {
@@ -132,6 +211,20 @@ void write_safetensors(const std::filesystem::path& path, std::vector<ExportTens
     if (!output) throw std::runtime_error("Failed writing " + path.string());
 }
 
+/**
+ * @brief Parses a non-negative integer from a compact safetensors JSON field.
+ *
+ * Leading whitespace and the separators `[`, and `,` are skipped. The cursor
+ * is advanced to the first character after the parsed decimal number.
+ *
+ * @param text Source JSON fragment.
+ * @param position In/out cursor into @p text.
+ * @return Parsed value as std::size_t.
+ *
+ * @throws std::runtime_error If no decimal digits are present.
+ * @throws std::invalid_argument If conversion fails.
+ * @throws std::out_of_range If the parsed number does not fit.
+ */
 std::size_t parse_number(const std::string& text, std::size_t& position) {
     while (position < text.size() && (text[position] == ' ' || text[position] == '\n' || text[position] == '\r' || text[position] == '\t' || text[position] == '[' || text[position] == ',')) ++position;
     const std::size_t begin = position;
@@ -140,6 +233,19 @@ std::size_t parse_number(const std::string& text, std::size_t& position) {
     return std::stoull(text.substr(begin, position - begin));
 }
 
+/**
+ * @brief Extracts an unescaped string field from a compact JSON object.
+ *
+ * @param object JSON object fragment generated in safetensors header format.
+ * @param field Field name without quotation marks.
+ * @return Contents of the string value.
+ *
+ * @throws std::runtime_error If the field or its closing quotation mark is
+ * missing.
+ *
+ * @note This is a narrow parser for the exporter-generated header and is not a
+ * general JSON parser.
+ */
 std::string field_string(const std::string& object, const std::string& field) {
     const std::string marker = "\"" + field + "\":\"";
     const std::size_t begin = object.find(marker);
@@ -150,6 +256,18 @@ std::string field_string(const std::string& object, const std::string& field) {
     return object.substr(value_begin, value_end - value_begin);
 }
 
+/**
+ * @brief Locates one named tensor object in a safetensors JSON header.
+ *
+ * @param header Complete safetensors header.
+ * @param name Exact tensor name.
+ * @return Substring containing the tensor's metadata object.
+ *
+ * @throws std::runtime_error If the named tensor is absent.
+ *
+ * @note This parser assumes the compact formatting produced by
+ * write_safetensors().
+ */
 std::string tensor_object(const std::string& header, const std::string& name) {
     const std::string marker = json_string(name) + ":{";
     const std::size_t begin = header.find(marker);
@@ -158,6 +276,25 @@ std::string tensor_object(const std::string& header, const std::string& name) {
     return header.substr(begin, end == std::string::npos ? std::string::npos : end - begin + 1);
 }
 
+/**
+ * @brief Loads and validates one tensor from an open safetensors file.
+ *
+ * The tensor metadata is located by name, then its dtype, shape, and byte count
+ * are checked against the already allocated destination tensor. Raw bytes are
+ * read from the data region and copied to the destination device through
+ * Tensor::copy_raw_from_host().
+ *
+ * @param header Complete safetensors JSON header.
+ * @param input Open binary input stream.
+ * @param data_begin Absolute file offset of the safetensors data region.
+ * @param name Tensor name to locate.
+ * @param tensor Preallocated destination tensor.
+ *
+ * @throws std::runtime_error If metadata is missing or incompatible, byte
+ * offsets are invalid, or tensor data cannot be read.
+ * @throws CudaError If the destination tensor is CUDA-resident and its host
+ * upload fails.
+ */
 void load_one_tensor(const std::string& header, std::ifstream& input, const std::size_t data_begin,
                      const std::string& name, Tensor& tensor) {
     const std::string object = tensor_object(header, name);
@@ -188,6 +325,27 @@ void load_one_tensor(const std::string& header, std::ifstream& input, const std:
 }
 } // namespace
 
+/**
+ * @brief Exports a CGPT model and tokenizer in a Hugging Face-style directory.
+ *
+ * The function creates the output directory and writes `config.json`,
+ * `tokenizer.json`, `tokenizer_config.json`, and a single
+ * `model.safetensors`. Parameter names follow the model's Hugging Face mapping,
+ * including per-layer normalization, attention, and MLP weights.
+ *
+ * @param output_directory Destination directory.
+ * @param tokenizer Tokenizer to serialize.
+ * @param weights Model weights to export.
+ * @param options Transformer architecture configuration.
+ * @param max_position_embeddings Maximum context length recorded in the
+ * configuration files.
+ *
+ * @throws std::filesystem::filesystem_error If directory creation fails.
+ * @throws std::invalid_argument If a tensor dtype is unsupported.
+ * @throws std::overflow_error If safetensors offsets overflow.
+ * @throws std::runtime_error If an output file cannot be written.
+ * @throws CudaError If CUDA-resident weights cannot be copied to host.
+ */
 void export_huggingface_model(const std::filesystem::path& output_directory,
                               const bpe::BpeTokenizer& tokenizer,
                               const TransformerModelWeights& weights,
@@ -222,6 +380,23 @@ void export_huggingface_model(const std::filesystem::path& output_directory,
     write_safetensors(output_directory / "model.safetensors", tensors);
 }
 
+/**
+ * @brief Loads model weights from `model.safetensors` into allocated tensors.
+ *
+ * The destination model structure defines the expected layer count, tensor
+ * shapes, dtypes, and devices. Every registered Hugging Face parameter is
+ * validated and copied into its corresponding destination tensor.
+ *
+ * @param input_directory Directory containing `model.safetensors`.
+ * @param weights Mutable, preallocated model-weight structure.
+ *
+ * @throws std::runtime_error If the file or header is invalid, a required
+ * tensor is absent, or tensor metadata and byte sizes do not match.
+ * @throws CudaError If uploading bytes into CUDA-resident tensors fails.
+ *
+ * @note This function loads weights only; it does not parse `config.json` or
+ * tokenizer files.
+ */
 void load_huggingface_model(const std::filesystem::path& input_directory,
                             const MutableTransformerModelWeights& weights) {
     std::ifstream input(input_directory / "model.safetensors", std::ios::binary);

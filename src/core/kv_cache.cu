@@ -1,3 +1,5 @@
+/** @file kv_cache.cu CUDA implementation of the autoregressive key-value cache. */
+
 #include "core/kv_cache.h"
 #include "core/cuda_check.h"
 
@@ -8,6 +10,14 @@
 
 namespace {
 
+/**
+ * @brief Validates a single batch index against a KV-cache configuration.
+ *
+ * @param config Cache configuration containing the maximum batch size.
+ * @param batch Batch index to validate.
+ *
+ * @throws std::out_of_range If @p batch is outside the configured range.
+ */
 void validate_batch_index(const KVCacheConfig& config, const std::size_t batch) {
     if (batch >= config.max_batch_size) {
         throw std::out_of_range("KVCache batch index is out of range");
@@ -16,6 +26,21 @@ void validate_batch_index(const KVCacheConfig& config, const std::size_t batch) 
 
 }
 
+/**
+ * @brief Allocates an FP16 CUDA key-value cache.
+ *
+ * Two equally sized device buffers are allocated for keys and values using the
+ * logical layout `[layer, batch, token, kv_head, head_dim]`. Per-layer,
+ * per-batch sequence lengths are stored in a zero-initialized host array.
+ *
+ * @param config Cache dimensions.
+ *
+ * @throws std::invalid_argument If any configured dimension is zero.
+ * @throws std::overflow_error If the required allocation size overflows.
+ * @throws CudaError If CUDA allocation or initial clearing fails.
+ *
+ * @note Construction provides cleanup on partial allocation failure.
+ */
 KVCache::KVCache(const KVCacheConfig& config) : config_(config) {
     validate_config();
 
@@ -32,10 +57,20 @@ KVCache::KVCache(const KVCacheConfig& config) : config_(config) {
     }
 }
 
+/**
+ * @brief Releases CUDA buffers and host-side sequence-length storage.
+ */
 KVCache::~KVCache() {
     release();
 }
 
+/**
+ * @brief Move-constructs a cache by transferring resource ownership.
+ *
+ * @param other Cache whose device buffers and host metadata are transferred.
+ *
+ * @post @p other no longer owns allocated resources.
+ */
 KVCache::KVCache(KVCache&& other) noexcept
     : config_(other.config_),
       keys_(std::exchange(other.keys_, nullptr)),
@@ -44,6 +79,14 @@ KVCache::KVCache(KVCache&& other) noexcept
     other.config_ = {};
 }
 
+/**
+ * @brief Move-assigns a cache by releasing current resources and taking ownership.
+ *
+ * @param other Cache whose resources are transferred.
+ * @return Reference to this cache.
+ *
+ * @post @p other no longer owns allocated resources.
+ */
 KVCache& KVCache::operator=(KVCache&& other) noexcept {
     if (this != &other) {
         release();
@@ -56,12 +99,31 @@ KVCache& KVCache::operator=(KVCache&& other) noexcept {
     return *this;
 }
 
+/**
+ * @brief Returns a mutable pointer to one key sequence in device memory.
+ *
+ * @param layer Transformer-layer index.
+ * @param batch Batch-item index.
+ * @return Device pointer to the first `[kv_head, head_dim]` element at token
+ * position zero.
+ *
+ * @throws std::out_of_range If @p layer or @p batch is invalid.
+ */
 __half* KVCache::key_sequence(const std::size_t layer, const std::size_t batch) {
     validate_layer(layer);
     validate_batch_index(config_, batch);
     return keys_ + (layer * config_.max_batch_size + batch) * elements_per_sequence();
 }
 
+/**
+ * @brief Returns a read-only pointer to one key sequence in device memory.
+ *
+ * @param layer Transformer-layer index.
+ * @param batch Batch-item index.
+ * @return Const device pointer to the sequence start.
+ *
+ * @throws std::out_of_range If @p layer or @p batch is invalid.
+ */
 const __half* KVCache::key_sequence(
     const std::size_t layer,
     const std::size_t batch
@@ -71,12 +133,30 @@ const __half* KVCache::key_sequence(
     return keys_ + (layer * config_.max_batch_size + batch) * elements_per_sequence();
 }
 
+/**
+ * @brief Returns a mutable pointer to one value sequence in device memory.
+ *
+ * @param layer Transformer-layer index.
+ * @param batch Batch-item index.
+ * @return Device pointer to the sequence start.
+ *
+ * @throws std::out_of_range If @p layer or @p batch is invalid.
+ */
 __half* KVCache::value_sequence(const std::size_t layer, const std::size_t batch) {
     validate_layer(layer);
     validate_batch_index(config_, batch);
     return values_ + (layer * config_.max_batch_size + batch) * elements_per_sequence();
 }
 
+/**
+ * @brief Returns a read-only pointer to one value sequence in device memory.
+ *
+ * @param layer Transformer-layer index.
+ * @param batch Batch-item index.
+ * @return Const device pointer to the sequence start.
+ *
+ * @throws std::out_of_range If @p layer or @p batch is invalid.
+ */
 const __half* KVCache::value_sequence(
     const std::size_t layer,
     const std::size_t batch
@@ -86,6 +166,15 @@ const __half* KVCache::value_sequence(
     return values_ + (layer * config_.max_batch_size + batch) * elements_per_sequence();
 }
 
+/**
+ * @brief Returns the host-tracked cached length for one layer and batch item.
+ *
+ * @param layer Transformer-layer index.
+ * @param batch Batch-item index.
+ * @return Number of valid cached token positions.
+ *
+ * @throws std::out_of_range If @p layer or @p batch is invalid.
+ */
 std::size_t KVCache::sequence_length(
     const std::size_t layer,
     const std::size_t batch
@@ -95,6 +184,19 @@ std::size_t KVCache::sequence_length(
     return host_lengths_[length_index(layer, batch)];
 }
 
+/**
+ * @brief Sets the host-tracked cached length for one sequence.
+ *
+ * This method updates metadata only and does not initialize or copy device
+ * memory.
+ *
+ * @param layer Transformer-layer index.
+ * @param batch Batch-item index.
+ * @param length New number of valid cached token positions.
+ *
+ * @throws std::out_of_range If an index is invalid or @p length exceeds the
+ * configured sequence capacity.
+ */
 void KVCache::set_sequence_length(
     const std::size_t layer,
     const std::size_t batch,
@@ -108,6 +210,16 @@ void KVCache::set_sequence_length(
     host_lengths_[length_index(layer, batch)] = length;
 }
 
+/**
+ * @brief Increments a sequence's host-tracked length.
+ *
+ * @param layer Transformer-layer index.
+ * @param batch Batch-item index.
+ * @param token_count Number of newly valid token positions.
+ *
+ * @throws std::out_of_range If an index is invalid or the increment exceeds
+ * the remaining cache capacity.
+ */
 void KVCache::advance_sequence_length(
     const std::size_t layer,
     const std::size_t batch,
@@ -120,6 +232,16 @@ void KVCache::advance_sequence_length(
     set_sequence_length(layer, batch, current_length + token_count);
 }
 
+/**
+ * @brief Asynchronously zeroes all key/value storage and resets all lengths.
+ *
+ * @param stream CUDA stream on which both memset operations are enqueued.
+ *
+ * @throws CudaError If either asynchronous CUDA memset fails.
+ *
+ * @note Host length metadata is reset immediately. Device clearing may still
+ * be pending when this function returns.
+ */
 void KVCache::clear(cudaStream_t stream) {
     const std::size_t bytes = total_elements() * sizeof(__half);
     CUDA_CHECK(cudaMemsetAsync(keys_, 0, bytes, stream));
@@ -127,12 +249,39 @@ void KVCache::clear(cudaStream_t stream) {
     reset_lengths();
 }
 
+/**
+ * @brief Resets every host-side sequence length to zero.
+ *
+ * Device key and value storage is left unchanged.
+ */
 void KVCache::reset_lengths() noexcept {
     if (host_lengths_ != nullptr) {
         std::fill_n(host_lengths_, config_.num_layers * config_.max_batch_size, 0);
     }
 }
 
+/**
+ * @brief Copies a rectangular token range into one layer of the cache.
+ *
+ * Input keys and values are expected in contiguous
+ * `[batch_size, token_count, num_kv_heads, head_dim]` FP16 layout. Two
+ * cudaMemcpy2DAsync operations copy each batch row into the configured cache
+ * pitch at @p token_offset.
+ *
+ * @param layer Destination transformer-layer index.
+ * @param batch_size Number of batch rows to copy.
+ * @param token_offset First destination token position.
+ * @param token_count Number of token positions copied per batch item.
+ * @param key Device pointer to contiguous source keys.
+ * @param value Device pointer to contiguous source values.
+ * @param stream CUDA stream used for asynchronous copies.
+ *
+ * @throws std::out_of_range If layer, batch size, or token range is invalid.
+ * @throws std::invalid_argument If a source pointer is null.
+ * @throws CudaError If a CUDA copy cannot be enqueued.
+ *
+ * @note This operation does not modify host-tracked sequence lengths.
+ */
 void KVCache::write(
     const std::size_t layer,
     const std::size_t batch_size,
@@ -171,6 +320,31 @@ void KVCache::write(
         cudaMemcpyDeviceToDevice, stream));
 }
 
+/**
+ * @brief Appends tokens to the valid end of each batch sequence.
+ *
+ * Input keys and values use contiguous
+ * `[batch_size, token_count, num_kv_heads, head_dim]` FP16 layout. When every
+ * batch item has the same current length, strided 2D copies are used. Otherwise
+ * one asynchronous copy per batch item and per K/V buffer is enqueued.
+ * Sequence lengths are advanced after all copies have been submitted.
+ *
+ * @param layer Destination transformer-layer index.
+ * @param batch_size Number of batch rows to append.
+ * @param token_count Number of tokens appended to every row.
+ * @param key Device pointer to source keys.
+ * @param value Device pointer to source values.
+ * @param stream CUDA stream used for asynchronous copies.
+ *
+ * @throws std::out_of_range If layer, batch size, or resulting sequence length
+ * is invalid.
+ * @throws std::invalid_argument If @p token_count is zero or a source pointer
+ * is null.
+ * @throws CudaError If a CUDA copy cannot be enqueued.
+ *
+ * @note Host lengths are updated before the asynchronous copies necessarily
+ * complete; users must preserve stream ordering before consuming the data.
+ */
 void KVCache::append(
     const std::size_t layer,
     const std::size_t batch_size,
@@ -232,18 +406,40 @@ void KVCache::append(
     }
 }
 
+/**
+ * @brief Returns the number of FP16 elements stored for one token.
+ *
+ * @return `num_kv_heads * head_dim`.
+ */
 std::size_t KVCache::elements_per_token() const noexcept {
     return config_.num_kv_heads * config_.head_dim;
 }
 
+/**
+ * @brief Returns the capacity of one layer/batch sequence in elements.
+ *
+ * @return `max_sequence_length * elements_per_token()`.
+ */
 std::size_t KVCache::elements_per_sequence() const noexcept {
     return config_.max_sequence_length * elements_per_token();
 }
 
+/**
+ * @brief Returns the element capacity of either the full key or value buffer.
+ *
+ * @return Product of layer, batch, sequence, KV-head, and head dimensions.
+ */
 std::size_t KVCache::total_elements() const noexcept {
     return config_.num_layers * config_.max_batch_size * elements_per_sequence();
 }
 
+/**
+ * @brief Computes the flattened host-length index for a layer/batch pair.
+ *
+ * @param layer Transformer-layer index.
+ * @param batch Batch-item index.
+ * @return Flattened metadata index.
+ */
 std::size_t KVCache::length_index(
     const std::size_t layer,
     const std::size_t batch
@@ -251,6 +447,13 @@ std::size_t KVCache::length_index(
     return layer * config_.max_batch_size + batch;
 }
 
+/**
+ * @brief Validates cache dimensions and allocation-size arithmetic.
+ *
+ * @throws std::invalid_argument If any dimension is zero.
+ * @throws std::overflow_error If the element or byte count overflows
+ * std::size_t.
+ */
 void KVCache::validate_config() const {
     if (config_.num_layers == 0 || config_.max_batch_size == 0 ||
         config_.max_sequence_length == 0 || config_.num_kv_heads == 0 ||
@@ -276,18 +479,35 @@ void KVCache::validate_config() const {
     }
 }
 
+/**
+ * @brief Validates a transformer-layer index.
+ *
+ * @param layer Layer index to check.
+ * @throws std::out_of_range If @p layer is invalid.
+ */
 void KVCache::validate_layer(const std::size_t layer) const {
     if (layer >= config_.num_layers) {
         throw std::out_of_range("KVCache layer index is out of range");
     }
 }
 
+/**
+ * @brief Validates a nonzero active batch size.
+ *
+ * @param batch_size Number of active batch items.
+ * @throws std::out_of_range If @p batch_size is zero or exceeds capacity.
+ */
 void KVCache::validate_batch_size(const std::size_t batch_size) const {
     if (batch_size == 0 || batch_size > config_.max_batch_size) {
         throw std::out_of_range("KVCache batch_size is out of range");
     }
 }
 
+/**
+ * @brief Releases all owned CUDA and host resources.
+ *
+ * The function is idempotent and leaves every owned pointer null.
+ */
 void KVCache::release() noexcept {
     if (keys_ != nullptr) {
         cudaFree(keys_);

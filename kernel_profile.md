@@ -1,6 +1,6 @@
 # Kernel profile
 
-- Date: 2026-08-20 09:17:40 Środkowoeuropejski czas letni
+- Date: 2026-08-20 09:17:40 Central European Summer Time
 - GPU memory peak reference: 192 GB/s
 - Raw log: `kernel_profile.log`
 

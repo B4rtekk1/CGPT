@@ -1,3 +1,5 @@
+/** @file bpe_tokenizer.cpp Implementation of the byte-pair encoding tokenizer and model I/O. */
+
 #include "tokenizer/bpe_tokenizer.h"
 #include "utils/progress_bar.h"
 
@@ -41,6 +43,18 @@ namespace bpe {
         using PairCounts = std::unordered_map<PairKey, std::uint64_t>;
         using Occurrence = std::uint32_t;
 
+
+        /**
+         * @brief Returns a process-unique identity for an encoder cache owner.
+         *
+         * Thread-local piece caches use this identity to detect that a cache was
+         * created for another tokenizer instance and must be reset.
+         *
+         * @return A monotonically increasing non-zero cache identity.
+         *
+         * @note Relaxed atomic ordering is sufficient because only uniqueness is
+         * required.
+         */
         [[nodiscard]] std::uint64_t next_cache_identity() noexcept {
             static std::atomic_uint64_t next{1};
             return next.fetch_add(1, std::memory_order_relaxed);
@@ -49,6 +63,17 @@ namespace bpe {
         // Encoding is invoked once per data-loader batch.  Keeping these workers alive
         // avoids repeated thread creation and lets independent tokenizer instances share
         // the same bounded CPU resource.
+
+        /**
+         * @brief Process-wide worker pool used by parallel batch encoding.
+         *
+         * Worker threads are created once and reused across tokenizer instances,
+         * avoiding thread creation for every data-loader batch. Submitted jobs are
+         * stored in a mutex-protected queue and workers sleep on a condition
+         * variable when no work is available.
+         *
+         * @note The pool is intentionally non-copyable.
+         */
         class EncodingThreadPool {
         public:
             EncodingThreadPool() {
@@ -66,14 +91,15 @@ namespace bpe {
                     stopping_ = true;
                 }
                 work_ready_.notify_all();
-                for (std::thread& worker : workers_) worker.join();
+                for (std::thread &worker: workers_) worker.join();
             }
 
-            EncodingThreadPool(const EncodingThreadPool&) = delete;
-            EncodingThreadPool& operator=(const EncodingThreadPool&) = delete;
+            EncodingThreadPool(const EncodingThreadPool &) = delete;
+
+            EncodingThreadPool &operator=(const EncodingThreadPool &) = delete;
 
             template<typename Function>
-            void run(const std::size_t worker_count, Function&& function) {
+            void run(const std::size_t worker_count, Function &&function) {
                 if (worker_count <= 1) {
                     function();
                     return;
@@ -121,16 +147,31 @@ namespace bpe {
 
             std::mutex mutex_;
             std::condition_variable work_ready_;
-            std::deque<std::function<void()>> jobs_;
+            std::deque<std::function<void()> > jobs_;
             std::vector<std::thread> workers_;
             bool stopping_ = false;
         };
 
-        [[nodiscard]] EncodingThreadPool& encoding_thread_pool() {
+
+        /**
+         * @brief Returns the shared encoding thread pool.
+         *
+         * @return Reference to a lazily constructed process-wide pool.
+         */
+        [[nodiscard]] EncodingThreadPool &encoding_thread_pool() {
             static EncodingThreadPool pool;
             return pool;
         }
 
+
+        /**
+         * @brief Max-heap of BPE merge candidates.
+         *
+         * Entries are ordered first by descending occurrence count and then by
+         * ascending packed pair key, providing deterministic tie breaking during
+         * tokenizer training. Stale entries are permitted and filtered by the
+         * training loop when removed from the heap.
+         */
         class CandidateHeap {
         public:
             void reserve(const std::size_t count) {
@@ -145,6 +186,7 @@ namespace bpe {
             [[nodiscard]] bool empty() const noexcept { return entries_.empty(); }
             [[nodiscard]] PairKey top_pair() const noexcept { return entries_.front().pair; }
             [[nodiscard]] std::uint64_t top_count() const noexcept { return entries_.front().count; }
+
             void pop() {
                 if (entries_.size() == 1) {
                     entries_.pop_back();
@@ -164,6 +206,7 @@ namespace bpe {
             [[nodiscard]] static bool better(const Entry &left, const Entry &right) noexcept {
                 return left.count != right.count ? left.count > right.count : left.pair < right.pair;
             }
+
             [[nodiscard]] static std::size_t parent(const std::size_t index) noexcept {
                 return (index - 1) / 2;
             }
@@ -171,6 +214,7 @@ namespace bpe {
             void swap_entries(const std::size_t left, const std::size_t right) {
                 std::swap(entries_[left], entries_[right]);
             }
+
             void sift_up(std::size_t index) {
                 while (index != 0 && better(entries_[index], entries_[parent(index)])) {
                     const std::size_t next = parent(index);
@@ -178,6 +222,7 @@ namespace bpe {
                     index = next;
                 }
             }
+
             void sift_down(std::size_t index) {
                 while (true) {
                     const std::size_t left = index * 2 + 1;
@@ -200,6 +245,14 @@ namespace bpe {
             std::vector<Entry> entries_;
         };
 
+
+        /**
+         * @brief Incrementally sortable list of pair occurrence positions.
+         *
+         * The prefix `[0, sorted_size)` is known to be sorted. Newly appended
+         * positions are sorted independently and merged with the existing prefix,
+         * avoiding a complete sort after every training update.
+         */
         struct OccurrenceList {
             std::vector<Occurrence> values;
             std::size_t sorted_size = 0;
@@ -220,7 +273,7 @@ namespace bpe {
                 auto unsorted_values = values | std::views::drop(sorted_size);
                 std::ranges::sort(unsorted_values);
                 if (sorted_size != 0) {
-                    std::ranges::inplace_merge(values, values.begin() + sorted_size);
+                    std::ranges::inplace_merge(values, values.begin() + static_cast<long long>(sorted_size));
                 }
                 mark_sorted();
             }
@@ -229,6 +282,15 @@ namespace bpe {
         // One cache-friendly table owns the count, occurrence list and candidate state
         // for a pair.  The previous representation kept those keys in three separate
         // node-based hash maps.
+
+        /**
+         * @brief Cache-friendly open-addressing table for BPE pair statistics.
+         *
+         * Each entry stores a packed token pair, its active occurrence count, and
+         * the list of positions at which the pair may occur. Linear probing is
+         * used with a power-of-two capacity and an approximate 70 percent maximum
+         * load factor.
+         */
         class PairTable {
         public:
             struct Entry {
@@ -242,7 +304,7 @@ namespace bpe {
                 if (expected * 10 >= slots_.size() * 7) rehash(expected * 2 + 1);
             }
 
-            [[nodiscard]] Entry* find(const PairKey pair) noexcept {
+            [[nodiscard]] Entry *find(const PairKey pair) noexcept {
                 if (slots_.empty()) return nullptr;
                 std::size_t index = hash(pair) & (slots_.size() - 1);
                 while (slots_[index].occupied) {
@@ -252,7 +314,7 @@ namespace bpe {
                 return nullptr;
             }
 
-            Entry& get_or_create(const PairKey pair) {
+            Entry &get_or_create(const PairKey pair) {
                 reserve(size_ + 1);
                 std::size_t index = hash(pair) & (slots_.size() - 1);
                 while (slots_[index].occupied && slots_[index].pair != pair) {
@@ -269,8 +331,8 @@ namespace bpe {
             }
 
             template<typename Function>
-            void for_each(Function&& function) {
-                for (Entry& entry : slots_) {
+            void for_each(Function &&function) {
+                for (Entry &entry: slots_) {
                     if (entry.occupied) function(entry);
                 }
             }
@@ -292,7 +354,7 @@ namespace bpe {
                 slots_.clear();
                 slots_.resize(capacity);
                 size_ = 0;
-                for (Entry& entry : old_slots) {
+                for (Entry &entry: old_slots) {
                     if (!entry.occupied) continue;
                     std::size_t index = hash(entry.pair) & (slots_.size() - 1);
                     while (slots_[index].occupied) index = (index + 1) & (slots_.size() - 1);
@@ -305,18 +367,52 @@ namespace bpe {
             std::size_t size_ = 0;
         };
 
+
+        /**
+         * @brief Packs two 32-bit token identifiers into one 64-bit key.
+         *
+         * @param left Left token identifier.
+         * @param right Right token identifier.
+         * @return Packed pair key with @p left in the upper 32 bits.
+         */
         [[nodiscard]] PairKey pair_key(const TokenId left, const TokenId right) noexcept {
             return (static_cast<PairKey>(left) << 32U) | static_cast<PairKey>(right);
         }
 
+
+        /**
+         * @brief Extracts the left token identifier from a packed pair key.
+         *
+         * @param key Packed pair key.
+         * @return Left token identifier.
+         */
         [[nodiscard]] TokenId pair_left(const PairKey key) noexcept {
             return static_cast<TokenId>(key >> 32U);
         }
 
+
+        /**
+         * @brief Extracts the right token identifier from a packed pair key.
+         *
+         * @param key Packed pair key.
+         * @return Right token identifier.
+         */
         [[nodiscard]] TokenId pair_right(const PairKey key) noexcept {
             return static_cast<TokenId>(key & 0xFFFF'FFFFULL);
         }
 
+
+        /**
+         * @brief Selects a bounded number of workers for a workload.
+         *
+         * A requested count of zero selects the hardware-concurrency value. The
+         * result is always at least one and never exceeds @p work_items when work
+         * is available.
+         *
+         * @param requested Explicit worker count, or zero for automatic selection.
+         * @param work_items Number of independently processable items.
+         * @return Number of workers to use.
+         */
         [[nodiscard]] std::size_t worker_count_for(
             const std::size_t requested,
             const std::size_t work_items
@@ -332,6 +428,17 @@ namespace bpe {
             return std::max<std::size_t>(1, std::min(selected, work_items));
         }
 
+
+        /**
+         * @brief Divides a contiguous item range among temporary worker threads.
+         *
+         * @tparam Function Callable type accepting `(worker, begin, end)`.
+         * @param item_count Total number of items.
+         * @param workers Number of ranges and worker threads.
+         * @param function Function invoked once for every assigned range.
+         *
+         * @note For one worker, the function executes synchronously on the caller.
+         */
         template<typename Function>
         void parallel_for_ranges(
             const std::size_t item_count,
@@ -356,6 +463,13 @@ namespace bpe {
             }
         }
 
+
+        /**
+         * @brief Converts raw bytes directly to the base byte-token vocabulary.
+         *
+         * @param text Byte sequence to convert.
+         * @return One token identifier per input byte.
+         */
         [[nodiscard]] std::vector<TokenId> bytes_to_tokens(const std::string_view text) {
             std::vector<TokenId> result;
             result.reserve(text.size());
@@ -367,6 +481,13 @@ namespace bpe {
             return result;
         }
 
+
+        /**
+         * @brief Coarse byte categories used by GPT-like pretokenization.
+         *
+         * Bytes with the high bit set are classified as letters so UTF-8 byte
+         * sequences remain grouped rather than split byte by byte.
+         */
         enum class ByteClass : std::uint8_t {
             Whitespace,
             Letter,
@@ -374,6 +495,12 @@ namespace bpe {
             Punctuation
         };
 
+
+        /**
+         * @brief Builds the compile-time byte classification table.
+         *
+         * @return Classification for all 256 possible byte values.
+         */
         [[nodiscard]] constexpr std::array<ByteClass, 256> make_byte_classes() noexcept {
             std::array<ByteClass, 256> classes{};
             classes.fill(ByteClass::Punctuation);
@@ -402,6 +529,13 @@ namespace bpe {
 
         alignas(64) constexpr auto kByteClasses = make_byte_classes();
 
+
+        /**
+         * @brief Classifies one byte for pretokenization.
+         *
+         * @param byte Byte value.
+         * @return Corresponding byte class.
+         */
         [[nodiscard]] ByteClass classify_byte(const unsigned char byte) noexcept {
             return kByteClasses[byte];
         }
@@ -414,6 +548,15 @@ namespace bpe {
 #endif
 
 #ifdef BPE_HAVE_AVX2
+
+        /**
+         * @brief Classifies 32 bytes simultaneously with AVX2.
+         *
+         * @param bytes Packed input bytes.
+         * @return Packed ByteClass values, one per input byte.
+         *
+         * @note Compiled only when AVX2 is enabled for the translation unit.
+         */
         [[nodiscard]] inline __m256i classify_vector_avx2(const __m256i bytes) noexcept {
             const __m256i zero = _mm256_setzero_si256();
             const __m256i high_bit = _mm256_cmpgt_epi8(zero, bytes); // unsigned >= 0x80
@@ -450,6 +593,13 @@ namespace bpe {
 #endif
 
 #ifdef BPE_HAVE_SSE2
+
+        /**
+         * @brief Classifies 16 bytes simultaneously with SSE2.
+         *
+         * @param bytes Packed input bytes.
+         * @return Packed ByteClass values, one per input byte.
+         */
         [[nodiscard]] __m128i classify_vector_sse2(const __m128i bytes) noexcept {
             const __m128i zero = _mm_setzero_si128();
             const __m128i high_bit = _mm_cmplt_epi8(bytes, zero); // unsigned >= 0x80
@@ -484,6 +634,17 @@ namespace bpe {
         }
 #endif
 
+
+        /**
+         * @brief Finds the end of a contiguous run belonging to one byte class.
+         *
+         * AVX2 or SSE2 is used when available, followed by a scalar tail.
+         *
+         * @param text Complete byte string.
+         * @param position Beginning of the run.
+         * @param byte_class Expected class.
+         * @return Index of the first byte with another class, or `text.size()`.
+         */
         [[nodiscard]] std::size_t scan_class_run(
             const std::string_view text,
             std::size_t position,
@@ -493,7 +654,7 @@ namespace bpe {
                 static_cast<char>(byte_class));
             while (position + 32 <= text.size()) {
                 const __m256i bytes = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i*>(text.data() + position));
+                    reinterpret_cast<const __m256i *>(text.data() + position));
                 const auto matches = static_cast<std::uint32_t>(
                     _mm256_movemask_epi8(_mm256_cmpeq_epi8(
                         classify_vector_avx2(bytes), expected32)));
@@ -508,7 +669,7 @@ namespace bpe {
                 static_cast<char>(byte_class));
             while (position + 16 <= text.size()) {
                 const __m128i bytes = _mm_loadu_si128(
-                    reinterpret_cast<const __m128i*>(text.data() + position));
+                    reinterpret_cast<const __m128i *>(text.data() + position));
                 const auto matches = static_cast<std::uint32_t>(
                     _mm_movemask_epi8(_mm_cmpeq_epi8(
                         classify_vector_sse2(bytes), expected16)));
@@ -520,17 +681,31 @@ namespace bpe {
 #endif
             while (position < text.size() &&
                    classify_byte(static_cast<unsigned char>(text[position])) ==
-                       byte_class) {
+                   byte_class) {
                 ++position;
             }
             return position;
         }
 
+
+        /**
+         * @brief Enumerates pretokenized pieces of an input byte string.
+         *
+         * `PretokenizerMode::None` emits the complete input. GPT-like mode groups
+         * whitespace, letters, punctuation, and runs of at most three digits.
+         * A single leading space may be attached to the following non-whitespace
+         * piece.
+         *
+         * @tparam Function Callable accepting one `std::string_view`.
+         * @param text Input bytes.
+         * @param mode Pretokenization strategy.
+         * @param function Callback invoked for each non-empty piece.
+         */
         template<typename Function>
         void for_each_pretoken(
             const std::string_view text,
             const PretokenizerMode mode,
-            Function&& function) {
+            Function &&function) {
             if (text.empty()) return;
             if (mode == PretokenizerMode::None) {
                 function(text);
@@ -545,7 +720,7 @@ namespace bpe {
                 if (text[position] == ' ' &&
                     (position == 0 ||
                      classify_byte(static_cast<unsigned char>(text[position - 1])) !=
-                         ByteClass::Whitespace) &&
+                     ByteClass::Whitespace) &&
                     position + 1 < text.size()) {
                     const ByteClass following = classify_byte(
                         static_cast<unsigned char>(text[position + 1]));
@@ -559,7 +734,7 @@ namespace bpe {
                     const std::size_t limit = std::min(position + 3, text.size());
                     while (position < limit &&
                            classify_byte(static_cast<unsigned char>(text[position])) ==
-                               ByteClass::Digit) {
+                           ByteClass::Digit) {
                         ++position;
                     }
                 } else {
@@ -570,10 +745,26 @@ namespace bpe {
             }
         }
 
+
+        /**
+         * @brief Writes one native-endian 32-bit unsigned integer.
+         *
+         * @param output Destination binary stream.
+         * @param value Value to write.
+         */
         void write_u32(std::ostream &output, const std::uint32_t value) {
             output.write(reinterpret_cast<const char *>(&value), sizeof(value));
         }
 
+
+        /**
+         * @brief Reads one native-endian 32-bit unsigned integer.
+         *
+         * @param input Source binary stream.
+         * @return Decoded value.
+         *
+         * @throws std::runtime_error If the stream ends before four bytes are read.
+         */
         [[nodiscard]] std::uint32_t read_u32(std::istream &input) {
             std::uint32_t value = 0;
             input.read(reinterpret_cast<char *>(&value), sizeof(value));
@@ -583,16 +774,24 @@ namespace bpe {
             return value;
         }
 
+
+        /**
+         * @brief Minimal JSON value representation used for tokenizer.json import.
+         *
+         * The parser supports the subset needed by Hugging Face tokenizer files:
+         * null, booleans, unsigned integer numbers, strings, arrays, and objects.
+         */
         struct JsonValue {
             enum class Type { Null, Boolean, Number, String, Array, Object };
+
             Type type = Type::Null;
             bool boolean = false;
             std::uint64_t number = 0;
             std::string string;
             std::vector<JsonValue> array;
-            std::map<std::string, JsonValue, std::less<>> object;
+            std::map<std::string, JsonValue, std::less<> > object;
 
-            [[nodiscard]] const JsonValue& member(
+            [[nodiscard]] const JsonValue &member(
                 const std::string_view name) const {
                 if (type != Type::Object) {
                     throw std::runtime_error("Expected a JSON object");
@@ -606,9 +805,18 @@ namespace bpe {
             }
         };
 
+
+        /**
+         * @brief Strict recursive-descent parser for Hugging Face tokenizer JSON.
+         *
+         * Strings support JSON escapes, including UTF-16 surrogate pairs, which
+         * are converted to UTF-8. Duplicate object keys and trailing input are
+         * rejected.
+         */
         class JsonParser {
         public:
-            explicit JsonParser(const std::string_view input) : input_(input) {}
+            explicit JsonParser(const std::string_view input) : input_(input) {
+            }
 
             [[nodiscard]] JsonValue parse() {
                 JsonValue value = parse_value();
@@ -656,7 +864,7 @@ namespace bpe {
                 position_ += literal.size();
             }
 
-            static void append_utf8(std::string& output, const std::uint32_t cp) {
+            static void append_utf8(std::string &output, const std::uint32_t cp) {
                 if (cp <= 0x7F) {
                     output.push_back(static_cast<char>(cp));
                 } else if (cp <= 0x7FF) {
@@ -709,14 +917,22 @@ namespace bpe {
                     }
                     if (position_ >= input_.size()) fail("short escape");
                     switch (input_[position_++]) {
-                        case '"': result.push_back('"'); break;
-                        case '\\': result.push_back('\\'); break;
-                        case '/': result.push_back('/'); break;
-                        case 'b': result.push_back('\b'); break;
-                        case 'f': result.push_back('\f'); break;
-                        case 'n': result.push_back('\n'); break;
-                        case 'r': result.push_back('\r'); break;
-                        case 't': result.push_back('\t'); break;
+                        case '"': result.push_back('"');
+                            break;
+                        case '\\': result.push_back('\\');
+                            break;
+                        case '/': result.push_back('/');
+                            break;
+                        case 'b': result.push_back('\b');
+                            break;
+                        case 'f': result.push_back('\f');
+                            break;
+                        case 'n': result.push_back('\n');
+                            break;
+                        case 'r': result.push_back('\r');
+                            break;
+                        case 't': result.push_back('\t');
+                            break;
                         case 'u': {
                             std::uint32_t cp = parse_hex4();
                             if (cp >= 0xD800 && cp <= 0xDBFF) {
@@ -757,7 +973,7 @@ namespace bpe {
                             std::string key = parse_string();
                             expect(':');
                             if (!result.object.emplace(
-                                    std::move(key), parse_value()).second) {
+                                std::move(key), parse_value()).second) {
                                 fail("duplicate object key");
                             }
                         } while (consume(','));
@@ -796,10 +1012,10 @@ namespace bpe {
                         result.type = JsonValue::Type::Number;
                         do {
                             const auto digit =
-                                static_cast<unsigned>(input_[position_] - '0');
+                                    static_cast<unsigned>(input_[position_] - '0');
                             if (result.number >
                                 (std::numeric_limits<std::uint64_t>::max() - digit) /
-                                    10) {
+                                10) {
                                 fail("number is too large");
                             }
                             result.number = result.number * 10 + digit;
@@ -815,13 +1031,19 @@ namespace bpe {
             std::size_t position_ = 0;
         };
 
+
+        /**
+         * @brief Builds the GPT-2/Hugging Face ByteLevel byte alphabet.
+         *
+         * @return Mapping from each raw byte to its UTF-8 token spelling.
+         */
         [[nodiscard]] std::array<std::string, 256> bytelevel_alphabet() {
             std::array<std::string, 256> result;
             std::uint32_t replacement = 0;
             for (std::uint32_t byte = 0; byte < 256; ++byte) {
                 const bool direct =
-                    (byte >= 33 && byte <= 126) ||
-                    (byte >= 161 && byte <= 172) || byte >= 174;
+                        (byte >= 33 && byte <= 126) ||
+                        (byte >= 161 && byte <= 172) || byte >= 174;
                 std::uint32_t cp = direct ? byte : 256 + replacement++;
                 if (cp <= 0x7F) {
                     result[byte].push_back(static_cast<char>(cp));
@@ -834,13 +1056,25 @@ namespace bpe {
         }
     }
 
+
+    /**
+     * @brief Constructs a byte-level BPE tokenizer.
+     *
+     * The initial vocabulary contains all 256 byte tokens followed by the
+     * configured special tokens. Merge tables are initially empty.
+     *
+     * @param special_tokens Ordered special-token strings.
+     * @param pretokenizer Pretokenization mode used before BPE merging.
+     *
+     * @throws std::invalid_argument If any special token is empty.
+     */
     BpeTokenizer::BpeTokenizer(
         std::vector<std::string> special_tokens,
         const PretokenizerMode pretokenizer)
         : pretokenizer_mode_(pretokenizer),
           special_tokens_(std::move(special_tokens)),
           cache_identity_(next_cache_identity()) {
-        for (const std::string &token : special_tokens_) {
+        for (const std::string &token: special_tokens_) {
             if (token.empty()) {
                 throw std::invalid_argument("special tokens must not be empty");
             }
@@ -849,12 +1083,19 @@ namespace bpe {
         rebuild_token_bytes();
     }
 
+
+    /**
+     * @brief Rebuilds the byte trie used to locate special tokens.
+     *
+     * Duplicate special-token strings retain the lowest configured token ID.
+     * Encoding tracks the longest reachable match beginning at each byte.
+     */
     void BpeTokenizer::rebuild_special_matcher() {
         special_matcher_.clear();
         special_matcher_.emplace_back();
         for (std::size_t token_index = 0; token_index < special_tokens_.size(); ++token_index) {
             std::size_t node = 0;
-            for (const unsigned char byte : special_tokens_[token_index]) {
+            for (const unsigned char byte: special_tokens_[token_index]) {
                 std::int32_t next = special_matcher_[node].next[byte];
                 if (next < 0) {
                     next = static_cast<std::int32_t>(special_matcher_.size());
@@ -870,12 +1111,32 @@ namespace bpe {
         }
     }
 
+
+    /**
+     * @brief Trains an exact in-memory byte-pair encoding tokenizer.
+     *
+     * Documents are pretokenized and represented as linked token positions.
+     * Pair counts and occurrence lists are updated incrementally after each
+     * selected merge. Pair counting and sufficiently large merge updates are
+     * parallelized.
+     *
+     * @param documents Training documents.
+     * @param config Vocabulary size, frequency threshold, special tokens,
+     * pretokenizer mode, worker count, and trainer settings.
+     * @return Trained tokenizer.
+     *
+     * @throws std::invalid_argument If configuration or corpus is invalid.
+     * @throws std::length_error If the exact corpus exceeds the 32-bit occurrence
+     * position space.
+     *
+     * @note ExactInMemory supports less than 4 GiB of pretokenized input.
+     */
     BpeTokenizer BpeTokenizer::train(
         const std::vector<std::string> &documents,
         const TrainerConfig &config
     ) {
         const std::size_t minimum_vocab =
-            kByteVocabularySize + config.special_tokens.size();
+                kByteVocabularySize + config.special_tokens.size();
 
         if (config.vocab_size < minimum_vocab) {
             throw std::invalid_argument(
@@ -887,7 +1148,7 @@ namespace bpe {
         if (config.vocab_size > std::numeric_limits<TokenId>::max()) {
             throw std::invalid_argument("vocab_size exceeds the TokenId limit");
         }
-        for (const std::string &token : config.special_tokens) {
+        for (const std::string &token: config.special_tokens) {
             if (token.empty()) {
                 throw std::invalid_argument("special tokens must not be empty");
             }
@@ -902,7 +1163,7 @@ namespace bpe {
         tokenizer.merge_lookup_.reserve(requested_merges);
 
         std::size_t input_bytes = 0;
-        for (const auto& document : documents) input_bytes += document.size();
+        for (const auto &document: documents) input_bytes += document.size();
         if (input_bytes >= std::numeric_limits<Occurrence>::max()) {
             throw std::length_error(
                 "ExactInMemory supports less than 4 GiB of pretokenized input");
@@ -914,20 +1175,20 @@ namespace bpe {
         piece_offsets.reserve(documents.size() * 8 + 1);
         piece_offsets.push_back(0);
 
-        for (const std::string &document : documents) {
+        for (const std::string &document: documents) {
             for_each_pretoken(document, config.pretokenizer,
-                [&corpus, &piece_offsets](const std::string_view piece) {
-                    if (piece.empty()) return;
-                    if (corpus.size() + piece.size() >=
-                        std::numeric_limits<Occurrence>::max()) {
-                        throw std::length_error(
-                            "ExactInMemory corpus exceeds 32-bit position space");
-                    }
-                    for (const unsigned char byte : piece) {
-                        corpus.push_back(byte);
-                    }
-                    piece_offsets.push_back(static_cast<Occurrence>(corpus.size()));
-                });
+                              [&corpus, &piece_offsets](const std::string_view piece) {
+                                  if (piece.empty()) return;
+                                  if (corpus.size() + piece.size() >=
+                                      std::numeric_limits<Occurrence>::max()) {
+                                      throw std::length_error(
+                                          "ExactInMemory corpus exceeds 32-bit position space");
+                                  }
+                                  for (const unsigned char byte: piece) {
+                                      corpus.push_back(byte);
+                                  }
+                                  piece_offsets.push_back(static_cast<Occurrence>(corpus.size()));
+                              });
         }
 
         if (corpus.empty() || piece_offsets.size() <= 1) {
@@ -957,31 +1218,31 @@ namespace bpe {
         {
             std::vector<PairCounts> initial_counts(workers);
             parallel_for_ranges(piece_count, workers,
-                [&corpus, &piece_offsets, &initial_counts](
-                    const std::size_t worker,
-                    const std::size_t begin_piece,
-                    const std::size_t end_piece) {
-                    PairCounts &counts = initial_counts[worker];
-                    for (std::size_t piece = begin_piece; piece < end_piece; ++piece) {
-                        const std::size_t begin = piece_offsets[piece];
-                        const std::size_t finish = piece_offsets[piece + 1];
-                        for (std::size_t i = begin + 1; i < finish; ++i) {
-                            ++counts[pair_key(corpus[i - 1], corpus[i])];
-                        }
-                    }
-                });
+                                [&corpus, &piece_offsets, &initial_counts](
+                            const std::size_t worker,
+                            const std::size_t begin_piece,
+                            const std::size_t end_piece) {
+                                    PairCounts &counts = initial_counts[worker];
+                                    for (std::size_t piece = begin_piece; piece < end_piece; ++piece) {
+                                        const std::size_t begin = piece_offsets[piece];
+                                        const std::size_t finish = piece_offsets[piece + 1];
+                                        for (std::size_t i = begin + 1; i < finish; ++i) {
+                                            ++counts[pair_key(corpus[i - 1], corpus[i])];
+                                        }
+                                    }
+                                });
 
             std::size_t unique_hint = 0;
-            for (const auto& counts : initial_counts) unique_hint += counts.size();
+            for (const auto &counts: initial_counts) unique_hint += counts.size();
             pair_stats.reserve(unique_hint / 2 + 1);
-            for (const PairCounts &counts : initial_counts) {
-                for (const auto &[pair, count] : counts) {
+            for (const PairCounts &counts: initial_counts) {
+                for (const auto &[pair, count]: counts) {
                     pair_stats.get_or_create(pair).count += count;
                 }
             }
         }
 
-        pair_stats.for_each([](PairTable::Entry& entry) {
+        pair_stats.for_each([](PairTable::Entry &entry) {
             entry.occurrences.values.reserve(entry.count);
         });
         std::size_t occurrence_entries = 0;
@@ -994,17 +1255,17 @@ namespace bpe {
                 ++occurrence_entries;
             }
         }
-        pair_stats.for_each([](PairTable::Entry& entry) { entry.occurrences.mark_sorted(); });
+        pair_stats.for_each([](PairTable::Entry &entry) { entry.occurrences.mark_sorted(); });
 
         CandidateHeap candidates;
         candidates.reserve(pair_stats.size());
-        pair_stats.for_each([&candidates](PairTable::Entry& entry) {
+        pair_stats.for_each([&candidates](PairTable::Entry &entry) {
             candidates.set(entry.pair, entry.count);
         });
 
         struct MergeUpdates {
-            std::vector<std::pair<PairKey, std::int64_t>> count_deltas;
-            std::vector<std::pair<PairKey, Occurrence>> new_occurrences;
+            std::vector<std::pair<PairKey, std::int64_t> > count_deltas;
+            std::vector<std::pair<PairKey, Occurrence> > new_occurrences;
             std::size_t merged_edges = 0;
         };
         std::vector<MergeUpdates> updates(workers);
@@ -1012,7 +1273,7 @@ namespace bpe {
 
         while (tokenizer.vocab_size() < config.vocab_size) {
             while (!candidates.empty()) {
-                const PairTable::Entry* entry = pair_stats.find(candidates.top_pair());
+                const PairTable::Entry *entry = pair_stats.find(candidates.top_pair());
                 if (entry != nullptr && entry->count == candidates.top_count()) break;
                 candidates.pop();
             }
@@ -1025,17 +1286,17 @@ namespace bpe {
             const auto merged = static_cast<TokenId>(tokenizer.vocab_size());
             tokenizer.add_merge(left, right);
 
-            if (PairTable::Entry* best_entry = pair_stats.find(best_pair); best_entry != nullptr) {
+            if (PairTable::Entry *best_entry = pair_stats.find(best_pair); best_entry != nullptr) {
                 OccurrenceList positions = std::move(best_entry->occurrences);
                 occurrence_entries -= positions.values.size();
                 positions.sort();
 
                 constexpr std::size_t min_occurrences_per_parallel_merge = 4'096;
                 const std::size_t merge_workers =
-                    positions.values.size() < min_occurrences_per_parallel_merge
-                        ? 1
-                        : worker_count_for(
-                              workers, std::min(piece_count, positions.values.size()));
+                        positions.values.size() < min_occurrences_per_parallel_merge
+                            ? 1
+                            : worker_count_for(
+                                workers, std::min(piece_count, positions.values.size()));
                 for (std::size_t w = 0; w < merge_workers; ++w) {
                     updates[w].count_deltas.clear();
                     updates[w].new_occurrences.clear();
@@ -1043,77 +1304,79 @@ namespace bpe {
                 }
 
                 parallel_for_ranges(piece_count, merge_workers,
-                    [&corpus, &next_positions, &previous_positions, &piece_offsets,
-                     &positions, &updates, left, right, merged](
-                        const std::size_t worker,
-                        const std::size_t begin_piece,
-                        const std::size_t end_piece) {
-                        MergeUpdates& local = updates[worker];
-                        const Occurrence begin_position = piece_offsets[begin_piece];
-                        const Occurrence end_position = piece_offsets[end_piece];
-                        const auto first = std::ranges::lower_bound(
-                            positions.values.begin(), positions.values.end(), begin_position);
-                        const auto last = std::ranges::lower_bound(
-                            positions.values.begin(), positions.values.end(), end_position);
+                                    [&corpus, &next_positions, &previous_positions, &piece_offsets,
+                                        &positions, &updates, left, right, merged](
+                                const std::size_t worker,
+                                const std::size_t begin_piece,
+                                const std::size_t end_piece) {
+                                        MergeUpdates &local = updates[worker];
+                                        const Occurrence begin_position = piece_offsets[begin_piece];
+                                        const Occurrence end_position = piece_offsets[end_piece];
+                                        const auto first = std::ranges::lower_bound(
+                                            positions.values.begin(), positions.values.end(), begin_position);
+                                        const auto last = std::ranges::lower_bound(
+                                            positions.values.begin(), positions.values.end(), end_position);
 
-                        for (auto current = first; current != last; ++current) {
-                            constexpr std::ptrdiff_t prefetch_ahead = 8;
+                                        for (auto current = first; current != last; ++current) {
+                                            constexpr std::ptrdiff_t prefetch_ahead = 8;
 #ifdef BPE_HAVE_X64_SIMD
-                            if (const auto ahead = current + prefetch_ahead; ahead < last) {
-                                const std::size_t future_position = *ahead;
-                                BPE_PREFETCH(&corpus[future_position], 1, 1);
-                                BPE_PREFETCH(&next_positions[future_position], 0, 1);
-                                BPE_PREFETCH(&previous_positions[future_position], 0, 1);
-                            }
+                                            if (const auto ahead = current + prefetch_ahead; ahead < last) {
+                                                const std::size_t future_position = *ahead;
+                                                BPE_PREFETCH(&corpus[future_position], 1, 1);
+                                                BPE_PREFETCH(&next_positions[future_position], 0, 1);
+                                                BPE_PREFETCH(&previous_positions[future_position], 0, 1);
+                                            }
 #endif
-                            const std::size_t position = *current;
-                            if (corpus[position] != left ||
-                                next_positions[position] == link_end ||
-                                corpus[next_positions[position]] != right) {
-                                continue;
-                            }
+                                            const std::size_t position = *current;
+                                            if (corpus[position] != left ||
+                                                next_positions[position] == link_end ||
+                                                corpus[next_positions[position]] != right) {
+                                                continue;
+                                            }
 
-                            const std::size_t right_position = next_positions[position];
-                            const Link before = previous_positions[position];
-                            const Link after = next_positions[right_position];
-                            const auto remove_pair = [&](const Link start) {
-                                if (start != link_end && next_positions[start] != link_end) {
-                                    local.count_deltas.emplace_back(
-                                        pair_key(corpus[start], corpus[next_positions[start]]), -1);
-                                }
-                            };
-                            const auto add_pair = [&](const Link start) {
-                                if (start != link_end && next_positions[start] != link_end) {
-                                    const PairKey pair = pair_key(
-                                        corpus[start], corpus[next_positions[start]]);
-                                    local.count_deltas.emplace_back(pair, 1);
-                                    local.new_occurrences.emplace_back(pair, start);
-                                }
-                            };
+                                            const std::size_t right_position = next_positions[position];
+                                            const Link before = previous_positions[position];
+                                            const Link after = next_positions[right_position];
+                                            const auto remove_pair = [&](const Link start) {
+                                                if (start != link_end && next_positions[start] != link_end) {
+                                                    local.count_deltas.emplace_back(
+                                                        pair_key(corpus[start], corpus[next_positions[start]]), -1);
+                                                }
+                                            };
+                                            const auto add_pair = [&](const Link start) {
+                                                if (start != link_end && next_positions[start] != link_end) {
+                                                    const PairKey pair = pair_key(
+                                                        corpus[start], corpus[next_positions[start]]);
+                                                    local.count_deltas.emplace_back(pair, 1);
+                                                    local.new_occurrences.emplace_back(pair, start);
+                                                }
+                                            };
 
-                            remove_pair(before);
-                            remove_pair(static_cast<Link>(position));
-                            remove_pair(static_cast<Link>(right_position));
+                                            remove_pair(before);
+                                            remove_pair(static_cast<Link>(position));
+                                            remove_pair(static_cast<Link>(right_position));
 
-                            corpus[position] = merged;
-                            next_positions[position] = after;
-                            if (after != link_end) previous_positions[after] = static_cast<Link>(position);
-                            if (before != link_end) next_positions[before] = static_cast<Link>(position);
-                            next_positions[right_position] = link_end;
-                            previous_positions[right_position] = link_end;
+                                            corpus[position] = merged;
+                                            next_positions[position] = after;
+                                            if (after != link_end)
+                                                previous_positions[after] = static_cast<Link>(position);
+                                            if (before != link_end)
+                                                next_positions[before] = static_cast<Link>(position);
+                                            next_positions[right_position] = link_end;
+                                            previous_positions[right_position] = link_end;
 
-                            add_pair(before);
-                            add_pair(static_cast<Link>(position));
-                            ++local.merged_edges;
-                        }
-                    });
+                                            add_pair(before);
+                                            add_pair(static_cast<Link>(position));
+                                            ++local.merged_edges;
+                                        }
+                                    });
 
                 total_deltas.clear();
                 for (std::size_t w = 0; w < merge_workers; ++w) {
-                    MergeUpdates& local = updates[w];
+                    MergeUpdates &local = updates[w];
                     active_edges -= local.merged_edges;
                     std::ranges::sort(local.count_deltas,
-                        [](const auto& a, const auto& b) { return a.first < b.first; });
+                                      [](const auto &a, const auto &b) { return a.first < b.first; });
                     for (std::size_t i = 0; i < local.count_deltas.size();) {
                         const PairKey pair = local.count_deltas[i].first;
                         std::int64_t sum = 0;
@@ -1128,9 +1391,9 @@ namespace bpe {
                     }
                 }
 
-                for (const auto& [pair, delta] : total_deltas) {
+                for (const auto &[pair, delta]: total_deltas) {
                     if (delta == 0) continue;
-                    PairTable::Entry& entry = pair_stats.get_or_create(pair);
+                    PairTable::Entry &entry = pair_stats.get_or_create(pair);
                     const std::int64_t previous = static_cast<std::int64_t>(entry.count);
                     const std::int64_t updated = previous + delta;
                     if (updated <= 0) {
@@ -1144,48 +1407,48 @@ namespace bpe {
                 }
 
                 for (std::size_t w = 0; w < merge_workers; ++w) {
-                    for (const auto& [pair, occurrence] : updates[w].new_occurrences) {
+                    for (const auto &[pair, occurrence]: updates[w].new_occurrences) {
                         pair_stats.get_or_create(pair).occurrences.append(occurrence);
                         ++occurrence_entries;
                     }
                 }
 
                 const std::size_t compact_slack =
-                    std::max<std::size_t>(1'000'000, active_edges / 8);
+                        std::max<std::size_t>(1'000'000, active_edges / 8);
                 if (occurrence_entries > active_edges + compact_slack) {
                     const std::size_t rebuild_workers = worker_count_for(workers, piece_count);
-                    std::vector<std::unordered_map<PairKey, std::vector<Occurrence>>>
-                        local_occurrences(rebuild_workers);
+                    std::vector<std::unordered_map<PairKey, std::vector<Occurrence> > >
+                            local_occurrences(rebuild_workers);
                     parallel_for_ranges(piece_count, rebuild_workers,
-                        [&corpus, &next_positions, &piece_offsets, &local_occurrences](
-                            const std::size_t worker,
-                            const std::size_t begin_piece,
-                            const std::size_t end_piece) {
-                            auto& local = local_occurrences[worker];
-                            for (std::size_t piece = begin_piece; piece < end_piece; ++piece) {
-                                const std::size_t begin = piece_offsets[piece];
-                                const std::size_t finish = piece_offsets[piece + 1];
-                                for (std::size_t start = begin; start < finish; ++start) {
-                                    if (next_positions[start] != link_end) {
-                                        local[pair_key(corpus[start], corpus[next_positions[start]])]
-                                            .push_back(static_cast<Occurrence>(start));
-                                    }
-                                }
-                            }
-                        });
+                                        [&corpus, &next_positions, &piece_offsets, &local_occurrences](
+                                    const std::size_t worker,
+                                    const std::size_t begin_piece,
+                                    const std::size_t end_piece) {
+                                            auto &local = local_occurrences[worker];
+                                            for (std::size_t piece = begin_piece; piece < end_piece; ++piece) {
+                                                const std::size_t begin = piece_offsets[piece];
+                                                const std::size_t finish = piece_offsets[piece + 1];
+                                                for (std::size_t start = begin; start < finish; ++start) {
+                                                    if (next_positions[start] != link_end) {
+                                                        local[pair_key(corpus[start], corpus[next_positions[start]])]
+                                                                .push_back(static_cast<Occurrence>(start));
+                                                    }
+                                                }
+                                            }
+                                        });
 
-                    pair_stats.for_each([](PairTable::Entry& entry) { entry.occurrences = {}; });
+                    pair_stats.for_each([](PairTable::Entry &entry) { entry.occurrences = {}; });
                     occurrence_entries = 0;
-                    for (auto& local : local_occurrences) {
-                        for (auto& [pair, values] : local) {
-                            OccurrenceList& list = pair_stats.get_or_create(pair).occurrences;
+                    for (auto &local: local_occurrences) {
+                        for (auto &[pair, values]: local) {
+                            OccurrenceList &list = pair_stats.get_or_create(pair).occurrences;
                             occurrence_entries += values.size();
                             list.values.insert(list.values.end(),
-                                std::make_move_iterator(values.begin()),
-                                std::make_move_iterator(values.end()));
+                                               std::make_move_iterator(values.begin()),
+                                               std::make_move_iterator(values.end()));
                         }
                     }
-                    pair_stats.for_each([](PairTable::Entry& entry) {
+                    pair_stats.for_each([](PairTable::Entry &entry) {
                         std::ranges::sort(entry.occurrences.values);
                         entry.occurrences.mark_sorted();
                     });
@@ -1200,9 +1463,27 @@ namespace bpe {
         return tokenizer;
     }
 
+
+    /**
+     * @brief Trains BPE by repeatedly scanning a seekable input stream.
+     *
+     * Each pass encodes the stream with the current vocabulary, counts adjacent
+     * pairs, and adds up to `low_memory_merges_per_pass` highest-ranked merges.
+     * Dense pair counting is used for small vocabularies and a sparse hash map
+     * otherwise.
+     *
+     * @param input Seekable training stream.
+     * @param config Trainer configuration.
+     * @param block_size Number of bytes read per stream block.
+     * @return Trained tokenizer.
+     *
+     * @throws std::invalid_argument If configuration, block size, or stream
+     * seekability is invalid.
+     * @throws std::runtime_error If reading or rewinding the stream fails.
+     */
     BpeTokenizer BpeTokenizer::train_low_memory(
-        std::istream& input,
-        const TrainerConfig& config,
+        std::istream &input,
+        const TrainerConfig &config,
         const std::size_t block_size
     ) {
         if (block_size == 0) {
@@ -1218,7 +1499,7 @@ namespace bpe {
         }
 
         const std::size_t minimum_vocab =
-            kByteVocabularySize + config.special_tokens.size();
+                kByteVocabularySize + config.special_tokens.size();
         if (config.vocab_size < minimum_vocab) {
             throw std::invalid_argument(
                 "vocab_size is smaller than byte and special-token vocabulary");
@@ -1250,8 +1531,8 @@ namespace bpe {
 
             const std::size_t current_vocab = tokenizer.vocab_size();
             const bool use_dense =
-                current_vocab <= config.low_memory_dense_vocab_limit &&
-                current_vocab <= 4'096;
+                    current_vocab <= config.low_memory_dense_vocab_limit &&
+                    current_vocab <= 4'096;
             std::vector<std::uint64_t> dense_counts;
             PairCounts sparse_counts;
             if (use_dense) {
@@ -1265,26 +1546,26 @@ namespace bpe {
             while (input.read(block.data(), static_cast<std::streamsize>(block.size())) ||
                    input.gcount() != 0) {
                 const auto bytes_read =
-                    static_cast<std::size_t>(input.gcount());
+                        static_cast<std::size_t>(input.gcount());
                 const std::string_view view(block.data(), bytes_read);
 
                 for_each_pretoken(view, config.pretokenizer,
-                    [&](const std::string_view piece) {
-                        if (piece.empty()) return;
-                        encoded.clear();
-                        tokenizer.append_encoded_bytes_uncached(piece, encoded, 10);
-                        for (std::size_t i = 1; i < encoded.size(); ++i) {
-                            const TokenId left = encoded[i - 1];
-                            const TokenId right = encoded[i];
-                            if (use_dense && left < current_vocab && right < current_vocab) {
-                                ++dense_counts[
-                                    static_cast<std::size_t>(left) * current_vocab + right];
-                            } else {
-                                ++sparse_counts[pair_key(left, right)];
-                            }
-                            ++observed_pairs;
-                        }
-                    });
+                                  [&](const std::string_view piece) {
+                                      if (piece.empty()) return;
+                                      encoded.clear();
+                                      tokenizer.append_encoded_bytes_uncached(piece, encoded, 10);
+                                      for (std::size_t i = 1; i < encoded.size(); ++i) {
+                                          const TokenId left = encoded[i - 1];
+                                          const TokenId right = encoded[i];
+                                          if (use_dense && left < current_vocab && right < current_vocab) {
+                                              ++dense_counts[
+                                                  static_cast<std::size_t>(left) * current_vocab + right];
+                                          } else {
+                                              ++sparse_counts[pair_key(left, right)];
+                                          }
+                                          ++observed_pairs;
+                                      }
+                                  });
             }
             if (input.fail() && !input.eof()) {
                 throw std::runtime_error(
@@ -1296,9 +1577,9 @@ namespace bpe {
                 std::uint64_t count;
                 PairKey pair;
             };
-            const auto worse = [](const RankedPair& a, const RankedPair& b) {
+            const auto worse = [](const RankedPair &a, const RankedPair &b) {
                 return a.count > b.count ||
-                    (a.count == b.count && a.pair < b.pair);
+                       (a.count == b.count && a.pair < b.pair);
             };
             std::vector<RankedPair> best;
             const std::size_t remaining = config.vocab_size - tokenizer.vocab_size();
@@ -1317,7 +1598,7 @@ namespace bpe {
                     return;
                 }
                 const RankedPair candidate{.count = count, .pair = pair};
-                const RankedPair& minimum = best.front();
+                const RankedPair &minimum = best.front();
                 if (candidate.count > minimum.count ||
                     (candidate.count == minimum.count && candidate.pair < minimum.pair)) {
                     std::ranges::pop_heap(best.begin(), best.end(), worse);
@@ -1329,23 +1610,23 @@ namespace bpe {
             if (use_dense) {
                 for (TokenId left = 0; left < current_vocab; ++left) {
                     const std::size_t row =
-                        static_cast<std::size_t>(left) * current_vocab;
+                            static_cast<std::size_t>(left) * current_vocab;
                     for (TokenId right = 0; right < current_vocab; ++right) {
                         const std::uint64_t count = dense_counts[row + right];
                         if (count != 0) consider(pair_key(left, right), count);
                     }
                 }
             }
-            for (const auto& [pair, count] : sparse_counts) {
+            for (const auto &[pair, count]: sparse_counts) {
                 consider(pair, count);
             }
             if (best.empty()) break;
 
-            std::ranges::sort(best, [](const RankedPair& a, const RankedPair& b) {
+            std::ranges::sort(best, [](const RankedPair &a, const RankedPair &b) {
                 return a.count != b.count ? a.count > b.count : a.pair < b.pair;
             });
             std::size_t added = 0;
-            for (const RankedPair& candidate : best) {
+            for (const RankedPair &candidate: best) {
                 if (tokenizer.vocab_size() >= config.vocab_size) break;
                 if (tokenizer.merge_lookup_.contains(candidate.pair)) continue;
                 tokenizer.add_merge(
@@ -1362,6 +1643,21 @@ namespace bpe {
         return tokenizer;
     }
 
+
+    /**
+     * @brief Trains a tokenizer from a byte stream.
+     *
+     * Low-memory mode delegates to train_low_memory(). Other modes read the
+     * stream into document-sized blocks and invoke exact in-memory training.
+     *
+     * @param input Training stream.
+     * @param config Trainer configuration.
+     * @param block_size Number of bytes per input block.
+     * @return Trained tokenizer.
+     *
+     * @throws std::invalid_argument If @p block_size is invalid.
+     * @throws std::runtime_error If stream reading fails.
+     */
     BpeTokenizer BpeTokenizer::train_streaming(
         std::istream &input,
         const TrainerConfig &config,
@@ -1391,6 +1687,15 @@ namespace bpe {
         return train(documents, config);
     }
 
+
+    /**
+     * @brief Convenience entry point for stream-based tokenizer training.
+     *
+     * @param input Training stream.
+     * @param config Trainer configuration.
+     * @param block_size Number of bytes per stream block.
+     * @return Trained tokenizer.
+     */
     BpeTokenizer BpeTokenizer::train(
         std::istream &input,
         const TrainerConfig &config,
@@ -1399,21 +1704,49 @@ namespace bpe {
         return train_streaming(input, config, block_size);
     }
 
+
+    /**
+     * @brief Encodes text using default encoding options.
+     *
+     * @param text Input byte string.
+     * @return Sequence of byte, special, and merged token identifiers.
+     */
     std::vector<TokenId> BpeTokenizer::encode(const std::string_view text) const {
         return encode(text, EncodeOptions{});
     }
 
+
+    /**
+     * @brief Encodes text using caller-provided cache options.
+     *
+     * Special tokens are recognized before ordinary pretokenization and BPE
+     * merging.
+     *
+     * @param text Input byte string.
+     * @param options Piece-cache capacity and maximum cached input size.
+     * @return Encoded token identifiers.
+     */
     std::vector<TokenId> BpeTokenizer::encode(
         const std::string_view text,
-        const EncodeOptions& options) const {
+        const EncodeOptions &options) const {
         constexpr unsigned single_dense_bits = 10;
         return encode_with_dense_limit(
             text, options, std::min(dense_merge_bits_, single_dense_bits));
     }
 
+
+    /**
+     * @brief Encodes text with an explicit dense-lookup token-bit limit.
+     *
+     * @param text Input byte string.
+     * @param options Encoding cache options.
+     * @param dense_limit_bits Maximum token-bit width eligible for the dense
+     * pair lookup.
+     * @return Encoded token sequence.
+     */
     std::vector<TokenId> BpeTokenizer::encode_with_dense_limit(
         const std::string_view text,
-        const EncodeOptions& options,
+        const EncodeOptions &options,
         const unsigned dense_limit_bits) const {
         if (text.empty()) {
             return {};
@@ -1459,57 +1792,78 @@ namespace bpe {
         return result;
     }
 
-    std::vector<std::vector<TokenId>> BpeTokenizer::encode_batch(
-        const std::vector<std::string>& texts,
+
+    /**
+     * @brief Encodes a vector of owning strings in parallel.
+     *
+     * @param texts Input documents.
+     * @param worker_count Number of workers, or zero for automatic selection.
+     * @param options Encoding cache options.
+     * @return One token vector per input document, preserving input order.
+     */
+    std::vector<std::vector<TokenId> > BpeTokenizer::encode_batch(
+        const std::vector<std::string> &texts,
         const std::size_t worker_count,
-        const EncodeOptions& options) const {
+        const EncodeOptions &options) const {
         std::vector<std::string_view> views;
         views.reserve(texts.size());
-        for (const std::string& text : texts) {
+        for (const std::string &text: texts) {
             views.emplace_back(text);
         }
         return encode_batch(views, worker_count, options);
     }
 
-    std::vector<std::vector<TokenId>> BpeTokenizer::encode_batch(
+
+    /**
+     * @brief Encodes a span of string views using the shared worker pool.
+     *
+     * Heterogeneous document sizes may be scheduled largest-first to reduce tail
+     * latency. Smaller, similarly sized documents are claimed in chunks.
+     *
+     * @param texts Input document views.
+     * @param worker_count Number of workers, or zero for automatic selection.
+     * @param options Encoding cache options.
+     * @return One token vector per input document.
+     */
+    std::vector<std::vector<TokenId> > BpeTokenizer::encode_batch(
         const std::span<const std::string_view> texts,
         const std::size_t worker_count,
-        const EncodeOptions& options) const {
-        std::vector<std::vector<TokenId>> result(texts.size());
+        const EncodeOptions &options) const {
+        std::vector<std::vector<TokenId> > result(texts.size());
         if (texts.empty()) return result;
 
         const std::size_t workers = worker_count_for(worker_count, texts.size());
         constexpr unsigned batch_dense_bits = 10;
         const unsigned dense_limit_bits =
-            std::min(dense_merge_bits_, batch_dense_bits);
+                std::min(dense_merge_bits_, batch_dense_bits);
 
         std::size_t smallest = texts.front().size();
         std::size_t largest = smallest;
-        for (const std::string_view text : texts.subspan(1)) {
+        for (const std::string_view text: texts.subspan(1)) {
             smallest = std::min(smallest, text.size());
             largest = std::max(largest, text.size());
         }
 
         const bool use_size_order =
-            texts.size() >= workers * 2 &&
-            (smallest == 0 ? largest != 0 : largest / smallest >= 2);
+                texts.size() >= workers * 2 &&
+                (smallest == 0 ? largest != 0 : largest / smallest >= 2);
         std::vector<std::size_t> jobs;
         if (use_size_order) {
             jobs.resize(texts.size());
             std::iota(jobs.begin(), jobs.end(), 0);
             std::ranges::sort(jobs.begin(), jobs.end(),
-                [&texts](const std::size_t a, const std::size_t b) {
-                    return texts[a].size() > texts[b].size();
-                });
+                              [&texts](const std::size_t a, const std::size_t b) {
+                                  return texts[a].size() > texts[b].size();
+                              });
         }
 
         std::atomic_size_t next_job{0};
         const auto worker = [this, &texts, &result, &options, &jobs,
-                             &next_job, dense_limit_bits, use_size_order] {
+                    &next_job, dense_limit_bits, use_size_order] {
             const std::size_t chunk_size = use_size_order ? 1 : 8;
             while (true) {
                 const std::size_t begin =
-                    next_job.fetch_add(chunk_size, std::memory_order_relaxed);
+                        next_job.fetch_add(chunk_size, std::memory_order_relaxed);
                 if (begin >= texts.size()) break;
                 const std::size_t end = std::min(begin + chunk_size, texts.size());
                 for (std::size_t job = begin; job < end; ++job) {
@@ -1529,10 +1883,19 @@ namespace bpe {
         return result;
     }
 
+
+    /**
+     * @brief Encodes a batch into contiguous token and offset arrays.
+     *
+     * @param texts Input document views.
+     * @param worker_count Number of workers, or zero for automatic selection.
+     * @param options Encoding cache options.
+     * @return Flat token storage and `texts.size() + 1` prefix offsets.
+     */
     EncodedBatch BpeTokenizer::encode_batch_flat(
         const std::span<const std::string_view> texts,
         const std::size_t worker_count,
-        const EncodeOptions& options) const {
+        const EncodeOptions &options) const {
         EncodedBatch flat;
         flat.offsets.resize(texts.size() + 1, 0);
         if (texts.empty()) return flat;
@@ -1550,7 +1913,7 @@ namespace bpe {
                 const std::size_t i = next_document.fetch_add(1, std::memory_order_relaxed);
                 if (i >= per_document.size()) break;
                 std::ranges::copy(per_document[i].begin(), per_document[i].end(),
-                          flat.tokens.begin() + static_cast<std::ptrdiff_t>(flat.offsets[i]));
+                                  flat.tokens.begin() + static_cast<std::ptrdiff_t>(flat.offsets[i]));
                 std::vector<TokenId>().swap(per_document[i]);
             }
         };
@@ -1562,28 +1925,50 @@ namespace bpe {
         return flat;
     }
 
+
+    /**
+     * @brief Pretokenizes and appends encoded ordinary text bytes.
+     *
+     * @param text Input segment known not to contain an extracted special token.
+     * @param output Destination token vector.
+     * @param options Encoding cache options.
+     * @param dense_limit_bits Dense merge-lookup limit.
+     */
     void BpeTokenizer::append_encoded_bytes(
         const std::string_view text,
-        std::vector<TokenId>& output,
-        const EncodeOptions& options,
+        std::vector<TokenId> &output,
+        const EncodeOptions &options,
         const unsigned dense_limit_bits) const {
         if (text.empty()) return;
 
         if (pretokenizer_mode_ != PretokenizerMode::None) {
             for_each_pretoken(text, pretokenizer_mode_,
-                [this, &output, &options, dense_limit_bits](const std::string_view piece) {
-                    encode_piece_cached(piece, output, options, dense_limit_bits);
-                });
+                              [this, &output, &options, dense_limit_bits](const std::string_view piece) {
+                                  encode_piece_cached(piece, output, options, dense_limit_bits);
+                              });
             return;
         }
 
         encode_piece_cached(text, output, options, dense_limit_bits);
     }
 
+
+    /**
+     * @brief Encodes one pretokenized piece using a thread-local bounded cache.
+     *
+     * Pieces up to 15 bytes use a compact inline key table. Longer pieces use an
+     * FNV-1a-style hash and string-key table. Cache state is invalidated when the
+     * tokenizer identity, merge count, or requested capacity changes.
+     *
+     * @param piece Pretokenized input piece.
+     * @param output Destination token vector.
+     * @param options Cache configuration.
+     * @param dense_limit_bits Dense merge-lookup limit.
+     */
     void BpeTokenizer::encode_piece_cached(
         const std::string_view piece,
-        std::vector<TokenId>& output,
-        const EncodeOptions& options,
+        std::vector<TokenId> &output,
+        const EncodeOptions &options,
         const unsigned dense_limit_bits) const {
         if (piece.empty()) return;
         if (options.cache_entries == 0 || options.cache_max_input_bytes == 0 ||
@@ -1608,11 +1993,12 @@ namespace bpe {
             std::uint32_t token_count = 0;
             bool occupied = false;
 
-            void emit(std::vector<TokenId>& destination) const {
+            void emit(std::vector<TokenId> &destination) const {
                 const std::size_t count = token_count;
                 destination.reserve(destination.size() + count);
                 if (count <= inline_tokens) {
-                    destination.insert(destination.end(), tokens.begin(), tokens.begin() + count);
+                    destination.insert(destination.end(), tokens.begin(),
+                                       tokens.begin() + static_cast<long long>(count));
                 } else {
                     destination.insert(destination.end(), spill.begin(), spill.end());
                 }
@@ -1635,7 +2021,7 @@ namespace bpe {
         };
 
         struct ThreadCache {
-            const BpeTokenizer* owner = nullptr;
+            const BpeTokenizer *owner = nullptr;
             std::uint64_t identity = 0;
             std::size_t merge_count = 0;
             std::size_t capacity = 0;
@@ -1665,7 +2051,7 @@ namespace bpe {
             cache.long_table.resize(long_capacity);
         }
 
-        ShortEntry* short_victim = nullptr;
+        ShortEntry *short_victim = nullptr;
         std::uint64_t short_key_low = 0;
         std::uint64_t short_key_high = 0;
         if (piece.size() <= 15) {
@@ -1678,16 +2064,16 @@ namespace bpe {
             short_key_high |= piece.size() << 56U;
 
             std::uint64_t packed_hash =
-                short_key_low ^ std::rotl(short_key_high, 23);
+                    short_key_low ^ std::rotl(short_key_high, 23);
             packed_hash *= 0x9E37'79B9'7F4A'7C15ULL;
             std::size_t short_index =
-                packed_hash & cache.short_mask;
+                    packed_hash & cache.short_mask;
             constexpr std::uint64_t key_mask = (std::uint64_t{1} << 60U) - 1;
             constexpr std::size_t short_max_probe = 8;
             for (std::size_t probe = 0; probe < short_max_probe; ++probe) {
-                ShortEntry& entry = cache.short_table[short_index];
+                ShortEntry &entry = cache.short_table[short_index];
                 const std::uint64_t stored_key_high =
-                    entry.key_high_and_count & key_mask;
+                        entry.key_high_and_count & key_mask;
                 if (entry.key_low == short_key_low &&
                     stored_key_high == short_key_high) {
                     const std::size_t count = entry.key_high_and_count >> 60U;
@@ -1707,19 +2093,19 @@ namespace bpe {
 
         std::uint64_t hash = 1469598103934665603ULL;
         if (piece.size() > 15) {
-            for (const unsigned char byte : piece) {
+            for (const unsigned char byte: piece) {
                 hash ^= byte;
                 hash *= 1099511628211ULL;
             }
             hash ^= piece.size() *
-                0x9E3779B97F4A7C15ULL;
+                    0x9E3779B97F4A7C15ULL;
         }
 
         std::size_t index = hash & cache.long_mask;
-        Entry* victim = nullptr;
+        Entry *victim = nullptr;
         if (piece.size() > 15) {
             for (std::size_t probe = 0; probe < 8; ++probe) {
-                Entry& entry = cache.long_table[index];
+                Entry &entry = cache.long_table[index];
                 if (!entry.occupied) {
                     victim = &entry;
                     break;
@@ -1742,8 +2128,8 @@ namespace bpe {
         if (short_victim != nullptr && encoded.size() <= inline_tokens) {
             short_victim->key_low = short_key_low;
             short_victim->key_high_and_count =
-                short_key_high |
-                (encoded.size() << 60U);
+                    short_key_high |
+                    (encoded.size() << 60U);
             std::ranges::copy(
                 encoded.begin(), encoded.end(), short_victim->tokens.begin());
         } else if (victim != nullptr) {
@@ -1751,6 +2137,18 @@ namespace bpe {
         }
     }
 
+
+    /**
+     * @brief Looks up the token produced by merging a token pair.
+     *
+     * The lookup checks a dense table for small token IDs, then a packed
+     * open-addressing table, and finally the general hash map.
+     *
+     * @param left Left token identifier.
+     * @param right Right token identifier.
+     * @param dense_limit_bits Maximum token-bit width eligible for dense lookup.
+     * @return Merged token ID, or `numeric_limits<TokenId>::max()` when absent.
+     */
     TokenId BpeTokenizer::lookup_merge(
         const TokenId left,
         const TokenId right,
@@ -1767,7 +2165,7 @@ namespace bpe {
             constexpr std::uint64_t id_mask = (std::uint64_t{1} << id_bits) - 1;
             if ((left | right) <= id_mask) {
                 const std::uint64_t key =
-                    (static_cast<std::uint64_t>(left) << id_bits) | right;
+                        (static_cast<std::uint64_t>(left) << id_bits) | right;
                 auto index = key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_;
                 while (true) {
                     const std::uint64_t slot = packed_merge_lookup_[index];
@@ -1786,15 +2184,27 @@ namespace bpe {
         return found == merge_lookup_.end() ? missing : found->second;
     }
 
+
+    /**
+     * @brief Applies ranked BPE merges to one byte string without using the cache.
+     *
+     * The routine starts from byte tokens and incrementally merges adjacent pairs
+     * according to learned merge rank. Linked token nodes and a candidate heap
+     * avoid repeatedly scanning the complete piece.
+     *
+     * @param text Input byte string.
+     * @param output Destination token vector to append to.
+     * @param dense_limit_bits Dense merge-lookup limit.
+     */
     void BpeTokenizer::append_encoded_bytes_uncached(
         const std::string_view text,
-        std::vector<TokenId>& output,
+        std::vector<TokenId> &output,
         const unsigned dense_limit_bits) const {
         if (text.empty()) return;
 
         const auto find_merge = [this, dense_limit_bits](
-                                    const TokenId left,
-                                    const TokenId right) noexcept {
+            const TokenId left,
+            const TokenId right) noexcept {
             return lookup_merge(left, right, dense_limit_bits);
         };
 
@@ -1838,7 +2248,7 @@ namespace bpe {
                 if (new_right < size) {
                     previous[new_right] = static_cast<std::uint8_t>(best_position);
                     ranks[best_position] =
-                        find_merge(symbols[best_position], symbols[new_right]);
+                            find_merge(symbols[best_position], symbols[new_right]);
                 } else {
                     ranks[best_position] = missing;
                 }
@@ -1888,7 +2298,7 @@ namespace bpe {
                             return;
                         }
                         auto middle = values.begin() +
-                            static_cast<std::ptrdiff_t>(sorted_size);
+                                      static_cast<std::ptrdiff_t>(sorted_size);
                         std::ranges::sort(middle, values.end());
                         if (sorted_size != 0) {
                             std::inplace_merge(values.begin(), middle, values.end());
@@ -1921,7 +2331,7 @@ namespace bpe {
                     }
 
                     const std::size_t rank = merge - first_merged;
-                    auto& bucket = positions[rank];
+                    auto &bucket = positions[rank];
                     if (bucket.values.empty()) {
                         rank_heap.push_back(rank);
                         std::ranges::push_heap(
@@ -1933,7 +2343,7 @@ namespace bpe {
                 for (Link left = 0; left + 1 < nodes.size(); ++left) {
                     add_rank_candidate(left);
                 }
-                for (auto& bucket : positions) {
+                for (auto &bucket: positions) {
                     bucket.sorted_size = bucket.values.size();
                 }
 
@@ -1944,20 +2354,20 @@ namespace bpe {
                     const std::size_t rank = rank_heap.back();
                     rank_heap.pop_back();
 
-                    auto& bucket = positions[rank];
+                    auto &bucket = positions[rank];
                     bucket.normalize();
                     bucket.values.erase(
                         std::unique(bucket.values.begin(), bucket.values.end()),
                         bucket.values.end());
-                    const MergeRule& rule = merges_[rank];
-                    for (const Link left_index : bucket.values) {
-                        Node& left = nodes[left_index];
+                    const MergeRule &rule = merges_[rank];
+                    for (const Link left_index: bucket.values) {
+                        Node &left = nodes[left_index];
                         if (left.next == end) {
                             continue;
                         }
 
                         const Link right_index = left.next;
-                        Node& right = nodes[right_index];
+                        Node &right = nodes[right_index];
                         if (left.token != rule.left || right.token != rule.right) {
                             continue;
                         }
@@ -2017,13 +2427,13 @@ namespace bpe {
                 const auto [expected_merge, left_index] = candidate_heap.back();
                 candidate_heap.pop_back();
 
-                Node& left = nodes[left_index];
+                Node &left = nodes[left_index];
                 if (left.next == end) {
                     continue;
                 }
 
                 const Link right_index = left.next;
-                Node& right = nodes[right_index];
+                Node &right = nodes[right_index];
                 if (find_merge(left.token, right.token) != expected_merge) {
                     continue;
                 }
@@ -2066,585 +2476,745 @@ namespace bpe {
         }
     }
 
-std::string BpeTokenizer::decode(const std::span<const TokenId> ids) const {
-    std::size_t decoded_size = 0;
-    for (const TokenId id : ids) {
-        if (is_special(id)) {
-            decoded_size += special_tokens_[id - kByteVocabularySize].size();
-        } else {
+
+    /**
+     * @brief Decodes token identifiers back to their byte representation.
+     *
+     * Special IDs emit their configured strings. Ordinary IDs append the byte
+     * sequence represented by the base token or learned merge.
+     *
+     * @param ids Token sequence to decode.
+     * @return Reconstructed byte string.
+     *
+     * @throws std::out_of_range If an ID is not part of this tokenizer vocabulary.
+     */
+    std::string BpeTokenizer::decode(const std::span<const TokenId> ids) const {
+        std::size_t decoded_size = 0;
+        for (const TokenId id: ids) {
+            if (is_special(id)) {
+                decoded_size += special_tokens_[id - kByteVocabularySize].size();
+            } else {
+                if (id >= token_bytes_.size()) {
+                    throw std::out_of_range("Token ID is outside this tokenizer vocabulary");
+                }
+                decoded_size += token_bytes_[id].size();
+            }
+        }
+
+        std::string text;
+        text.reserve(decoded_size);
+
+        for (const TokenId id: ids) {
+            if (is_special(id)) {
+                text += special_tokens_[id - kByteVocabularySize];
+                continue;
+            }
+
             if (id >= token_bytes_.size()) {
                 throw std::out_of_range("Token ID is outside this tokenizer vocabulary");
             }
-            decoded_size += token_bytes_[id].size();
+
+            const auto &bytes = token_bytes_[id];
+            text.append(
+                reinterpret_cast<const char *>(bytes.data()),
+                bytes.size()
+            );
+        }
+
+        return text;
+    }
+
+
+    /**
+     * @brief Saves the tokenizer using an explicitly selected format.
+     *
+     * @param path Destination file.
+     * @param format Binary or Hugging Face JSON output format.
+     *
+     * @throws std::invalid_argument If @p format is Auto or unknown.
+     * @throws std::runtime_error If serialization fails.
+     */
+    void BpeTokenizer::save(
+        const std::filesystem::path &path,
+        const TokenizerFormat format) const {
+        switch (format) {
+            case TokenizerFormat::HuggingFaceJson:
+                save_huggingface_json(path);
+                return;
+            case TokenizerFormat::Binary:
+                save_binary(path);
+                return;
+            case TokenizerFormat::Auto:
+                throw std::invalid_argument(
+                    "TokenizerFormat::Auto is valid only when loading");
+        }
+        throw std::invalid_argument("Unknown tokenizer output format");
+    }
+
+
+    /**
+     * @brief Saves the tokenizer in the compact BPETOK2 binary format.
+     *
+     * The file stores magic bytes, special-token count, merge count,
+     * pretokenization mode, special-token strings, and ordered merge triples.
+     *
+     * @param path Destination file.
+     *
+     * @throws std::runtime_error If the file cannot be opened or written.
+     * @throws std::length_error If serialized counts exceed 32-bit fields.
+     *
+     * @note Integer fields use the host's native endianness.
+     */
+    void BpeTokenizer::save_binary(const std::filesystem::path &path) const {
+        std::ofstream output(path, std::ios::binary);
+        if (!output) {
+            throw std::runtime_error("Cannot open tokenizer output file");
+        }
+
+        constexpr std::array<char, 8> magic = {'B', 'P', 'E', 'T', 'O', 'K', '2', '\0'};
+        if (special_tokens_.size() > std::numeric_limits<std::uint32_t>::max() ||
+            merges_.size() > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::length_error("Tokenizer is too large to serialize");
+        }
+        output.write(magic.data(), magic.size());
+        write_u32(output, static_cast<std::uint32_t>(special_tokens_.size()));
+        write_u32(output, static_cast<std::uint32_t>(merges_.size()));
+        write_u32(output, static_cast<std::uint32_t>(pretokenizer_mode_));
+
+        for (const std::string &token: special_tokens_) {
+            if (token.size() > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::length_error("Tokenizer special token is too large to serialize");
+            }
+            write_u32(output, static_cast<std::uint32_t>(token.size()));
+            output.write(token.data(), static_cast<std::streamsize>(token.size()));
+        }
+
+        for (const auto &[left, right, merged]: merges_) {
+            write_u32(output, left);
+            write_u32(output, right);
+            write_u32(output, merged);
+        }
+
+        if (!output) {
+            throw std::runtime_error("Cannot write tokenizer file");
         }
     }
 
-    std::string text;
-    text.reserve(decoded_size);
 
-    for (const TokenId id : ids) {
-        if (is_special(id)) {
-            text += special_tokens_[id - kByteVocabularySize];
-            continue;
+    /**
+     * @brief Exports a Hugging Face-compatible ByteLevel BPE tokenizer.json.
+     *
+     * @param path Destination JSON file.
+     *
+     * @throws std::runtime_error If the tokenizer does not use GPT-like
+     * pretokenization or if the output cannot be written.
+     */
+    void BpeTokenizer::save_huggingface_json(
+        const std::filesystem::path &path) const {
+        if (pretokenizer_mode_ != PretokenizerMode::GptLike) {
+            throw std::runtime_error(
+                "Hugging Face export currently supports only GptLike pretokenization");
         }
 
-        if (id >= token_bytes_.size()) {
-            throw std::out_of_range("Token ID is outside this tokenizer vocabulary");
+        std::array<std::uint32_t, 256> byte_to_codepoint{};
+        std::uint32_t replacement = 0;
+        for (std::uint32_t byte = 0; byte < 256; ++byte) {
+            const bool direct =
+                    (byte >= 33 && byte <= 126) ||
+                    (byte >= 161 && byte <= 172) ||
+                    (byte >= 174);
+            byte_to_codepoint[byte] =
+                    direct ? byte : 256 + replacement++;
         }
 
-        const auto& bytes = token_bytes_[id];
-        text.append(
-            reinterpret_cast<const char*>(bytes.data()),
-            bytes.size()
-        );
-    }
-
-    return text;
-}
-
-void BpeTokenizer::save(
-    const std::filesystem::path& path,
-    const TokenizerFormat format) const {
-    switch (format) {
-        case TokenizerFormat::HuggingFaceJson:
-            save_huggingface_json(path);
-            return;
-        case TokenizerFormat::Binary:
-            save_binary(path);
-            return;
-        case TokenizerFormat::Auto:
-            throw std::invalid_argument(
-                "TokenizerFormat::Auto is valid only when loading");
-    }
-    throw std::invalid_argument("Unknown tokenizer output format");
-}
-
-void BpeTokenizer::save_binary(const std::filesystem::path& path) const {
-    std::ofstream output(path, std::ios::binary);
-    if (!output) {
-        throw std::runtime_error("Cannot open tokenizer output file");
-    }
-
-    constexpr std::array<char, 8> magic = {'B', 'P', 'E', 'T', 'O', 'K', '2', '\0'};
-    if (special_tokens_.size() > std::numeric_limits<std::uint32_t>::max() ||
-        merges_.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::length_error("Tokenizer is too large to serialize");
-    }
-    output.write(magic.data(), magic.size());
-    write_u32(output, static_cast<std::uint32_t>(special_tokens_.size()));
-    write_u32(output, static_cast<std::uint32_t>(merges_.size()));
-    write_u32(output, static_cast<std::uint32_t>(pretokenizer_mode_));
-
-    for (const std::string& token : special_tokens_) {
-        if (token.size() > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::length_error("Tokenizer special token is too large to serialize");
-        }
-        write_u32(output, static_cast<std::uint32_t>(token.size()));
-        output.write(token.data(), static_cast<std::streamsize>(token.size()));
-    }
-
-    for (const auto&[left, right, merged] : merges_) {
-        write_u32(output, left);
-        write_u32(output, right);
-        write_u32(output, merged);
-    }
-
-    if (!output) {
-        throw std::runtime_error("Cannot write tokenizer file");
-    }
-}
-
-void BpeTokenizer::save_huggingface_json(
-    const std::filesystem::path& path) const {
-    if (pretokenizer_mode_ != PretokenizerMode::GptLike) {
-        throw std::runtime_error(
-            "Hugging Face export currently supports only GptLike pretokenization");
-    }
-
-    std::array<std::uint32_t, 256> byte_to_codepoint{};
-    std::uint32_t replacement = 0;
-    for (std::uint32_t byte = 0; byte < 256; ++byte) {
-        const bool direct =
-            (byte >= 33 && byte <= 126) ||
-            (byte >= 161 && byte <= 172) ||
-            (byte >= 174);
-        byte_to_codepoint[byte] =
-            direct ? byte : 256 + replacement++;
-    }
-
-    const auto append_utf8 = [](std::string& output, const std::uint32_t cp) {
-        if (cp <= 0x7F) {
-            output.push_back(static_cast<char>(cp));
-        } else if (cp <= 0x7FF) {
-            output.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-            output.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
-            output.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-            output.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-            output.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        }
-    };
-    const auto bytelevel_token =
-        [&byte_to_codepoint, &append_utf8](
-            const std::vector<std::uint8_t>& bytes) {
+        const auto append_utf8 = [](std::string &output, const std::uint32_t cp) {
+            if (cp <= 0x7F) {
+                output.push_back(static_cast<char>(cp));
+            } else if (cp <= 0x7FF) {
+                output.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                output.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else {
+                output.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                output.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                output.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+        };
+        const auto bytelevel_token =
+                [&byte_to_codepoint, &append_utf8](
+            const std::vector<std::uint8_t> &bytes) {
             std::string result;
             result.reserve(bytes.size() * 2);
-            for (const std::uint8_t byte : bytes) {
+            for (const std::uint8_t byte: bytes) {
                 append_utf8(result, byte_to_codepoint[byte]);
             }
             return result;
         };
-    const auto json_string = [](std::ostream& output, const std::string_view text) {
-        static constexpr char hex[] = "0123456789abcdef";
-        output.put('"');
-        for (const unsigned char byte : text) {
-            switch (byte) {
-                case '"': output << "\\\""; break;
-                case '\\': output << "\\\\"; break;
-                case '\b': output << "\\b"; break;
-                case '\f': output << "\\f"; break;
-                case '\n': output << "\\n"; break;
-                case '\r': output << "\\r"; break;
-                case '\t': output << "\\t"; break;
-                default:
-                    if (byte < 0x20) {
-                        output << "\\u00" << hex[byte >> 4] << hex[byte & 0x0F];
-                    } else {
-                        output.put(static_cast<char>(byte));
-                    }
+        const auto json_string = [](std::ostream &output, const std::string_view text) {
+            static constexpr char hex[] = "0123456789abcdef";
+            output.put('"');
+            for (const unsigned char byte: text) {
+                switch (byte) {
+                    case '"': output << "\\\"";
+                        break;
+                    case '\\': output << "\\\\";
+                        break;
+                    case '\b': output << "\\b";
+                        break;
+                    case '\f': output << "\\f";
+                        break;
+                    case '\n': output << "\\n";
+                        break;
+                    case '\r': output << "\\r";
+                        break;
+                    case '\t': output << "\\t";
+                        break;
+                    default:
+                        if (byte < 0x20) {
+                            output << "\\u00" << hex[byte >> 4] << hex[byte & 0x0F];
+                        } else {
+                            output.put(static_cast<char>(byte));
+                        }
+                }
             }
-        }
-        output.put('"');
-    };
+            output.put('"');
+        };
 
-    std::ofstream output(path, std::ios::binary);
-    if (!output) {
-        throw std::runtime_error(
-            "Cannot open Hugging Face tokenizer output file");
-    }
-
-    output << "{\n"
-              "  \"version\": \"1.0\",\n"
-              "  \"truncation\": null,\n"
-              "  \"padding\": null,\n"
-              "  \"added_tokens\": [";
-    for (std::size_t index = 0; index < special_tokens_.size(); ++index) {
-        if (index != 0) output << ',';
-        output << "\n    {\"id\":" << (kByteVocabularySize + index)
-               << ",\"content\":";
-        json_string(output, special_tokens_[index]);
-        output << ",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,"
-                  "\"normalized\":false,\"special\":true}";
-    }
-    if (!special_tokens_.empty()) output << '\n';
-
-
-    output << "  ],\n"
-              "  \"normalizer\": null,\n"
-              "  \"pre_tokenizer\": {\n"
-              "    \"type\":\"Sequence\",\n"
-              "    \"pretokenizers\":[\n"
-              "      {\"type\":\"Split\",\"pattern\":{\"Regex\":"
-              "\"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\\\r\\\\n\\\\p{L}\\\\p{N}]?"
-              "\\\\p{L}+|\\\\p{N}{1,3}| ?[^\\\\s\\\\p{L}\\\\p{N}]+"
-              "[\\\\r\\\\n]*|\\\\s*[\\\\r\\\\n]|\\\\s+(?!\\\\S)|\\\\s+\"},"
-              "\"behavior\":\"Isolated\",\"invert\":false},\n"
-              "      {\"type\":\"ByteLevel\",\"add_prefix_space\":false,"
-              "\"trim_offsets\":true,\"use_regex\":false}\n"
-              "    ]\n"
-              "  },\n"
-              "  \"post_processor\": null,\n"
-              "  \"decoder\": {\"type\":\"ByteLevel\",\"add_prefix_space\":false,"
-              "\"trim_offsets\":true,\"use_regex\":true},\n"
-              "  \"model\": {\n"
-              "    \"type\":\"BPE\",\"dropout\":null,\"unk_token\":null,"
-              "\"continuing_subword_prefix\":\"\",\"end_of_word_suffix\":\"\","
-              "\"fuse_unk\":false,\"byte_fallback\":false,\"ignore_merges\":false,\n"
-              "    \"vocab\": {";
-
-    bool first = true;
-    std::unordered_map<std::string, TokenId> exported_tokens;
-    exported_tokens.reserve(token_bytes_.size());
-    for (TokenId id = 0; id < token_bytes_.size(); ++id) {
-        if (is_special(id)) continue;
-        const std::string token = bytelevel_token(token_bytes_[id]);
-        if (!exported_tokens.emplace(token, id).second) {
+        std::ofstream output(path, std::ios::binary);
+        if (!output) {
             throw std::runtime_error(
-                "Cannot export duplicate token byte sequence to tokenizer.json");
+                "Cannot open Hugging Face tokenizer output file");
         }
-        if (!first) output << ',';
-        output << "\n      ";
-        json_string(output, token);
-        output << ':' << id;
-        first = false;
-    }
-    if (!first) output << '\n';
-    output << "    },\n"
-              "    \"merges\": [";
-    for (std::size_t index = 0; index < merges_.size(); ++index) {
-        const MergeRule& merge = merges_[index];
-        if (index != 0) output << ',';
-        output << "\n      [";
-        json_string(output, bytelevel_token(token_bytes_[merge.left]));
-        output << ',';
-        json_string(output, bytelevel_token(token_bytes_[merge.right]));
-        output << ']';
-    }
-    if (!merges_.empty()) output << '\n';
-    output << "    ]\n"
-              "  }\n"
-              "}\n";
 
-    if (!output) {
-        throw std::runtime_error("Cannot write Hugging Face tokenizer file");
-    }
-}
+        output << "{\n"
+                "  \"version\": \"1.0\",\n"
+                "  \"truncation\": null,\n"
+                "  \"padding\": null,\n"
+                "  \"added_tokens\": [";
+        for (std::size_t index = 0; index < special_tokens_.size(); ++index) {
+            if (index != 0) output << ',';
+            output << "\n    {\"id\":" << (kByteVocabularySize + index)
+                    << ",\"content\":";
+            json_string(output, special_tokens_[index]);
+            output << ",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,"
+                    "\"normalized\":false,\"special\":true}";
+        }
+        if (!special_tokens_.empty()) output << '\n';
 
-BpeTokenizer BpeTokenizer::load(
-    const std::filesystem::path& path,
-    TokenizerFormat format) {
-    if (format == TokenizerFormat::Auto) {
-        std::ifstream probe(path, std::ios::binary);
-        if (!probe) {
+
+        output << "  ],\n"
+                "  \"normalizer\": null,\n"
+                "  \"pre_tokenizer\": {\n"
+                "    \"type\":\"Sequence\",\n"
+                "    \"pretokenizers\":[\n"
+                "      {\"type\":\"Split\",\"pattern\":{\"Regex\":"
+                "\"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\\\r\\\\n\\\\p{L}\\\\p{N}]?"
+                "\\\\p{L}+|\\\\p{N}{1,3}| ?[^\\\\s\\\\p{L}\\\\p{N}]+"
+                "[\\\\r\\\\n]*|\\\\s*[\\\\r\\\\n]|\\\\s+(?!\\\\S)|\\\\s+\"},"
+                "\"behavior\":\"Isolated\",\"invert\":false},\n"
+                "      {\"type\":\"ByteLevel\",\"add_prefix_space\":false,"
+                "\"trim_offsets\":true,\"use_regex\":false}\n"
+                "    ]\n"
+                "  },\n"
+                "  \"post_processor\": null,\n"
+                "  \"decoder\": {\"type\":\"ByteLevel\",\"add_prefix_space\":false,"
+                "\"trim_offsets\":true,\"use_regex\":true},\n"
+                "  \"model\": {\n"
+                "    \"type\":\"BPE\",\"dropout\":null,\"unk_token\":null,"
+                "\"continuing_subword_prefix\":\"\",\"end_of_word_suffix\":\"\","
+                "\"fuse_unk\":false,\"byte_fallback\":false,\"ignore_merges\":false,\n"
+                "    \"vocab\": {";
+
+        bool first = true;
+        std::unordered_map<std::string, TokenId> exported_tokens;
+        exported_tokens.reserve(token_bytes_.size());
+        for (TokenId id = 0; id < token_bytes_.size(); ++id) {
+            if (is_special(id)) continue;
+            const std::string token = bytelevel_token(token_bytes_[id]);
+            if (!exported_tokens.emplace(token, id).second) {
+                throw std::runtime_error(
+                    "Cannot export duplicate token byte sequence to tokenizer.json");
+            }
+            if (!first) output << ',';
+            output << "\n      ";
+            json_string(output, token);
+            output << ':' << id;
+            first = false;
+        }
+        if (!first) output << '\n';
+        output << "    },\n"
+                "    \"merges\": [";
+        for (std::size_t index = 0; index < merges_.size(); ++index) {
+            const MergeRule &merge = merges_[index];
+            if (index != 0) output << ',';
+            output << "\n      [";
+            json_string(output, bytelevel_token(token_bytes_[merge.left]));
+            output << ',';
+            json_string(output, bytelevel_token(token_bytes_[merge.right]));
+            output << ']';
+        }
+        if (!merges_.empty()) output << '\n';
+        output << "    ]\n"
+                "  }\n"
+                "}\n";
+
+        if (!output) {
+            throw std::runtime_error("Cannot write Hugging Face tokenizer file");
+        }
+    }
+
+
+    /**
+     * @brief Loads a tokenizer, optionally detecting its serialization format.
+     *
+     * Auto detection treats the first non-whitespace `{` byte as Hugging Face JSON
+     * and any other leading byte as the custom binary format.
+     *
+     * @param path Tokenizer file.
+     * @param format Input format or TokenizerFormat::Auto.
+     * @return Loaded tokenizer.
+     *
+     * @throws std::runtime_error If the file cannot be read or is malformed.
+     * @throws std::invalid_argument If the requested format is unknown.
+     */
+    BpeTokenizer BpeTokenizer::load(
+        const std::filesystem::path &path,
+        TokenizerFormat format) {
+        if (format == TokenizerFormat::Auto) {
+            std::ifstream probe(path, std::ios::binary);
+            if (!probe) {
+                throw std::runtime_error("Cannot open tokenizer model file");
+            }
+            char first = 0;
+            do {
+                if (!probe.get(first)) {
+                    throw std::runtime_error("Tokenizer model file is empty");
+                }
+            } while (first == ' ' || first == '\t' || first == '\r' || first == '\n');
+            format = first == '{'
+                         ? TokenizerFormat::HuggingFaceJson
+                         : TokenizerFormat::Binary;
+        }
+        switch (format) {
+            case TokenizerFormat::HuggingFaceJson:
+                return load_huggingface_json(path);
+            case TokenizerFormat::Binary:
+                return load_binary(path);
+            case TokenizerFormat::Auto:
+                break;
+        }
+        throw std::invalid_argument("Unknown tokenizer input format");
+    }
+
+
+    /**
+     * @brief Loads BPETOK1 or BPETOK2 binary tokenizer data.
+     *
+     * Version 1 defaults to no pretokenization. Version 2 stores the configured
+     * pretokenizer. Merge IDs must be contiguous and may reference only previously
+     * defined tokens.
+     *
+     * @param path Source binary file.
+     * @return Reconstructed tokenizer.
+     *
+     * @throws std::runtime_error If magic, sizes, token data, merge ordering, or
+     * trailing data are invalid.
+     */
+    BpeTokenizer BpeTokenizer::load_binary(const std::filesystem::path &path) {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
             throw std::runtime_error("Cannot open tokenizer model file");
         }
-        char first = 0;
-        do {
-            if (!probe.get(first)) {
-                throw std::runtime_error("Tokenizer model file is empty");
+
+        constexpr std::array<char, 8> magic_v1 = {'B', 'P', 'E', 'T', 'O', 'K', '1', '\0'};
+        constexpr std::array<char, 8> magic_v2 = {'B', 'P', 'E', 'T', 'O', 'K', '2', '\0'};
+        std::array<char, 8> actual_magic{};
+        input.read(actual_magic.data(), static_cast<std::streamsize>(actual_magic.size()));
+
+        if (!input || (actual_magic != magic_v1 && actual_magic != magic_v2)) {
+            throw std::runtime_error("Invalid tokenizer file magic");
+        }
+
+        const std::uint32_t special_count = read_u32(input);
+        const std::uint32_t merge_count = read_u32(input);
+        auto pretokenizer = PretokenizerMode::None;
+        if (actual_magic == magic_v2) {
+            const std::uint32_t raw_mode = read_u32(input);
+            if (raw_mode > static_cast<std::uint32_t>(PretokenizerMode::GptLike)) {
+                throw std::runtime_error("Tokenizer file declares an unknown pretokenizer");
             }
-        } while (first == ' ' || first == '\t' || first == '\r' || first == '\n');
-        format = first == '{'
-                     ? TokenizerFormat::HuggingFaceJson
-                     : TokenizerFormat::Binary;
-    }
-    switch (format) {
-        case TokenizerFormat::HuggingFaceJson:
-            return load_huggingface_json(path);
-        case TokenizerFormat::Binary:
-            return load_binary(path);
-        case TokenizerFormat::Auto:
-            break;
-    }
-    throw std::invalid_argument("Unknown tokenizer input format");
-}
-
-BpeTokenizer BpeTokenizer::load_binary(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("Cannot open tokenizer model file");
-    }
-
-    constexpr std::array<char, 8> magic_v1 = {'B', 'P', 'E', 'T', 'O', 'K', '1', '\0'};
-    constexpr std::array<char, 8> magic_v2 = {'B', 'P', 'E', 'T', 'O', 'K', '2', '\0'};
-    std::array<char, 8> actual_magic{};
-    input.read(actual_magic.data(), static_cast<std::streamsize>(actual_magic.size()));
-
-    if (!input || (actual_magic != magic_v1 && actual_magic != magic_v2)) {
-        throw std::runtime_error("Invalid tokenizer file magic");
-    }
-
-    const std::uint32_t special_count = read_u32(input);
-    const std::uint32_t merge_count = read_u32(input);
-    auto pretokenizer = PretokenizerMode::None;
-    if (actual_magic == magic_v2) {
-        const std::uint32_t raw_mode = read_u32(input);
-        if (raw_mode > static_cast<std::uint32_t>(PretokenizerMode::GptLike)) {
-            throw std::runtime_error("Tokenizer file declares an unknown pretokenizer");
-        }
-        pretokenizer = static_cast<PretokenizerMode>(raw_mode);
-    }
-
-    if (special_count > 1'000'000 || merge_count > 10'000'000) {
-        throw std::runtime_error("Tokenizer file declares unreasonable sizes");
-    }
-    if (static_cast<std::uint64_t>(kByteVocabularySize) + special_count + merge_count >
-        std::numeric_limits<TokenId>::max()) {
-        throw std::runtime_error("Tokenizer file vocabulary exceeds TokenId limit");
-    }
-
-    std::vector<std::string> special_tokens;
-    special_tokens.reserve(special_count);
-
-    for (std::uint32_t i = 0; i < special_count; ++i) {
-        const std::uint32_t size = read_u32(input);
-        if (size > 1'000'000) {
-            throw std::runtime_error("Tokenizer special token is too large");
+            pretokenizer = static_cast<PretokenizerMode>(raw_mode);
         }
 
-        std::string token(size, '\0');
-        input.read(token.data(), size);
+        if (special_count > 1'000'000 || merge_count > 10'000'000) {
+            throw std::runtime_error("Tokenizer file declares unreasonable sizes");
+        }
+        if (static_cast<std::uint64_t>(kByteVocabularySize) + special_count + merge_count >
+            std::numeric_limits<TokenId>::max()) {
+            throw std::runtime_error("Tokenizer file vocabulary exceeds TokenId limit");
+        }
+
+        std::vector<std::string> special_tokens;
+        special_tokens.reserve(special_count);
+
+        for (std::uint32_t i = 0; i < special_count; ++i) {
+            const std::uint32_t size = read_u32(input);
+            if (size > 1'000'000) {
+                throw std::runtime_error("Tokenizer special token is too large");
+            }
+
+            std::string token(size, '\0');
+            input.read(token.data(), size);
+            if (!input) {
+                throw std::runtime_error("Unexpected end of tokenizer special token");
+            }
+            special_tokens.push_back(std::move(token));
+        }
+
+        BpeTokenizer tokenizer(std::move(special_tokens), pretokenizer);
+        tokenizer.merges_.reserve(merge_count);
+        tokenizer.token_bytes_.reserve(
+            kByteVocabularySize + special_count + merge_count);
+        tokenizer.merge_lookup_.reserve(merge_count);
+        for (std::uint32_t i = 0; i < merge_count; ++i) {
+            const TokenId left = read_u32(input);
+            const TokenId right = read_u32(input);
+            const TokenId merged = read_u32(input);
+
+            if (merged != tokenizer.vocab_size()) {
+                throw std::runtime_error("Tokenizer merge IDs are not contiguous");
+            }
+            if (left >= merged || right >= merged) {
+                throw std::runtime_error("Tokenizer merge references a future token");
+            }
+
+            tokenizer.add_merge(left, right);
+        }
+        tokenizer.rebuild_fast_merge_lookup();
+
+        char trailing = 0;
+        input.read(&trailing, 1);
+        if (input.gcount() != 0) {
+            throw std::runtime_error("Tokenizer file contains trailing data");
+        }
+
+        return tokenizer;
+    }
+
+
+    /**
+     * @brief Loads a compatible Hugging Face ByteLevel BPE tokenizer.json.
+     *
+     * The loader requires byte token IDs 0 through 255 to match the expected
+     * ByteLevel alphabet. Special tokens must immediately follow the byte
+     * vocabulary, and merge result IDs must be contiguous in rank order.
+     *
+     * @param path Source tokenizer.json file.
+     * @return Reconstructed tokenizer using GPT-like pretokenization.
+     *
+     * @throws std::runtime_error If JSON syntax or tokenizer structure is invalid.
+     */
+    BpeTokenizer BpeTokenizer::load_huggingface_json(
+        const std::filesystem::path &path) {
+        std::ifstream input(path, std::ios::binary);
         if (!input) {
-            throw std::runtime_error("Unexpected end of tokenizer special token");
+            throw std::runtime_error("Cannot open Hugging Face tokenizer model file");
         }
-        special_tokens.push_back(std::move(token));
+        const std::string json{
+            std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()
+        };
+        const JsonValue root = JsonParser(json).parse();
+        const JsonValue &model = root.member("model");
+        const JsonValue &type = model.member("type");
+        if (type.type != JsonValue::Type::String || type.string != "BPE") {
+            throw std::runtime_error("tokenizer.json model is not BPE");
+        }
+
+        const JsonValue &added = root.member("added_tokens");
+        if (added.type != JsonValue::Type::Array) {
+            throw std::runtime_error("tokenizer.json added_tokens must be an array");
+        }
+        std::vector<std::pair<TokenId, std::string> > specials;
+        for (const JsonValue &entry: added.array) {
+            const JsonValue &special = entry.member("special");
+            if (special.type != JsonValue::Type::Boolean || !special.boolean) continue;
+            const JsonValue &id = entry.member("id");
+            const JsonValue &content = entry.member("content");
+            if (id.type != JsonValue::Type::Number ||
+                id.number > std::numeric_limits<TokenId>::max() ||
+                content.type != JsonValue::Type::String) {
+                throw std::runtime_error("Invalid special token in tokenizer.json");
+            }
+            specials.emplace_back(
+                static_cast<TokenId>(id.number), content.string);
+        }
+        std::ranges::sort(specials);
+        std::vector<std::string> special_tokens;
+        special_tokens.reserve(specials.size());
+        for (std::size_t index = 0; index < specials.size(); ++index) {
+            if (specials[index].first != kByteVocabularySize + index) {
+                throw std::runtime_error(
+                    "tokenizer.json special token IDs must immediately follow "
+                    "the 256 byte tokens");
+            }
+            special_tokens.push_back(std::move(specials[index].second));
+        }
+
+        const JsonValue &vocab = model.member("vocab");
+        if (vocab.type != JsonValue::Type::Object) {
+            throw std::runtime_error("tokenizer.json vocab must be an object");
+        }
+        std::unordered_map<std::string, TokenId> token_ids;
+        token_ids.reserve(vocab.object.size());
+        for (const auto &[token, id]: vocab.object) {
+            if (id.type != JsonValue::Type::Number ||
+                id.number > std::numeric_limits<TokenId>::max()) {
+                throw std::runtime_error("Invalid vocabulary ID in tokenizer.json");
+            }
+            token_ids.emplace(token, static_cast<TokenId>(id.number));
+        }
+        const auto alphabet = bytelevel_alphabet();
+        for (TokenId byte = 0; byte < kByteVocabularySize; ++byte) {
+            const auto found = token_ids.find(alphabet[byte]);
+            if (found == token_ids.end() || found->second != byte) {
+                throw std::runtime_error(
+                    "tokenizer.json does not use CGPT-compatible byte token IDs");
+            }
+        }
+
+        BpeTokenizer tokenizer(std::move(special_tokens), PretokenizerMode::GptLike);
+        const JsonValue &merges = model.member("merges");
+        if (merges.type != JsonValue::Type::Array) {
+            throw std::runtime_error("tokenizer.json merges must be an array");
+        }
+        tokenizer.merges_.reserve(merges.array.size());
+        tokenizer.token_bytes_.reserve(tokenizer.vocab_size() + merges.array.size());
+        tokenizer.merge_lookup_.reserve(merges.array.size());
+        for (const JsonValue &entry: merges.array) {
+            if (entry.type != JsonValue::Type::Array || entry.array.size() != 2 ||
+                entry.array[0].type != JsonValue::Type::String ||
+                entry.array[1].type != JsonValue::Type::String) {
+                throw std::runtime_error(
+                    "tokenizer.json merge must be a two-string array");
+            }
+            const auto left = token_ids.find(entry.array[0].string);
+            const auto right = token_ids.find(entry.array[1].string);
+            const auto merged =
+                    token_ids.find(entry.array[0].string + entry.array[1].string);
+            if (left == token_ids.end() || right == token_ids.end() ||
+                merged == token_ids.end()) {
+                throw std::runtime_error(
+                    "tokenizer.json merge references an unknown token");
+            }
+            if (merged->second != tokenizer.vocab_size()) {
+                throw std::runtime_error(
+                    "tokenizer.json merge IDs are not contiguous in rank order");
+            }
+            tokenizer.add_merge(left->second, right->second);
+        }
+        tokenizer.rebuild_fast_merge_lookup();
+        return tokenizer;
     }
 
-    BpeTokenizer tokenizer(std::move(special_tokens), pretokenizer);
-    tokenizer.merges_.reserve(merge_count);
-    tokenizer.token_bytes_.reserve(
-        kByteVocabularySize + special_count + merge_count);
-    tokenizer.merge_lookup_.reserve(merge_count);
-    for (std::uint32_t i = 0; i < merge_count; ++i) {
-        const TokenId left = read_u32(input);
-        const TokenId right = read_u32(input);
-        const TokenId merged = read_u32(input);
 
-        if (merged != tokenizer.vocab_size()) {
-            throw std::runtime_error("Tokenizer merge IDs are not contiguous");
+    /**
+     * @brief Returns the total number of byte, special, and merged tokens.
+     *
+     * @return Current vocabulary size.
+     */
+    std::size_t BpeTokenizer::vocab_size() const noexcept {
+        return token_bytes_.size();
+    }
+
+
+    /**
+     * @brief Returns learned merge rules in rank order.
+     *
+     * @return Read-only merge-rule vector.
+     */
+    const std::vector<MergeRule> &BpeTokenizer::merges() const noexcept {
+        return merges_;
+    }
+
+
+    /**
+     * @brief Returns configured special-token strings.
+     *
+     * @return Read-only special-token vector.
+     */
+    const std::vector<std::string> &BpeTokenizer::special_tokens() const noexcept {
+        return special_tokens_;
+    }
+
+
+    /**
+     * @brief Finds the token ID assigned to a special-token string.
+     *
+     * @param token Special-token spelling.
+     * @return Assigned ID, or std::nullopt when not configured.
+     */
+    std::optional<TokenId> BpeTokenizer::special_token_id(const std::string_view token) const noexcept {
+        for (std::size_t index = 0; index < special_tokens_.size(); ++index) {
+            if (special_tokens_[index] == token) {
+                return kByteVocabularySize + static_cast<TokenId>(index);
+            }
         }
+        return std::nullopt;
+    }
+
+
+    /**
+     * @brief Returns the tokenizer's pretokenization mode.
+     *
+     * @return Active pretokenizer mode.
+     */
+    PretokenizerMode BpeTokenizer::pretokenizer_mode() const noexcept {
+        return pretokenizer_mode_;
+    }
+
+
+    /**
+     * @brief Appends one merge rule and materializes its byte sequence.
+     *
+     * The new token ID is the current vocabulary size.
+     *
+     * @param left Existing left token.
+     * @param right Existing right token.
+     *
+     * @throws std::invalid_argument If either input token is unknown or the pair is
+     * already present.
+     */
+    void BpeTokenizer::add_merge(const TokenId left, const TokenId right) {
+        const auto merged = static_cast<TokenId>(token_bytes_.size());
         if (left >= merged || right >= merged) {
-            throw std::runtime_error("Tokenizer merge references a future token");
+            throw std::invalid_argument("BPE merge references an unknown token");
         }
 
-        tokenizer.add_merge(left, right);
-    }
-    tokenizer.rebuild_fast_merge_lookup();
-
-    char trailing = 0;
-    input.read(&trailing, 1);
-    if (input.gcount() != 0) {
-        throw std::runtime_error("Tokenizer file contains trailing data");
-    }
-
-    return tokenizer;
-}
-
-BpeTokenizer BpeTokenizer::load_huggingface_json(
-    const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("Cannot open Hugging Face tokenizer model file");
-    }
-    const std::string json{
-        std::istreambuf_iterator<char>(input),
-        std::istreambuf_iterator<char>()};
-    const JsonValue root = JsonParser(json).parse();
-    const JsonValue& model = root.member("model");
-    const JsonValue& type = model.member("type");
-    if (type.type != JsonValue::Type::String || type.string != "BPE") {
-        throw std::runtime_error("tokenizer.json model is not BPE");
-    }
-
-    const JsonValue& added = root.member("added_tokens");
-    if (added.type != JsonValue::Type::Array) {
-        throw std::runtime_error("tokenizer.json added_tokens must be an array");
-    }
-    std::vector<std::pair<TokenId, std::string>> specials;
-    for (const JsonValue& entry : added.array) {
-        const JsonValue& special = entry.member("special");
-        if (special.type != JsonValue::Type::Boolean || !special.boolean) continue;
-        const JsonValue& id = entry.member("id");
-        const JsonValue& content = entry.member("content");
-        if (id.type != JsonValue::Type::Number ||
-            id.number > std::numeric_limits<TokenId>::max() ||
-            content.type != JsonValue::Type::String) {
-            throw std::runtime_error("Invalid special token in tokenizer.json");
+        const PairKey key = pair_key(left, right);
+        if (merge_lookup_.contains(key)) {
+            throw std::invalid_argument("BPE merge pair is duplicated");
         }
-        specials.emplace_back(
-            static_cast<TokenId>(id.number), content.string);
-    }
-    std::ranges::sort(specials);
-    std::vector<std::string> special_tokens;
-    special_tokens.reserve(specials.size());
-    for (std::size_t index = 0; index < specials.size(); ++index) {
-        if (specials[index].first != kByteVocabularySize + index) {
-            throw std::runtime_error(
-                "tokenizer.json special token IDs must immediately follow "
-                "the 256 byte tokens");
-        }
-        special_tokens.push_back(std::move(specials[index].second));
-    }
 
-    const JsonValue& vocab = model.member("vocab");
-    if (vocab.type != JsonValue::Type::Object) {
-        throw std::runtime_error("tokenizer.json vocab must be an object");
-    }
-    std::unordered_map<std::string, TokenId> token_ids;
-    token_ids.reserve(vocab.object.size());
-    for (const auto& [token, id] : vocab.object) {
-        if (id.type != JsonValue::Type::Number ||
-            id.number > std::numeric_limits<TokenId>::max()) {
-            throw std::runtime_error("Invalid vocabulary ID in tokenizer.json");
-        }
-        token_ids.emplace(token, static_cast<TokenId>(id.number));
-    }
-    const auto alphabet = bytelevel_alphabet();
-    for (TokenId byte = 0; byte < kByteVocabularySize; ++byte) {
-        const auto found = token_ids.find(alphabet[byte]);
-        if (found == token_ids.end() || found->second != byte) {
-            throw std::runtime_error(
-                "tokenizer.json does not use CGPT-compatible byte token IDs");
-        }
-    }
-
-    BpeTokenizer tokenizer(std::move(special_tokens), PretokenizerMode::GptLike);
-    const JsonValue& merges = model.member("merges");
-    if (merges.type != JsonValue::Type::Array) {
-        throw std::runtime_error("tokenizer.json merges must be an array");
-    }
-    tokenizer.merges_.reserve(merges.array.size());
-    tokenizer.token_bytes_.reserve(tokenizer.vocab_size() + merges.array.size());
-    tokenizer.merge_lookup_.reserve(merges.array.size());
-    for (const JsonValue& entry : merges.array) {
-        if (entry.type != JsonValue::Type::Array || entry.array.size() != 2 ||
-            entry.array[0].type != JsonValue::Type::String ||
-            entry.array[1].type != JsonValue::Type::String) {
-            throw std::runtime_error(
-                "tokenizer.json merge must be a two-string array");
-        }
-        const auto left = token_ids.find(entry.array[0].string);
-        const auto right = token_ids.find(entry.array[1].string);
-        const auto merged =
-            token_ids.find(entry.array[0].string + entry.array[1].string);
-        if (left == token_ids.end() || right == token_ids.end() ||
-            merged == token_ids.end()) {
-            throw std::runtime_error(
-                "tokenizer.json merge references an unknown token");
-        }
-        if (merged->second != tokenizer.vocab_size()) {
-            throw std::runtime_error(
-                "tokenizer.json merge IDs are not contiguous in rank order");
-        }
-        tokenizer.add_merge(left->second, right->second);
-    }
-    tokenizer.rebuild_fast_merge_lookup();
-    return tokenizer;
-}
-
-std::size_t BpeTokenizer::vocab_size() const noexcept {
-    return token_bytes_.size();
-}
-
-const std::vector<MergeRule>& BpeTokenizer::merges() const noexcept {
-    return merges_;
-}
-
-const std::vector<std::string>& BpeTokenizer::special_tokens() const noexcept {
-    return special_tokens_;
-}
-
-std::optional<TokenId> BpeTokenizer::special_token_id(const std::string_view token) const noexcept {
-    for (std::size_t index = 0; index < special_tokens_.size(); ++index) {
-        if (special_tokens_[index] == token) {
-            return kByteVocabularySize + static_cast<TokenId>(index);
-        }
-    }
-    return std::nullopt;
-}
-
-PretokenizerMode BpeTokenizer::pretokenizer_mode() const noexcept {
-    return pretokenizer_mode_;
-}
-
-void BpeTokenizer::add_merge(const TokenId left, const TokenId right) {
-    const auto merged = static_cast<TokenId>(token_bytes_.size());
-    if (left >= merged || right >= merged) {
-        throw std::invalid_argument("BPE merge references an unknown token");
-    }
-
-    const PairKey key = pair_key(left, right);
-    if (merge_lookup_.contains(key)) {
-        throw std::invalid_argument("BPE merge pair is duplicated");
-    }
-
-    std::vector<std::uint8_t> bytes = token_bytes_[left];
-    bytes.insert(bytes.end(), token_bytes_[right].begin(), token_bytes_[right].end());
-    merges_.push_back({.left = left, .right = right, .merged = merged});
-    token_bytes_.push_back(std::move(bytes));
-    merge_lookup_.emplace(key, merged);
-}
-
-void BpeTokenizer::rebuild_fast_merge_lookup() {
-    constexpr unsigned id_bits = 21;
-    constexpr TokenId id_limit = TokenId{1} << id_bits;
-    constexpr TokenId missing = std::numeric_limits<TokenId>::max();
-    constexpr std::uint64_t empty = std::numeric_limits<std::uint64_t>::max();
-
-    packed_merge_lookup_.clear();
-    packed_merge_mask_ = 0;
-    packed_merge_shift_ = 0;
-    dense_merge_lookup_.clear();
-    dense_merge_bits_ = 0;
-    if (merges_.empty() || token_bytes_.size() > id_limit) {
-        return;
+        std::vector<std::uint8_t> bytes = token_bytes_[left];
+        bytes.insert(bytes.end(), token_bytes_[right].begin(), token_bytes_[right].end());
+        merges_.push_back({.left = left, .right = right, .merged = merged});
+        token_bytes_.push_back(std::move(bytes));
+        merge_lookup_.emplace(key, merged);
     }
 
 
-    constexpr unsigned dense_bits = 10;
-    constexpr std::size_t dense_side = std::size_t{1} << dense_bits;
-    dense_merge_lookup_.assign(dense_side * dense_side, missing);
-    dense_merge_bits_ = dense_bits;
-    for (const MergeRule& merge : merges_) {
-        if (((merge.left | merge.right) >> dense_bits) == 0) {
-            dense_merge_lookup_[
-                (static_cast<std::size_t>(merge.left) << dense_bits) |
-                merge.right] = merge.merged;
-        }
-    }
+    /**
+     * @brief Rebuilds dense and packed acceleration tables for merge lookup.
+     *
+     * Pairs whose IDs fit in 10 bits use a dense 1024-by-1024 table. Remaining
+     * pairs use a packed 21-bit open-addressing table when the vocabulary permits.
+     * The implementation falls back to the general hash map if compact-table
+     * constraints cannot be satisfied.
+     */
+    void BpeTokenizer::rebuild_fast_merge_lookup() {
+        constexpr unsigned id_bits = 21;
+        constexpr TokenId id_limit = TokenId{1} << id_bits;
+        constexpr TokenId missing = std::numeric_limits<TokenId>::max();
+        constexpr std::uint64_t empty = std::numeric_limits<std::uint64_t>::max();
 
-    const auto packed_merge_count = static_cast<std::size_t>(
-        std::ranges::count_if(merges_, [](const MergeRule& merge) {
-            return ((merge.left | merge.right) >> dense_bits) != 0;
-        }));
-    if (packed_merge_count == 0) {
-        return;
-    }
-
-    const std::size_t slot_count = std::max<std::size_t>(
-        64, std::bit_ceil(packed_merge_count * 2));
-    packed_merge_lookup_.assign(slot_count, empty);
-    packed_merge_mask_ = slot_count - 1;
-    packed_merge_shift_ = 64U - std::countr_zero(slot_count);
-
-    for (const MergeRule& merge : merges_) {
-        if (((merge.left | merge.right) >> dense_bits) == 0) {
-            continue;
-        }
-        if (merge.left >= id_limit || merge.right >= id_limit ||
-            merge.merged >= id_limit) {
-            dense_merge_lookup_.clear();
-            dense_merge_bits_ = 0;
-            packed_merge_lookup_.clear();
-            packed_merge_mask_ = 0;
-            packed_merge_shift_ = 0;
+        packed_merge_lookup_.clear();
+        packed_merge_mask_ = 0;
+        packed_merge_shift_ = 0;
+        dense_merge_lookup_.clear();
+        dense_merge_bits_ = 0;
+        if (merges_.empty() || token_bytes_.size() > id_limit) {
             return;
         }
 
-        const std::uint64_t key =
-            (static_cast<std::uint64_t>(merge.left) << id_bits) | merge.right;
-        auto index = key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_;
-        std::size_t displacement = 0;
-        while (packed_merge_lookup_[index] != empty) {
-            index = (index + 1) & packed_merge_mask_;
-            if (++displacement > 64) {
+
+        constexpr unsigned dense_bits = 10;
+        constexpr std::size_t dense_side = std::size_t{1} << dense_bits;
+        dense_merge_lookup_.assign(dense_side * dense_side, missing);
+        dense_merge_bits_ = dense_bits;
+        for (const MergeRule &merge: merges_) {
+            if (((merge.left | merge.right) >> dense_bits) == 0) {
+                dense_merge_lookup_[
+                    (static_cast<std::size_t>(merge.left) << dense_bits) |
+                    merge.right] = merge.merged;
+            }
+        }
+
+        const auto packed_merge_count = static_cast<std::size_t>(
+            std::ranges::count_if(merges_, [](const MergeRule &merge) {
+                return ((merge.left | merge.right) >> dense_bits) != 0;
+            }));
+        if (packed_merge_count == 0) {
+            return;
+        }
+
+        const std::size_t slot_count = std::max<std::size_t>(
+            64, std::bit_ceil(packed_merge_count * 2));
+        packed_merge_lookup_.assign(slot_count, empty);
+        packed_merge_mask_ = slot_count - 1;
+        packed_merge_shift_ = 64U - std::countr_zero(slot_count);
+
+        for (const MergeRule &merge: merges_) {
+            if (((merge.left | merge.right) >> dense_bits) == 0) {
+                continue;
+            }
+            if (merge.left >= id_limit || merge.right >= id_limit ||
+                merge.merged >= id_limit) {
+                dense_merge_lookup_.clear();
+                dense_merge_bits_ = 0;
                 packed_merge_lookup_.clear();
                 packed_merge_mask_ = 0;
                 packed_merge_shift_ = 0;
                 return;
             }
+
+            const std::uint64_t key =
+                    (static_cast<std::uint64_t>(merge.left) << id_bits) | merge.right;
+            auto index = key * 0x9E37'79B9'7F4A'7C15ULL >> packed_merge_shift_;
+            std::size_t displacement = 0;
+            while (packed_merge_lookup_[index] != empty) {
+                index = (index + 1) & packed_merge_mask_;
+                if (++displacement > 64) {
+                    packed_merge_lookup_.clear();
+                    packed_merge_mask_ = 0;
+                    packed_merge_shift_ = 0;
+                    return;
+                }
+            }
+            packed_merge_lookup_[index] = (key << id_bits) | merge.merged;
         }
-        packed_merge_lookup_[index] = (key << id_bits) | merge.merged;
     }
-}
 
-void BpeTokenizer::rebuild_token_bytes() {
-    token_bytes_.clear();
-    token_bytes_.reserve(kByteVocabularySize + special_tokens_.size() + merges_.size());
-    for (TokenId byte = 0; byte < kByteVocabularySize; ++byte) {
-        token_bytes_.push_back({static_cast<std::uint8_t>(byte)});
+
+    /**
+     * @brief Resets derived vocabulary and lookup data to byte and special tokens.
+     *
+     * The base 256 token entries are reconstructed as single-byte sequences.
+     * Learned merge storage itself is not modified by this helper.
+     */
+    void BpeTokenizer::rebuild_token_bytes() {
+        token_bytes_.clear();
+        token_bytes_.reserve(kByteVocabularySize + special_tokens_.size() + merges_.size());
+        for (TokenId byte = 0; byte < kByteVocabularySize; ++byte) {
+            token_bytes_.push_back({static_cast<std::uint8_t>(byte)});
+        }
+        token_bytes_.resize(kByteVocabularySize + special_tokens_.size());
+        merge_lookup_.clear();
+        dense_merge_lookup_.clear();
+        dense_merge_bits_ = 0;
+        packed_merge_lookup_.clear();
+        packed_merge_mask_ = 0;
+        packed_merge_shift_ = 0;
     }
-    token_bytes_.resize(kByteVocabularySize + special_tokens_.size());
-    merge_lookup_.clear();
-    dense_merge_lookup_.clear();
-    dense_merge_bits_ = 0;
-    packed_merge_lookup_.clear();
-    packed_merge_mask_ = 0;
-    packed_merge_shift_ = 0;
-}
 
-bool BpeTokenizer::is_special(const TokenId id) const noexcept {
-    return id >= kByteVocabularySize &&
-           id < kByteVocabularySize + special_tokens_.size();
-}
+
+    /**
+     * @brief Tests whether a token ID belongs to the special-token interval.
+     *
+     * @param id Token identifier.
+     * @return True when @p id represents a configured special token.
+     */
+    bool BpeTokenizer::is_special(const TokenId id) const noexcept {
+        return id >= kByteVocabularySize &&
+               id < kByteVocabularySize + special_tokens_.size();
+    }
 }
