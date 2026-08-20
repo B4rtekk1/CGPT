@@ -36,7 +36,7 @@ namespace {
         const float value = sum / float(hidden) + eps;
         __m128 x = _mm_rsqrt_ss(_mm_set_ss(value));
         // One Newton-Raphson refinement: x <- x * (3 - value*x*x) / 2.
-        x = _mm_mul_ss(x, _mm_mul_ss(_mm_set_ss(1.5f),
+        x = _mm_mul_ss(x, _mm_mul_ss(_mm_set_ss(0.5f),
                                      _mm_sub_ss(_mm_set_ss(3.0f), _mm_mul_ss(_mm_set_ss(value), _mm_mul_ss(x, x)))));
         return _mm_cvtss_f32(x);
     }

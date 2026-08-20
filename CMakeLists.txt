@@ -88,11 +88,12 @@ add_cgpt_test(transformer_block_test tests/transformer_block_test.cu cgpt_core)
 add_cgpt_test(transformer_model_test tests/transformer_model_test.cu cgpt_core)
 add_cgpt_test(adamw_test tests/adamw_test.cu cgpt_core)
 add_cgpt_test(fp16_numerical_stability_test tests/fp16_numerical_stability_test.cu cgpt_core)
+add_cgpt_test(cpu_ops_numerical_test tests/cpu_ops_numerical_test.cpp cgpt_core)
 add_cgpt_test(dataset_loader_test tests/dataset_loader_test.cpp cgpt_core)
 add_cgpt_test(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp cgpt_tokenizer)
 add_cgpt_test(bpe_tokenizer_100mb_test tests/bpe_tokenizer_100mb_test.cpp cgpt_tokenizer)
 add_executable(run_all_tests tests/run_all_tests.cpp)
-add_dependencies(run_all_tests rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test cut_cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test fp16_numerical_stability_test dataset_loader_test bpe_tokenizer_test bpe_tokenizer_100mb_test)
+add_dependencies(run_all_tests rmsnorm_test linear_test linear_backward_test swiglu_test rope_test tensor_test device_buffer_test dtype_test flash_attention_test embedding_test cross_entropy_test cut_cross_entropy_test softmax_test cuda_graph_test cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test fp16_numerical_stability_test cpu_ops_numerical_test dataset_loader_test bpe_tokenizer_test bpe_tokenizer_100mb_test)
 add_executable(cgpt_train train/train.cpp)
 target_link_libraries(cgpt_train PRIVATE cgpt_core cgpt_tokenizer CUDA::cudart)
 set_target_properties(cgpt_train PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
@@ -110,6 +111,7 @@ set_tests_properties(
         flash_attention_test embedding_test cross_entropy_test cut_cross_entropy_test softmax_test cuda_graph_test
         cuda_benchmark_test kv_cache_test transformer_block_test transformer_model_test adamw_test
         fp16_numerical_stability_test dataset_loader_test bpe_tokenizer_test
+        cpu_ops_numerical_test
         PROPERTIES TIMEOUT 30)
 set_tests_properties(cross_entropy_test softmax_test PROPERTIES TIMEOUT 60)
 set_tests_properties(bpe_tokenizer_100mb_test PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77
