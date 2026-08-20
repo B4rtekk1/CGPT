@@ -1,3 +1,11 @@
+/**
+ * @file generation_cpu.cpp
+ * @brief CPU implementation of autoregressive Transformer text generation.
+ *
+ * This translation unit performs complete Transformer forward passes on CPU,
+ * applies configurable logits-processing and sampling rules, and exposes token-
+ * and text-level generation entry points.
+ */
 #include "core/generation.h"
 #include "ops/cpu/embedding_cpu.h"
 #include "ops/cpu/linear_cpu.h"
@@ -15,6 +23,18 @@
 #include <stdexcept>
 
 namespace {
+    /**
+     * @brief Copies the complete contents of one CPU tensor into another.
+     *
+     * The tensors must have identical storage sizes and data types. This helper
+     * performs a raw byte copy and therefore assumes compatible tensor layouts.
+     *
+     * @param dst Destination tensor.
+     * @param src Source tensor.
+     *
+     * @throws std::invalid_argument If the tensors differ in size or type, or
+     *         if either tensor is not CPU-resident.
+     */
     void copy_tensor(Tensor &dst, const Tensor &src) {
         if (dst.nbytes() != src.nbytes() || dst.dtype() != src.dtype() ||
             dst.device_type() != DeviceType::CPU || src.device_type() != DeviceType::CPU) {
@@ -23,6 +43,19 @@ namespace {
         std::memcpy(dst.raw_data(), src.raw_data(), src.nbytes());
     }
 
+    /**
+     * @brief Adds a tensor to another tensor in place.
+     *
+     * For F32 tensors the operation is performed directly on CPU memory. Other
+     * supported floating-point formats are converted through temporary F32 host
+     * buffers before the result is written back.
+     *
+     * @param[in,out] a Tensor receiving the element-wise sum.
+     * @param b Tensor added to @p a.
+     *
+     * @throws std::invalid_argument If tensor shapes, data types, or devices do
+     *         not match, or if either tensor is not CPU-resident.
+     */
     void add(Tensor &a, const Tensor &b) {
         if (a.shape() != b.shape() || a.dtype() != b.dtype() ||
             a.device_type() != DeviceType::CPU || b.device_type() != DeviceType::CPU) {
@@ -41,6 +74,14 @@ namespace {
         a.copy_from_host(av);
     }
 
+    /**
+     * @brief Validates generation sampling parameters.
+     *
+     * @param o Sampling and logits-processing options to validate.
+     *
+     * @throws std::invalid_argument If any sampling parameter is non-finite or
+     *         outside its supported range.
+     */
     void validate_sampling(const GenerationOptions &o) {
         if (!std::isfinite(o.temperature) || o.temperature < 0.0F)
             throw std::invalid_argument("temperature must be finite and non-negative");
@@ -55,6 +96,25 @@ namespace {
             throw std::invalid_argument("min_p must be in [0, 1]");
     }
 
+    /**
+     * @brief Selects the next token from a vector of vocabulary logits.
+     *
+     * The function applies repetition, presence, and frequency penalties,
+     * optional no-repeat n-gram masking, top-k filtering, min-p filtering, and
+     * nucleus sampling. A temperature of zero enables deterministic greedy
+     * selection after logits processing.
+     *
+     * @param logits Logits for every token in the vocabulary.
+     * @param ctx Complete generated-token context used by repetition penalties
+     *        and no-repeat n-gram masking.
+     * @param o Sampling configuration.
+     * @param rng Random-number generator used for stochastic sampling.
+     * @return Identifier of the selected token.
+     *
+     * @throws std::invalid_argument If @p logits is empty or sampling options
+     *         are invalid.
+     * @throws std::runtime_error If logits processing removes every token.
+     */
     bpe::TokenId sample(const std::vector<float> &logits, const std::vector<bpe::TokenId> &ctx,
                         const GenerationOptions &o, std::mt19937_64 &rng) {
         if (logits.empty()) throw std::invalid_argument("cannot sample from empty logits");
@@ -137,6 +197,22 @@ namespace {
         return static_cast<bpe::TokenId>(ids[distribution(rng)]);
     }
 
+    /**
+     * @brief Executes a full CPU Transformer forward pass for a token sequence.
+     *
+     * Each decoder layer applies pre-normalized grouped-query attention with
+     * rotary position embeddings, followed by a pre-normalized SwiGLU feed-
+     * forward network and residual additions. The final normalized hidden states
+     * are projected through the language-model head.
+     *
+     * @param[out] logits Output tensor with shape
+     *        `[sequence_length, vocabulary_size]`.
+     * @param ids Input token identifiers.
+     * @param w CPU-resident Transformer weights.
+     * @param o Transformer architecture options.
+     * @param co Precomputed RoPE cosine cache.
+     * @param si Precomputed RoPE sine cache.
+     */
     void forward(Tensor &logits, const std::vector<bpe::TokenId> &ids, const TransformerModelWeights &w,
                  const TransformerModelOptions &o, const Tensor &co, const Tensor &si) {
         const auto S = ids.size(), H = o.block_options.hidden_size, Q = o.block_options.num_query_heads, KV = o.
@@ -196,6 +272,27 @@ namespace {
     }
 }
 
+/**
+ * @brief Generates token identifiers autoregressively on the CPU.
+ *
+ * On every generation step, the function retains at most
+ * `GenerationOptions::max_context_tokens` recent tokens, recomputes model
+ * logits for that context, and samples one new token. Generation stops after
+ * the configured token limit or when the optional EOS token is produced.
+ *
+ * @param prompt Initial prompt token identifiers. Must not be empty.
+ * @param w CPU-resident Transformer weights.
+ * @param co Precomputed RoPE cosine cache with sufficient sequence capacity.
+ * @param si Precomputed RoPE sine cache matching @p co.
+ * @param o Transformer architecture options.
+ * @param go Generation and sampling options.
+ * @return The prompt followed by all generated token identifiers.
+ *
+ * @throws std::invalid_argument If the prompt is empty, the context limit is
+ *         zero, RoPE caches are incompatible, model weights are not suitable
+ *         for CPU execution, or sampling options are invalid.
+ * @throws std::runtime_error If logits processing leaves no valid token.
+ */
 std::vector<bpe::TokenId> generate_tokens_cpu(
     const std::vector<bpe::TokenId> &prompt, const TransformerModelWeights &w,
     const Tensor &co, const Tensor &si, const TransformerModelOptions &o,
@@ -221,12 +318,12 @@ std::vector<bpe::TokenId> generate_tokens_cpu(
         const std::size_t begin = result.size() > go.max_context_tokens
                                       ? result.size() - go.max_context_tokens
                                       : 0;
-        const std::vector<bpe::TokenId> ctx(result.begin() + begin, result.end());
+        const std::vector<bpe::TokenId> ctx(result.begin() + static_cast<long long>(begin), result.end());
         Tensor logits({ctx.size(), o.vocabulary_size}, w.token_embedding.dtype(), DeviceType::CPU);
         forward(logits, ctx, w, o, co, si);
         std::vector<float> host(logits.numel());
         logits.copy_to_host(host);
-        const std::vector<float> last(host.end() - o.vocabulary_size, host.end());
+        const std::vector<float> last(host.end() - static_cast<long long>(o.vocabulary_size), host.end());
         const auto next = sample(last, result, go, rng);
         result.push_back(next);
         if (go.eos_token_id && next == *go.eos_token_id) break;
@@ -234,6 +331,26 @@ std::vector<bpe::TokenId> generate_tokens_cpu(
     return result;
 }
 
+/**
+ * @brief Generates decoded text and token-count statistics on the CPU.
+ *
+ * If no EOS identifier is supplied, the tokenizer is queried for common EOS
+ * special-token spellings. The prompt is then encoded, passed to
+ * generate_tokens_cpu(), and the complete token sequence is decoded.
+ *
+ * @param tok Tokenizer used to encode the prompt and decode generated tokens.
+ * @param prompt Input text prompt.
+ * @param w CPU-resident Transformer weights.
+ * @param co Precomputed RoPE cosine cache.
+ * @param si Precomputed RoPE sine cache.
+ * @param o Transformer architecture options.
+ * @param go Generation and sampling options.
+ * @return Generated text together with prompt and generated token counts.
+ *
+ * @throws std::invalid_argument If token generation inputs or options are
+ *         invalid.
+ * @throws std::runtime_error If sampling cannot select a valid token.
+ */
 TextGenerationResult generate_text_with_stats_cpu(
     const bpe::BpeTokenizer &tok, std::string_view prompt,
     const TransformerModelWeights &w, const Tensor &co, const Tensor &si,
