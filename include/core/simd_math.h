@@ -190,13 +190,18 @@ struct Float16Ops {
     }
 
     CGPT_FORCE_INLINE static float load_scalar(const Storage value) noexcept {
-        return _cvtsh_ss(value);
+        const __m128 converted = _mm_cvtph_ps(
+            _mm_cvtsi32_si128(static_cast<int>(value))
+        );
+        return _mm_cvtss_f32(converted);
     }
 
     CGPT_FORCE_INLINE static Storage store_scalar(const float value) noexcept {
-        return static_cast<Storage>(
-            _cvtss_sh(value, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)
+        const __m128i converted = _mm_cvtps_ph(
+            _mm_set_ss(value),
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC
         );
+        return static_cast<Storage>(_mm_cvtsi128_si32(converted) & 0xFFFF);
     }
 };
 
@@ -223,4 +228,4 @@ struct BFloat16Ops {
     }
 };
 
-}
+} // namespace cgpt::cpu::simd
