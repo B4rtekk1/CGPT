@@ -345,9 +345,10 @@ void transformer_block_forward(
                    weights.o_projection, cublas_context, stream,
                    options.linear_options);
 
-    add_tensors(output, input, workspace.attention_projection, stream);
-
-    rmsnorm_forward(workspace.norm, output, weights.ffn_norm,
+    // Parallel residuals: the MLP sees the original block input, rather than
+    // the attention-updated residual stream.  This shortens both branch
+    // gradient paths and keeps their activations independently normalized.
+    rmsnorm_forward(workspace.norm, input, weights.ffn_norm,
                     options.rms_epsilon, stream);
 
     linear_forward(workspace.gate, workspace.norm, weights.gate_proj,
@@ -358,6 +359,7 @@ void transformer_block_forward(
     linear_forward(workspace.ffn_output, workspace.activated, weights.down_proj,
                    cublas_context, stream, options.linear_options);
 
+    add_tensors(output, input, workspace.attention_projection, stream);
     add_tensors(output, output, workspace.ffn_output, stream);
 
     workspace.query.reshape({batch, sequence, options.num_query_heads,
@@ -399,15 +401,12 @@ void transformer_block_backward(
         backward.grad_up, forward_workspace.norm, weights.up_proj, cublas_context, stream, linear_options);
     linear_options.accumulate_input = false;
 
-    CUDA_CHECK(cudaMemcpyAsync(backward.grad_attention_projection.raw_data(), input.raw_data(), input.nbytes(), cudaMemcpyDeviceToDevice, stream));
-    add_inplace(backward.grad_attention_projection, forward_workspace.attention_projection, stream);
     rmsnorm_backward(backward.grad_residual, gradients.ffn_norm, backward.grad_ffn_norm_input,
-        backward.grad_attention_projection, weights.ffn_norm, options.rms_epsilon, stream);
+        input, weights.ffn_norm, options.rms_epsilon, stream);
 
     CUDA_CHECK(cudaMemcpyAsync(grad_input.raw_data(), grad_output.raw_data(), grad_output.nbytes(), cudaMemcpyDeviceToDevice, stream));
     add_inplace(grad_input, backward.grad_residual, stream);
-    CUDA_CHECK(cudaMemcpyAsync(backward.grad_attention_projection.raw_data(), backward.grad_residual.raw_data(), backward.grad_residual.nbytes(), cudaMemcpyDeviceToDevice, stream));
-    add_inplace(backward.grad_attention_projection, grad_output, stream);
+    CUDA_CHECK(cudaMemcpyAsync(backward.grad_attention_projection.raw_data(), grad_output.raw_data(), grad_output.nbytes(), cudaMemcpyDeviceToDevice, stream));
 
     backward.grad_attention_output.reshape({rows, hidden});
     auto& saved_attention_output = const_cast<Tensor&>(forward_workspace.attention_output);

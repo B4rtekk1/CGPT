@@ -151,9 +151,7 @@ std::vector<float> reference_forward(const std::vector<float>& input,
     }
 
     const auto attention_projection = linear(attention, o_weight, rows, kHidden, kHidden);
-    std::vector<float> residual(rows * kHidden);
-    for (std::size_t i = 0; i < residual.size(); ++i) residual[i] = input[i] + attention_projection[i];
-    const auto ffn_input = rmsnorm(residual, ffn_norm, rows, kHidden);
+    const auto ffn_input = rmsnorm(input, ffn_norm, rows, kHidden);
     const auto gate = linear(ffn_input, gate_weight, rows, kHidden, kIntermediate);
     const auto up = linear(ffn_input, up_weight, rows, kHidden, kIntermediate);
     std::vector<float> activated(gate.size());
@@ -161,8 +159,11 @@ std::vector<float> reference_forward(const std::vector<float>& input,
         activated[i] = gate[i] / (1.0F + std::exp(-gate[i])) * up[i];
     }
     const auto ffn_output = linear(activated, down_weight, rows, kIntermediate, kHidden);
-    for (std::size_t i = 0; i < residual.size(); ++i) residual[i] += ffn_output[i];
-    return residual;
+    std::vector<float> output(rows * kHidden);
+    for (std::size_t i = 0; i < output.size(); ++i) {
+        output[i] = input[i] + attention_projection[i] + ffn_output[i];
+    }
+    return output;
 }
 
 struct BlockFixture {

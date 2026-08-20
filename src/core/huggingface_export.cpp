@@ -91,7 +91,8 @@ void write_config(const std::filesystem::path& path, const TransformerModelOptio
            << "  \"max_position_embeddings\": " << max_position_embeddings << ",\n"
            << "  \"rms_norm_eps\": " << std::setprecision(9) << block.rms_epsilon << ",\n"
            << "  \"rope_theta\": 10000.0,\n"
-           << "  \"tie_word_embeddings\": false\n"
+           << "  \"use_parallel_residual\": true,\n"
+           << "  \"tie_word_embeddings\": true\n"
            << "}\n";
 }
 

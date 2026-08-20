@@ -13,6 +13,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cmath>
 #include <math_constants.h>
 
 #include <stdexcept>
@@ -139,7 +140,8 @@ void cross_entropy_fused_kernel(
     const bpe::TokenId* __restrict__ targets,
     const std::size_t rows,
     const std::size_t vocabulary_size,
-    const float inv_rows) {
+    const float inv_rows,
+    const float gradient_scale) {
 
     const std::size_t row = blockIdx.x;
     if (row >= rows) return;
@@ -229,16 +231,16 @@ void cross_entropy_fused_kernel(
             if (column + 3 * kStride == target_column) v3 -= 1.0f;
         }
 
-        row_gradient[column] = from_float<T>(v0 * inv_rows);
-        row_gradient[column + kStride] = from_float<T>(v1 * inv_rows);
-        row_gradient[column + 2 * kStride] = from_float<T>(v2 * inv_rows);
-        row_gradient[column + 3 * kStride] = from_float<T>(v3 * inv_rows);
+        row_gradient[column] = from_float<T>(v0 * inv_rows * gradient_scale);
+        row_gradient[column + kStride] = from_float<T>(v1 * inv_rows * gradient_scale);
+        row_gradient[column + 2 * kStride] = from_float<T>(v2 * inv_rows * gradient_scale);
+        row_gradient[column + 3 * kStride] = from_float<T>(v3 * inv_rows * gradient_scale);
     }
 
     for (; column < vocabulary_size; column += kStride) {
         float value = __expf(to_float(row_logits[column]) - maximum) * inv_denominator;
         if (valid_target && column == static_cast<std::size_t>(target)) value -= 1.0f;
-        row_gradient[column] = from_float<T>(value * inv_rows);
+        row_gradient[column] = from_float<T>(value * inv_rows * gradient_scale);
     }
 }
 
@@ -305,7 +307,7 @@ void validate(const Tensor& loss, const Tensor& gradient, const Tensor& logits,
 template <typename T>
 void launch(Tensor& loss, Tensor& gradient, const Tensor& logits,
             const bpe::TokenId* targets, const std::size_t rows,
-            const std::size_t vocabulary_size, cudaStream_t stream) {
+            const std::size_t vocabulary_size, const float gradient_scale, cudaStream_t stream) {
     const float inv_rows = 1.0f / static_cast<float>(rows);
 
     cross_entropy_fused_kernel<T><<<static_cast<unsigned>(rows), kThreads, 0, stream>>>(
@@ -315,7 +317,8 @@ void launch(Tensor& loss, Tensor& gradient, const Tensor& logits,
         targets,
         rows,
         vocabulary_size,
-        inv_rows);
+        inv_rows,
+        gradient_scale);
 }
 
 template <typename T>
@@ -341,14 +344,18 @@ void launch_forward(Tensor& loss, const Tensor& logits,
  * @param[in] logits Input logits with shape [rows, vocabulary_size].
  * @param[in] device_targets Device pointer to target IDs.
  * @param target_count Number of target IDs.
+ * @param gradient_scale Multiplier applied to the returned gradient only.
  * @param stream CUDA stream used for the asynchronous operation.
  * @throws std::invalid_argument If inputs, shapes, dtypes, or targets are invalid.
  * @throws cudaError_t If a CUDA memory operation or kernel launch fails.
  */
 void cross_entropy_forward_backward(Tensor& loss, Tensor& gradient, const Tensor& logits,
                                     const bpe::TokenId* device_targets,
-                                    const std::size_t target_count, cudaStream_t stream) {
+                                    const std::size_t target_count, cudaStream_t stream,
+                                    const float gradient_scale) {
     validate(loss, gradient, logits, device_targets, target_count);
+    if (!std::isfinite(gradient_scale) || gradient_scale <= 0.0F)
+        throw std::invalid_argument("cross_entropy: gradient scale must be finite and positive");
 
     CUDA_CHECK(cudaMemsetAsync(loss.raw_data(), 0, sizeof(float), stream));
 
@@ -357,13 +364,13 @@ void cross_entropy_forward_backward(Tensor& loss, Tensor& gradient, const Tensor
 
     switch (logits.dtype()) {
         case Dtype::F32:
-            launch<float>(loss, gradient, logits, device_targets, rows, vocabulary_size, stream);
+            launch<float>(loss, gradient, logits, device_targets, rows, vocabulary_size, gradient_scale, stream);
             break;
         case Dtype::F16:
-            launch<__half>(loss, gradient, logits, device_targets, rows, vocabulary_size, stream);
+            launch<__half>(loss, gradient, logits, device_targets, rows, vocabulary_size, gradient_scale, stream);
             break;
         case Dtype::BF16:
-            launch<__nv_bfloat16>(loss, gradient, logits, device_targets, rows, vocabulary_size, stream);
+            launch<__nv_bfloat16>(loss, gradient, logits, device_targets, rows, vocabulary_size, gradient_scale, stream);
             break;
         default:
             throw std::invalid_argument("cross_entropy: unsupported logits dtype");

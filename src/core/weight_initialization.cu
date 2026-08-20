@@ -71,10 +71,16 @@ void initialize_transformer_weights(
 
     matrix(weights.token_embedding, {options.vocabulary_size, block.hidden_size},
            "token embedding", initialization.seed);
-    matrix(weights.lm_head, {options.vocabulary_size, block.hidden_size},
-           "lm head", initialization.seed + 1);
+    // A tied classifier is the very same Tensor as the input embedding and
+    // must not be reinitialized with an independent random matrix.
+    if (&weights.lm_head != &weights.token_embedding) {
+        matrix(weights.lm_head, {options.vocabulary_size, block.hidden_size},
+               "lm head", initialization.seed + 1);
+    }
     norm(weights.final_norm, "final norm");
 
+    const float residual_stddev = initialization.weight_stddev /
+        std::sqrt(2.0F * static_cast<float>(options.num_layers));
     for (std::size_t layer = 0; layer < weights.layers.size(); ++layer) {
         auto& current = weights.layers[layer];
         const std::uint64_t base = initialization.seed + 2 + layer * 9;
@@ -88,10 +94,12 @@ void initialize_transformer_weights(
         head_norm(current.k_norm, "k norm");
         matrix(current.v_projection,
                {block.num_kv_heads * block.head_dim, block.hidden_size}, "v projection", base + 2);
-        matrix(current.o_projection,
-               {block.hidden_size, block.num_query_heads * block.head_dim}, "o projection", base + 3);
+        validate_shape(current.o_projection,
+            {block.hidden_size, block.num_query_heads * block.head_dim}, "o projection");
+        initialize_weight_tensor(current.o_projection, residual_stddev, base + 3);
         matrix(current.gate_proj, {block.intermediate_size, block.hidden_size}, "gate projection", base + 4);
         matrix(current.up_proj, {block.intermediate_size, block.hidden_size}, "up projection", base + 5);
-        matrix(current.down_proj, {block.hidden_size, block.intermediate_size}, "down projection", base + 6);
+        validate_shape(current.down_proj, {block.hidden_size, block.intermediate_size}, "down projection");
+        initialize_weight_tensor(current.down_proj, residual_stddev, base + 6);
     }
 }

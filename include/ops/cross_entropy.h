@@ -18,6 +18,8 @@
  * @param logits Input logits tensor.
  * @param device_targets CUDA target-token buffer.
  * @param target_count Number of target IDs and logits rows.
+ * @param gradient_scale Multiplier applied only to the returned gradient. This
+ * enables mixed-precision loss scaling while leaving @p loss unchanged.
  * @param stream CUDA stream used for the operation.
  */
 void cross_entropy_forward_backward(
@@ -26,7 +28,8 @@ void cross_entropy_forward_backward(
     const Tensor& logits,
     const bpe::TokenId* device_targets,
     std::size_t target_count,
-    cudaStream_t stream = nullptr);
+    cudaStream_t stream = nullptr,
+    float gradient_scale = 1.0F);
 
 /**
  * @brief Computes mean next-token cross-entropy without producing a gradient.

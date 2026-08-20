@@ -43,15 +43,19 @@ struct Arguments {
     std::filesystem::path output_directory = "train/huggingface";
     std::optional<std::filesystem::path> load_directory;
     std::size_t vocab_size = 32'000;
-    std::size_t batch_size = 16;
+    std::size_t batch_size = 8;
     std::size_t sequence_length = 1024;
     std::size_t epochs = 10;
     std::size_t max_steps = 0; // 0 means all batches from every requested epoch.
     std::size_t validation_interval = 500;
     std::size_t validation_batches = 64;
-    float learning_rate = 1.0e-4F;
-    float min_learning_rate = 0.0F;
+    float learning_rate = 3.0e-4F;
+    float min_learning_rate = 3.0e-5F;
+    // Zero selects an automatic warmup lasting 2% of the training run.
     std::size_t warmup_steps = 0;
+    // 2^10 keeps the mean FP16 logits gradient representable for the default
+    // 8 x 1024-token batch. AdamW divides it back out before updating.
+    float loss_scale = 1024.0F;
     float validation_fraction = 0.1F;
     std::string prompt = "The";
     std::size_t generate_tokens = 64;
@@ -94,6 +98,7 @@ Arguments parse_arguments(int argc, char** argv) {
         else if (option == "--learning-rate") args.learning_rate = std::stof(value());
         else if (option == "--min-learning-rate") args.min_learning_rate = std::stof(value());
         else if (option == "--warmup-steps") args.warmup_steps = std::stoull(value());
+        else if (option == "--loss-scale") args.loss_scale = std::stof(value());
         else if (option == "--validation-fraction") args.validation_fraction = std::stof(value());
         else if (option == "--prompt") args.prompt = value();
         else if (option == "--generate-tokens") args.generate_tokens = std::stoull(value());
@@ -103,7 +108,7 @@ Arguments parse_arguments(int argc, char** argv) {
                          "[--output-dir PATH] "
                          "[--load-dir PATH] "
                          "[--batch-size N] [--sequence-length N] [--epochs N] [--max-steps N] "
-                         "[--learning-rate N] [--min-learning-rate N] [--warmup-steps N] "
+                         "[--learning-rate N] [--min-learning-rate N] [--warmup-steps N] [--loss-scale N] "
                          "[--validation-fraction N] [--validation-interval N] "
                          "[--validation-batches N] [--prompt TEXT] [--generate-tokens N] "
                          "[--save-avg-loss]\n"
@@ -115,12 +120,20 @@ Arguments parse_arguments(int argc, char** argv) {
         !std::isfinite(args.learning_rate) || args.learning_rate <= 0.0F ||
         !std::isfinite(args.min_learning_rate) || args.min_learning_rate < 0.0F ||
         args.min_learning_rate > args.learning_rate ||
+        !std::isfinite(args.loss_scale) || args.loss_scale <= 0.0F ||
         args.validation_interval == 0 || args.validation_batches == 0)
         throw std::invalid_argument("Invalid training dimensions");
     if (!std::isfinite(args.validation_fraction) || args.validation_fraction <= 0.0F ||
         args.validation_fraction >= 1.0F)
         throw std::invalid_argument("validation-fraction must be between 0 and 1");
     return args;
+}
+
+TransformerModelOptions model_options(const std::size_t vocabulary_size) {
+    // About 25.3M trainable parameters with a 32k-token vocabulary.  The
+    // 4 query-heads to 1 KV-head layout and 128-wide heads select the
+    // optimized GQA 4:1 Tensor-Core forward/backward path.
+    return {vocabulary_size, 4, {512, 1024, 4, 1, 128, 128, 1.0e-5F, true, {ComputeType::F32}}};
 }
 
 /**
@@ -214,7 +227,9 @@ std::string load_training_text(const std::filesystem::path& path) {
     while (std::getline(input, line)) {
         const std::string document = json_text_field(line);
         if (document.empty()) continue;
-        if (!text.empty()) text.push_back('\n');
+        // Preserve an explicit learnable boundary; a bare newline lets the
+        // model treat two unrelated FineWeb documents as one continuation.
+        if (!text.empty()) text.append("\n<eos>\n");
         text.append(document);
     }
     if (text.empty()) throw std::runtime_error("JSONL input contains no text fields: " + path.string());
@@ -243,16 +258,18 @@ struct LayerStorage {
 
 struct ModelStorage {
     TransformerModelOptions options;
-    Tensor embedding, final_norm, lm_head, g_embedding, g_final_norm, g_lm_head;
+    Tensor embedding, final_norm, g_embedding, g_final_norm;
     std::vector<LayerStorage> layers;
     std::vector<TransformerBlockWeights> weight_layers;
     std::vector<MutableTransformerBlockWeights> mutable_layers;
     std::vector<TransformerBlockGradients> gradient_layers;
 
-    explicit ModelStorage(std::size_t vocab)
-        : options{vocab, 2, {256, 768, 4, 1, 64, 64, 1.0e-5F, true, {ComputeType::F32}}},
-          embedding({vocab, 256}, Dtype::F16), final_norm({256}, Dtype::F16), lm_head({vocab, 256}, Dtype::F16),
-          g_embedding({vocab, 256}, Dtype::F16), g_final_norm({256}, Dtype::F16), g_lm_head({vocab, 256}, Dtype::F16) {
+    explicit ModelStorage(const TransformerModelOptions& model_options)
+        : options(model_options),
+          embedding({options.vocabulary_size, options.block_options.hidden_size}, Dtype::F16),
+          final_norm({options.block_options.hidden_size}, Dtype::F16),
+          g_embedding({options.vocabulary_size, options.block_options.hidden_size}, Dtype::F16),
+          g_final_norm({options.block_options.hidden_size}, Dtype::F16) {
         layers.reserve(options.num_layers);
         for (std::size_t i = 0; i < options.num_layers; ++i) layers.emplace_back(options.block_options);
         for (auto& layer : layers) {
@@ -260,18 +277,21 @@ struct ModelStorage {
             mutable_layers.push_back({layer.attention_norm, layer.q, layer.k, layer.q_norm, layer.k_norm, layer.v, layer.o, layer.ffn_norm, layer.gate, layer.up, layer.down});
             gradient_layers.push_back({layer.g_attention_norm, layer.g_q, layer.g_k, layer.g_q_norm, layer.g_k_norm, layer.g_v, layer.g_o, layer.g_ffn_norm, layer.g_gate, layer.g_up, layer.g_down});
         }
-        initialize_transformer_weights({embedding, mutable_layers, final_norm, lm_head}, options);
+        initialize_transformer_weights({embedding, mutable_layers, final_norm, embedding}, options);
     }
-    [[nodiscard]] TransformerModelWeights weights() const { return {embedding, weight_layers, final_norm, lm_head}; }
-    [[nodiscard]] TransformerModelGradients gradients() { return {g_embedding, gradient_layers, g_final_norm, g_lm_head}; }
+    [[nodiscard]] TransformerModelWeights weights() const {
+        return {embedding, weight_layers, final_norm, embedding};
+    }
+    [[nodiscard]] TransformerModelGradients gradients() {
+        return {g_embedding, gradient_layers, g_final_norm, g_embedding};
+    }
 };
 
 void append_parameters(ModelStorage& model, std::vector<std::pair<Tensor*, Tensor*>>& result) {
     result.clear();
-    result.reserve(3 + model.layers.size() * 11);
+    result.reserve(2 + model.layers.size() * 11);
     result.emplace_back(&model.embedding, &model.g_embedding);
     result.emplace_back(&model.final_norm, &model.g_final_norm);
-    result.emplace_back(&model.lm_head, &model.g_lm_head);
     for (auto& l : model.layers) {
         result.emplace_back(&l.attention_norm, &l.g_attention_norm);
         result.emplace_back(&l.q, &l.g_q);
@@ -386,11 +406,14 @@ int main(int argc, char** argv) {
         if (loader.batch_count() == 0 || validation_loader.batch_count() == 0)
             throw std::runtime_error("Not enough tokens for one training and validation batch");
         const std::size_t total_steps = args.max_steps ? std::min(args.max_steps, loader.batch_count() * args.epochs) : loader.batch_count() * args.epochs;
-        LearningRateScheduler scheduler({args.learning_rate, args.min_learning_rate, args.warmup_steps, total_steps});
-        ModelStorage model(tokenizer.vocab_size());
+        const std::size_t warmup_steps = args.warmup_steps == 0
+            ? (total_steps > 1 ? std::max<std::size_t>(1, total_steps / 50) : 0)
+            : args.warmup_steps;
+        LearningRateScheduler scheduler({args.learning_rate, args.min_learning_rate, warmup_steps, total_steps});
+        ModelStorage model(model_options(tokenizer.vocab_size()));
         if (args.load_directory) {
             load_huggingface_model(*args.load_directory,
-                {model.embedding, model.mutable_layers, model.final_norm, model.lm_head});
+                {model.embedding, model.mutable_layers, model.final_norm, model.embedding});
             std::cout << "Loaded model weights from " << *args.load_directory << '\n';
         }
         auto [cos_cache, sin_cache] = rotary_cache(args.sequence_length, model.options.block_options.rotary_dim);
@@ -413,8 +436,11 @@ int main(int argc, char** argv) {
         AdamWWorkspace optimizer_workspace;
         AdamWOptions optimizer_options;
         optimizer_options.learning_rate = args.learning_rate;
-        optimizer_options.weight_decay = 0.01F;
+        optimizer_options.beta1 = 0.9F;
+        optimizer_options.beta2 = 0.95F;
+        optimizer_options.weight_decay = 0.1F;
         optimizer_options.max_grad_norm = 1.0F;
+        optimizer_options.loss_scale = args.loss_scale;
         const CublasLtContext cublas;
         const Stream stream;
         const cudaStream_t cuda_stream = stream.get();
@@ -496,7 +522,8 @@ int main(int argc, char** argv) {
         const auto enqueue_model_step = [&] {
             transformer_model_forward(logits, captured_inputs, args.batch_size, args.sequence_length,
                 model.weights(), forward_workspace, cos_cache, sin_cache, cublas, cuda_stream, model.options);
-            cross_entropy_forward_backward(loss, grad_logits, logits, captured_targets, captured_batch.token_count(), cuda_stream);
+            cross_entropy_forward_backward(loss, grad_logits, logits, captured_targets,
+                captured_batch.token_count(), cuda_stream, args.loss_scale);
             transformer_model_backward(grad_logits, captured_inputs, args.batch_size, args.sequence_length,
                 model.weights(), model.gradients(), forward_workspace, backward_workspace, cos_cache, sin_cache,
                 cublas, cuda_stream, model.options);

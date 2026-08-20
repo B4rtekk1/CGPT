@@ -183,5 +183,10 @@ void transformer_model_backward(
             cos_cache, sin_cache, cublas_context, stream, block, position_offset);
         std::swap(current, previous);
     }
-    embedding_backward(gradients.token_embedding, *current, device_token_ids, rows, stream);
+    // With tied embeddings, linear_backward has already written the output
+    // classifier gradient to this tensor.  Preserve it while adding the
+    // gradient from the input lookup; untied models retain the old overwrite
+    // behaviour.
+    embedding_backward(gradients.token_embedding, *current, device_token_ids, rows, stream,
+        EmbeddingBackwardOptions{.accumulate_weight = &gradients.token_embedding == &gradients.lm_head});
 }

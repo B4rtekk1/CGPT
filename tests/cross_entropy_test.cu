@@ -43,6 +43,18 @@ void test_loss_and_gradient() {
     expect_close(gradient, {0.0450153f, 0.1223642f, -0.1673795f, -0.3333333f, 0.1666667f, 0.1666667f});
 }
 
+void test_gradient_scaling() {
+    Tensor logits({1, 2});
+    Tensor gradient({1, 2});
+    Tensor loss({1});
+    logits.copy_from_host(std::vector<float>{0.0f, 0.0f});
+    DeviceTargets targets({0});
+    cross_entropy_forward_backward(loss, gradient, logits, targets.get(), 1, nullptr, 1024.0f);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    expect_close(loss, {std::log(2.0f)});
+    expect_close(gradient, {-512.0f, 512.0f});
+}
+
 void test_validation() {
     Tensor logits({2, 3}); Tensor gradient({2, 3}); Tensor loss({1}); DeviceTargets targets({0, 1});
     try { cross_entropy_forward_backward(loss, gradient, logits, targets.get(), 1); }
@@ -67,7 +79,7 @@ void benchmark_kernel() {
 } // namespace
 
 int main() {
-    try { test_loss_and_gradient(); test_validation(); benchmark_kernel(); }
+    try { test_loss_and_gradient(); test_gradient_scaling(); test_validation(); benchmark_kernel(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return EXIT_FAILURE; }
     std::cout << "Cross entropy tests passed.\n";
     return EXIT_SUCCESS;

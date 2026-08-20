@@ -34,7 +34,7 @@ def main() -> None:
 
     try:
         dataset = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
+            "HuggingFaceFW/fineweb",
             name=args.config,
             split="train",
             streaming=True,

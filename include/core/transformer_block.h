@@ -173,9 +173,10 @@ struct TransformerBlockBackwardWorkspace {
 /**
  * @brief Executes the forward pass of one decoder-only Transformer block.
  *
- * The block applies RMS normalization, grouped-query attention, a residual
- * connection, and a SwiGLU feed-forward network. Intermediate results needed
- * by training are written to @p workspace.
+ * The block applies independent pre-RMSNorm attention and SwiGLU branches to
+ * the same input, then combines both with the residual connection:
+ * `output = input + attention(RMSNorm_attn(input)) + MLP(RMSNorm_ffn(input))`.
+ * Intermediate results needed by training are written to @p workspace.
  *
  * @param output Destination tensor for the block output.
  * @param input Input hidden states.
