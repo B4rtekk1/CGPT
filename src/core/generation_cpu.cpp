@@ -74,6 +74,100 @@ namespace {
         a.copy_from_host(av);
     }
 
+    /** Reusable buffers and a per-layer CPU key/value cache for one decode stream. */
+    struct CpuLayerWorkspace {
+        Tensor attention_norm, q_flat, k_flat, value_flat, q_norm_input, k_norm_input;
+        Tensor q_norm_output, k_norm_output, query, key, attention, attention_flat;
+        Tensor attention_projection, ffn_norm, gate, up, activated, ffn_output;
+        Tensor key_cache, value_cache;
+
+        CpuLayerWorkspace(const TransformerBlockOptions &o, const std::size_t context, const Dtype dtype)
+            : attention_norm({1, o.hidden_size}, dtype, DeviceType::CPU),
+              q_flat({1, o.num_query_heads * o.head_dim}, dtype, DeviceType::CPU),
+              k_flat({1, o.num_kv_heads * o.head_dim}, dtype, DeviceType::CPU),
+              value_flat({1, o.num_kv_heads * o.head_dim}, dtype, DeviceType::CPU),
+              q_norm_input({o.num_query_heads, o.head_dim}, dtype, DeviceType::CPU),
+              k_norm_input({o.num_kv_heads, o.head_dim}, dtype, DeviceType::CPU),
+              q_norm_output({o.num_query_heads, o.head_dim}, dtype, DeviceType::CPU),
+              k_norm_output({o.num_kv_heads, o.head_dim}, dtype, DeviceType::CPU),
+              query({1, 1, o.num_query_heads, o.head_dim}, dtype, DeviceType::CPU),
+              key({1, 1, o.num_kv_heads, o.head_dim}, dtype, DeviceType::CPU),
+              attention({1, 1, o.num_query_heads, o.head_dim}, dtype, DeviceType::CPU),
+              attention_flat({1, o.hidden_size}, dtype, DeviceType::CPU),
+              attention_projection({1, o.hidden_size}, dtype, DeviceType::CPU),
+              ffn_norm({1, o.hidden_size}, dtype, DeviceType::CPU),
+              gate({1, o.intermediate_size}, dtype, DeviceType::CPU),
+              up({1, o.intermediate_size}, dtype, DeviceType::CPU),
+              activated({1, o.intermediate_size}, dtype, DeviceType::CPU),
+              ffn_output({1, o.hidden_size}, dtype, DeviceType::CPU),
+              key_cache({1, context, o.num_kv_heads, o.head_dim}, dtype, DeviceType::CPU),
+              value_cache({1, context, o.num_kv_heads, o.head_dim}, dtype, DeviceType::CPU) {}
+    };
+
+    struct CpuGenerationWorkspace {
+        Tensor hidden, residual, normalized, logits;
+        std::vector<CpuLayerWorkspace> layers;
+
+        CpuGenerationWorkspace(const TransformerModelOptions &o, const std::size_t context, const Dtype dtype)
+            : hidden({1, o.block_options.hidden_size}, dtype, DeviceType::CPU),
+              residual({1, o.block_options.hidden_size}, dtype, DeviceType::CPU),
+              normalized({1, o.block_options.hidden_size}, dtype, DeviceType::CPU),
+              logits({1, o.vocabulary_size}, dtype, DeviceType::CPU) {
+            layers.reserve(o.num_layers);
+            for (std::size_t index = 0; index < o.num_layers; ++index)
+                layers.emplace_back(o.block_options, context, dtype);
+        }
+    };
+
+    /** Executes one token while appending its K/V vectors to every layer cache. */
+    void forward_cached_token(CpuGenerationWorkspace &workspace, const bpe::TokenId token,
+                              const std::size_t position, const TransformerModelWeights &weights,
+                              const TransformerModelOptions &options, const Tensor &cosine, const Tensor &sine) {
+        const auto &block = options.block_options;
+        if (position >= workspace.layers.front().key_cache.shape()[1])
+            throw std::out_of_range("CPU generation: KV cache capacity exceeded");
+        embedding_forward_cpu(workspace.hidden, &token, 1, weights.token_embedding);
+        for (std::size_t index = 0; index < weights.layers.size(); ++index) {
+            const auto &weights_layer = weights.layers[index];
+            auto &layer = workspace.layers[index];
+            copy_tensor(workspace.residual, workspace.hidden);
+            rmsnorm_forward_cpu(layer.attention_norm, workspace.residual, weights_layer.attention_norm, block.rms_epsilon);
+            linear_forward_cpu(layer.q_flat, layer.attention_norm, weights_layer.q_projection);
+            linear_forward_cpu(layer.k_flat, layer.attention_norm, weights_layer.k_projection);
+            linear_forward_cpu(layer.value_flat, layer.attention_norm, weights_layer.v_projection);
+            copy_tensor(layer.q_norm_input, layer.q_flat);
+            copy_tensor(layer.k_norm_input, layer.k_flat);
+            rmsnorm_forward_cpu(layer.q_norm_output, layer.q_norm_input, weights_layer.q_norm, block.rms_epsilon);
+            rmsnorm_forward_cpu(layer.k_norm_output, layer.k_norm_input, weights_layer.k_norm, block.rms_epsilon);
+            copy_tensor(layer.query, layer.q_norm_output);
+            copy_tensor(layer.key, layer.k_norm_output);
+            rope_forward_cpu(layer.query, layer.key, cosine, sine, {block.rotary_dim, position});
+
+            const std::size_t token_bytes = layer.key.nbytes();
+            auto *key_destination = static_cast<std::uint8_t *>(layer.key_cache.raw_data()) + position * token_bytes;
+            auto *value_destination = static_cast<std::uint8_t *>(layer.value_cache.raw_data()) + position * token_bytes;
+            std::memcpy(key_destination, layer.key.raw_data(), token_bytes);
+            std::memcpy(value_destination, layer.value_flat.raw_data(), token_bytes);
+
+            FlashAttentionOptions attention_options{block.num_query_heads, block.num_kv_heads, block.head_dim,
+                                                     0.0F, block.causal, position};
+            flash_gqa_attention_forward_cpu(layer.attention, layer.query, layer.key_cache, layer.value_cache,
+                                            attention_options, position + 1);
+            copy_tensor(layer.attention_flat, layer.attention);
+            linear_forward_cpu(layer.attention_projection, layer.attention_flat, weights_layer.o_projection);
+            rmsnorm_forward_cpu(layer.ffn_norm, workspace.residual, weights_layer.ffn_norm, block.rms_epsilon);
+            linear_forward_cpu(layer.gate, layer.ffn_norm, weights_layer.gate_proj);
+            linear_forward_cpu(layer.up, layer.ffn_norm, weights_layer.up_proj);
+            swiglu_forward_cpu(layer.activated, layer.gate, layer.up);
+            linear_forward_cpu(layer.ffn_output, layer.activated, weights_layer.down_proj);
+            copy_tensor(workspace.hidden, workspace.residual);
+            add(workspace.hidden, layer.attention_projection);
+            add(workspace.hidden, layer.ffn_output);
+        }
+        rmsnorm_forward_cpu(workspace.normalized, workspace.hidden, weights.final_norm, block.rms_epsilon);
+        linear_forward_cpu(workspace.logits, workspace.normalized, weights.lm_head);
+    }
+
     /**
      * @brief Validates generation sampling parameters.
      *
@@ -151,11 +245,23 @@ namespace {
         for (std::size_t i = 0; i < adjusted.size(); ++i)
             if (std::isfinite(adjusted[i])) ids.push_back(i);
         if (ids.empty()) throw std::runtime_error("no valid token remains after logits processing");
-        std::ranges::sort(ids, [&](const auto a, const auto b) { return adjusted[a] > adjusted[b]; });
-        if (o.top_k != 0 && o.top_k < ids.size()) ids.resize(o.top_k);
-        if (o.temperature == 0.0F) return static_cast<bpe::TokenId>(ids.front());
+        const auto before = [&](const auto left, const auto right) { return adjusted[left] > adjusted[right]; };
+        if (o.temperature == 0.0F) {
+            return static_cast<bpe::TokenId>(*std::max_element(ids.begin(), ids.end(),
+                [&](const auto left, const auto right) { return adjusted[left] < adjusted[right]; }));
+        }
+        if (o.top_k != 0 && o.top_k < ids.size()) {
+            std::nth_element(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(o.top_k), ids.end(), before);
+            ids.resize(o.top_k);
+        }
+        // Nucleus/min-p sampling requires probabilities in descending order.
+        // With top-p=1 and min-p=0 their order is irrelevant, avoiding a full
+        // sort of the 32k-token vocabulary on every decode step.
+        if (o.top_p < 1.0F || o.min_p > 0.0F)
+            std::ranges::sort(ids, before);
 
-        const float max_logit = adjusted[ids.front()];
+        const float max_logit = adjusted[*std::max_element(ids.begin(), ids.end(),
+            [&](const auto left, const auto right) { return adjusted[left] < adjusted[right]; })];
         std::vector<float> probabilities(ids.size());
         float total = 0.0F;
         for (std::size_t i = 0; i < ids.size(); ++i) {
@@ -164,7 +270,8 @@ namespace {
         }
         for (float &probability: probabilities) probability /= total;
         if (o.min_p > 0.0F && probabilities.size() > 1) {
-            const float cutoff = o.min_p * probabilities.front();
+            const auto best = std::distance(probabilities.begin(), std::max_element(probabilities.begin(), probabilities.end()));
+            const float cutoff = o.min_p * probabilities[best];
             std::size_t keep = probabilities.size();
             for (std::size_t i = 1; i < probabilities.size(); ++i)
                 if (probabilities[i] < cutoff) {
@@ -314,19 +421,31 @@ std::vector<bpe::TokenId> generate_tokens_cpu(
     validate_sampling(go);
     std::mt19937_64 rng(go.seed ? go.seed : std::random_device{}());
     std::vector<bpe::TokenId> result = prompt;
-    for (std::size_t step = 0; step < go.max_new_tokens; ++step) {
+    CpuGenerationWorkspace workspace(o, go.max_context_tokens, w.token_embedding.dtype());
+    std::size_t cached_tokens = 0;
+    const auto rebuild_cache = [&] {
         const std::size_t begin = result.size() > go.max_context_tokens
                                       ? result.size() - go.max_context_tokens
                                       : 0;
-        const std::vector<bpe::TokenId> ctx(result.begin() + static_cast<long long>(begin), result.end());
-        Tensor logits({ctx.size(), o.vocabulary_size}, w.token_embedding.dtype(), DeviceType::CPU);
-        forward(logits, ctx, w, o, co, si);
-        std::vector<float> host(logits.numel());
-        logits.copy_to_host(host);
-        const std::vector<float> last(host.end() - static_cast<long long>(o.vocabulary_size), host.end());
+        cached_tokens = 0;
+        for (std::size_t index = begin; index < result.size(); ++index)
+            forward_cached_token(workspace, result[index], cached_tokens++, w, o, co, si);
+    };
+    rebuild_cache();
+    for (std::size_t step = 0; step < go.max_new_tokens; ++step) {
+        std::vector<float> last(o.vocabulary_size);
+        workspace.logits.copy_to_host(last);
         const auto next = sample(last, result, go, rng);
         result.push_back(next);
         if (go.eos_token_id && next == *go.eos_token_id) break;
+        if (cached_tokens == go.max_context_tokens) {
+            // Preserve the established sliding-window semantics once the
+            // cache is full.  Rebuilding is rare and keeps RoPE positions
+            // identical to the previous full-context implementation.
+            rebuild_cache();
+        } else {
+            forward_cached_token(workspace, next, cached_tokens++, w, o, co, si);
+        }
     }
     return result;
 }

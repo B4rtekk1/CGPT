@@ -3,7 +3,23 @@ project(CGPT VERSION 1.0 LANGUAGES CXX CUDA)
 include(CTest)
 enable_testing()
 find_package(CUDAToolkit REQUIRED)
-find_package(OpenMP)
+
+# A distributed Windows CLI should run on a clean machine.  Build with the
+# static MSVC runtime by default so cgpt_cli does not require the Visual C++
+# Redistributable.  This may be disabled by packagers that prefer the shared
+# runtime.
+option(CGPT_PORTABLE_WINDOWS_RUNTIME "Link the MSVC runtime statically on Windows" ON)
+if (MSVC AND CGPT_PORTABLE_WINDOWS_RUNTIME)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
+# OpenMP adds a VCOMP140.dll runtime dependency on Windows.  CPU inference is
+# correct without it (the pragmas are ignored), so keep portable builds free
+# from that dependency unless parallel CPU execution is requested explicitly.
+option(CGPT_ENABLE_OPENMP "Enable OpenMP parallel CPU operations" OFF)
+if (CGPT_ENABLE_OPENMP)
+    find_package(OpenMP)
+endif()
 if (WIN32)
     file(GLOB CGPT_CUPTI_RUNTIME_DLLS "${CUDAToolkit_CUPTI_INCLUDE_DIR}/../lib64/cupti64_*.dll")
     if (NOT CGPT_CUPTI_RUNTIME_DLLS)
@@ -38,7 +54,7 @@ add_library(cgpt_core STATIC
 set_source_files_properties(src/ops/cross_entropy.cu src/ops/softmax.cu PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
 target_include_directories(cgpt_core PUBLIC ${CGPT_INCLUDE_DIR} ${CGPT_INCLUDE_DIR}/core)
 target_link_libraries(cgpt_core PUBLIC CUDA::cudart CUDA::cublasLt)
-if (OpenMP_CXX_FOUND)
+if (CGPT_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
     target_link_libraries(cgpt_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 if (MSVC)

@@ -168,10 +168,12 @@ namespace {
      *         fails.
      */
     void apply(Tensor &out, Tensor *lse, const Tensor &q, const Tensor &k, const Tensor &v,
-               const FlashAttentionOptions &o) {
+               const FlashAttentionOptions &o, const std::size_t key_sequence_length) {
         validate(out, q, k, v, o, lse);
-        const auto B = q.shape()[0], QS = q.shape()[1], KS = k.shape()[1], H = o.num_query_heads, KV = o.num_kv_heads, D
+        const auto B = q.shape()[0], QS = q.shape()[1], KS = key_sequence_length ? key_sequence_length : k.shape()[1], H = o.num_query_heads, KV = o.num_kv_heads, D
                 = o.head_dim;
+        if (KS == 0 || KS > k.shape()[1])
+            throw std::invalid_argument("CPU attention: invalid cached key sequence length");
         const float scale = o.attention_scale > 0 ? o.attention_scale : 1.0f / std::sqrt(static_cast<float>(D));
         const auto t = q.dtype();
         const auto *qp = q.raw_data();
@@ -223,7 +225,9 @@ namespace {
  *       requires F16C support.
  */
 void flash_gqa_attention_forward_cpu(Tensor &o, const Tensor &q, const Tensor &k, const Tensor &v,
-                                     const FlashAttentionOptions &x) { apply(o, nullptr, q, k, v, x); }
+                                     const FlashAttentionOptions &x, const std::size_t key_sequence_length) {
+    apply(o, nullptr, q, k, v, x, key_sequence_length);
+}
 
 /**
  * @brief Computes grouped-query attention and per-query log-sum-exp values.
@@ -243,4 +247,4 @@ void flash_gqa_attention_forward_cpu(Tensor &o, const Tensor &q, const Tensor &k
  *       requires F16C support.
  */
 void flash_gqa_attention_forward_with_lse_cpu(Tensor &o, Tensor &l, const Tensor &q, const Tensor &k, const Tensor &v,
-                                              const FlashAttentionOptions &x) { apply(o, &l, q, k, v, x); }
+                                              const FlashAttentionOptions &x) { apply(o, &l, q, k, v, x, 0); }

@@ -33,6 +33,15 @@ The project builds a CUDA core library, the `cgpt_train` training executable, th
 - the CUDA Toolkit with `cudart`, `cuBLASLt`, and CUPTI;
 - a compatible NVIDIA GPU (CUDA architectures `86` and `90a` are compiled by default).
 
+The default Windows build is portable for CPU inference: it uses the static
+MSVC runtime and does not enable OpenMP, so the target machine does not need
+the Visual C++ Redistributable or `VCOMP140.dll`. Enable parallel CPU kernels
+only when distributing the matching runtime:
+
+```powershell
+cmake -S . -B build -DCGPT_ENABLE_OPENMP=ON
+```
+
 ### Configure and build (Windows / PowerShell)
 
 ```powershell

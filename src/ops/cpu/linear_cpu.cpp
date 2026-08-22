@@ -12,11 +12,85 @@
 #include <immintrin.h>
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace {
+    /** Persistent native-thread executor used by CPU decode GEMMs.
+     * It deliberately replaces no OpenMP functionality outside this file. */
+    class CpuThreadPool {
+    public:
+        static CpuThreadPool &instance() {
+            static CpuThreadPool pool;
+            return pool;
+        }
+
+        [[nodiscard]] std::size_t parallelism() const noexcept { return workers_.size(); }
+
+        template <typename Function>
+        void run(const std::size_t task_count, Function &&function) {
+            if (task_count <= 1 || workers_.empty()) {
+                function(0);
+                return;
+            }
+            std::unique_lock lock(mutex_);
+            task_ = std::forward<Function>(function);
+            task_count_ = task_count;
+            next_task_ = 0;
+            active_workers_ = 0;
+            work_ready_.notify_all();
+            completed_.wait(lock, [&] { return next_task_ == task_count_ && active_workers_ == 0; });
+            task_ = {};
+        }
+
+    private:
+        CpuThreadPool() {
+            const std::size_t hardware = std::thread::hardware_concurrency();
+            const std::size_t count = hardware > 1 ? hardware - 1 : 0;
+            workers_.reserve(count);
+            for (std::size_t index = 0; index < count; ++index)
+                workers_.emplace_back([this] { worker_loop(); });
+        }
+
+        ~CpuThreadPool() {
+            {
+                std::lock_guard lock(mutex_);
+                stopping_ = true;
+            }
+            work_ready_.notify_all();
+            for (auto &worker : workers_) worker.join();
+        }
+
+        void worker_loop() {
+            std::unique_lock lock(mutex_);
+            for (;;) {
+                work_ready_.wait(lock, [&] { return stopping_ || next_task_ < task_count_; });
+                if (stopping_) return;
+                const std::size_t index = next_task_++;
+                ++active_workers_;
+                const auto current_task = task_;
+                lock.unlock();
+                current_task(index);
+                lock.lock();
+                --active_workers_;
+                if (next_task_ == task_count_ && active_workers_ == 0) completed_.notify_one();
+            }
+        }
+
+        std::vector<std::thread> workers_;
+        std::mutex mutex_;
+        std::condition_variable work_ready_, completed_;
+        std::function<void(std::size_t)> task_;
+        std::size_t task_count_ = 0, next_task_ = 0, active_workers_ = 0;
+        bool stopping_ = false;
+    };
+
     /**
      * @brief Loads eight consecutive tensor elements as an AVX2 float vector.
      *
@@ -139,11 +213,11 @@ namespace {
         const auto *weights = w.raw_data();
         const auto *b = bias ? bias->raw_data() : nullptr;
         auto *y = out.raw_data();
-#pragma omp parallel for schedule(static)
-        for (std::int64_t r = 0; r < static_cast<std::int64_t>(rows); ++r) {
-            const std::size_t rb = static_cast<std::size_t>(r) * I, ob = static_cast<std::size_t>(r) * O;
-            std::size_t o = 0;
-            for (; o + 7 < O; o += 8) {
+        const auto compute_outputs = [&](const std::size_t row, const std::size_t first_output,
+                                         const std::size_t end_output) {
+            const std::size_t rb = row * I, ob = row * O;
+            std::size_t o = first_output;
+            for (; o + 7 < end_output; o += 8) {
                 __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0;
                 std::size_t i = 0;
                 for (; i + 7 < I; i += 8) {
@@ -172,11 +246,30 @@ namespace {
                     store1(y, t, ob + o + z, s);
                 }
             }
-            for (; o < O; ++o) {
+            for (; o < end_output; ++o) {
                 float s = b ? load1(b, t, o) : 0;
                 for (std::size_t i = 0; i < I; ++i)s = std::fma(load1(x, t, rb + i), load1(weights, t, o * I + i), s);
                 store1(y, t, ob + o, s);
             }
+        };
+
+        // Autoregressive decoding has one input row, so the former OpenMP
+        // row parallelism could not use multiple cores.  Split sufficiently
+        // wide output matrices into independent eight-channel blocks instead.
+        // std::thread keeps the portable build free of the OpenMP runtime.
+        const std::size_t vector_outputs = O / 8 * 8;
+        const std::size_t workers = std::min<std::size_t>(CpuThreadPool::instance().parallelism(),
+                                                          vector_outputs / 1024);
+        if (rows == 1 && workers > 1) {
+            const std::size_t output_blocks = vector_outputs / 8;
+            CpuThreadPool::instance().run(workers, [&](const std::size_t worker) {
+                const std::size_t begin = (output_blocks * worker / workers) * 8;
+                const std::size_t end = (output_blocks * (worker + 1) / workers) * 8;
+                compute_outputs(0, begin, end);
+            });
+            if (vector_outputs < O) compute_outputs(0, vector_outputs, O);
+        } else {
+            for (std::size_t row = 0; row < rows; ++row) compute_outputs(row, 0, O);
         }
     }
 }
