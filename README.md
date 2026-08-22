@@ -1,6 +1,5 @@
-# CGPT
-
-A small GPT-style language model written in C++20 and CUDA. The project contains the model implementation, CUDA kernels, training and generation tools, and tests.
+# CUDA Generative Pretrained Transformer
+CGPT is an experimental GPT-style language model built from scratch with C++20 and CUDA. It includes the model code, custom CUDA kernels, training and text-generation tools, and a small test suite.
 
 This README also records the results of one training run of the 104M-parameter model.
 
@@ -20,7 +19,6 @@ The model and checkpoints are in `output/model-104m`.
 - [Training run](#training-run)
 - [Quick start](#quick-start)
   - [Configure and build (Windows / PowerShell)](#configure-and-build-windows--powershell)
-  - [Tests](#tests)
   - [Text generation](#text-generation)
   - [Training](#training)
   - [API documentation](#api-documentation)
@@ -29,7 +27,6 @@ The model and checkpoints are in `output/model-104m`.
 - [Comparison with GPT-2](#comparison-with-gpt-2)
 - [Generation result](#generation-result)
 - [Notes](#notes)
-- [Artifacts](#artifacts)
 
 ## Quick start
 
@@ -45,30 +42,6 @@ The project builds a CUDA core library, the `cgpt_train` training executable, th
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release --parallel
-```
-
-If you are using an existing build directory, run:
-
-```powershell
-cmake --build build --config Release --parallel
-```
-
-### Tests
-
-```powershell
-ctest --test-dir build -C Release --output-on-failure
-```
-
-Alternatively, use the aggregate CMake target:
-
-```powershell
-cmake --build build --config Release --target run_all
-```
-
-To run a single test:
-
-```powershell
-ctest --test-dir build -C Release -R rmsnorm_test --output-on-failure
 ```
 
 ### Text generation
@@ -271,10 +244,3 @@ This sample contains **128 generated tokens** and took **0.81 s** (**157.16 toke
 The run completed without errors, and the model was also exported in Hugging Face format. Validation loss fell from `3.908841` at step 5,000 to `3.282484` at the end. The final validation loss was slightly below the final training loss, although this single run is not enough to draw strong conclusions about generalization.
 
 The lowest recorded training loss was `3.197763` at step 45,000. More training, a warmup schedule, different learning-rate settings, and a larger evaluation set would be reasonable next experiments.
-
-## Artifacts
-
-- final model: `output/model-104m`;
-- checkpoints: `output/model-104m/checkpoints/`;
-- tokenizer: `data/fineweb_edu_tokenizer_32k.json`;
-- full training log: `training_output.txt`.
