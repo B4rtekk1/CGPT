@@ -1,21 +1,23 @@
-# CGPT Training Report
+# CGPT
 
-> **CGPT** — a local CUDA-based language model written in C++20.
+A small GPT-style language model written in C++20 and CUDA. The project contains the model implementation, CUDA kernels, training and generation tools, and tests.
 
-## Summary
+This README also records the results of one training run of the 104M-parameter model.
 
-A complete one-epoch training run was performed for the `104m` model on the approximately 10 GB `FineWeb-Edu` dataset. Training completed successfully after **58,874 optimizer steps**.
+## Training run
 
-Final losses:
+The `104m` model was trained for one epoch on approximately 10 GB of `FineWeb-Edu` data. The run finished after **58,874 optimizer steps**.
 
-- training loss: **3.302037**;
-- validation loss: **3.282484**.
+Final losses were:
 
-The model and checkpoints were saved in `output/model-104m`.
+- training: **3.302037**
+- validation: **3.282484**
+
+The model and checkpoints are in `output/model-104m`.
 
 ## Table of contents
 
-- [Summary](#summary)
+- [Training run](#training-run)
 - [Quick start](#quick-start)
   - [Configure and build (Windows / PowerShell)](#configure-and-build-windows--powershell)
   - [Tests](#tests)
@@ -24,15 +26,14 @@ The model and checkpoints were saved in `output/model-104m`.
   - [API documentation](#api-documentation)
 - [Experiment configuration](#experiment-configuration)
 - [Data preparation](#data-preparation)
-- [Training progress](#training-progress)
 - [Comparison with GPT-2](#comparison-with-gpt-2)
 - [Generation result](#generation-result)
-- [Conclusions](#conclusions)
+- [Notes](#notes)
 - [Artifacts](#artifacts)
 
 ## Quick start
 
-The project builds a CUDA core library, the `cgpt_train` training executable, the `cgpt_cli` text-generation interface, and a unit-test suite. The main build requirements are:
+The project builds a CUDA core library, the `cgpt_train` training executable, the `cgpt_cli` text-generation interface, and a unit-test suite. The main requirements are:
 
 - CMake `4.3` or newer;
 - a C++20 compiler with CUDA support;
@@ -142,7 +143,7 @@ python scripts\download_fineweb_edu.py
 .\scripts\profile_kernels.ps1
 ```
 
-> Data and model paths may need to be adjusted for the local build directory and CMake generator configuration. Detailed results are provided below.
+Data and model paths may need to be adjusted for the selected CMake generator.
 
 ## Experiment configuration
 
@@ -225,11 +226,11 @@ xychart-beta
 
 Validation checkpoints were saved at steps `5000`, `10000`, `15000`, `20000`, `25000`, `30000`, `35000`, `40000`, `45000`, `50000`, `55000`, and `58874`.
 
-The actual training time was approximately **12,741.46 s**, or **3 hours 32 minutes**, with a stable throughput of about **4.62 steps/s**.
+The run took approximately **12,741.46 s** (3 hours 32 minutes), at about **4.62 steps/s**.
 
 ## Comparison with GPT-2
 
-The closest historical reference is GPT-2 Small, which has approximately **124M parameters**, compared with **104M parameters** in this project. The original GPT-2 family was trained on the 40 GB WebText corpus, while this run used approximately 10 GB of FineWeb-Edu data. GPT-2 used a 50,257-token vocabulary; this project uses a 32,000-token BPE vocabulary. See the [original GPT-2 paper](https://cdn.openai.com/better-language-models/language-models.pdf) and the [OpenAI GPT-2 model card](https://github.com/openai/gpt-2/blob/master/model_card.md).
+GPT-2 Small is a useful rough reference: it has approximately **124M parameters**, compared with **104M** here. The datasets, tokenizers, hardware, and training setups are different, so this is only a scale comparison. GPT-2 used WebText and a 50,257-token vocabulary; this run used FineWeb-Edu and a 32,000-token BPE vocabulary. See the [original GPT-2 paper](https://cdn.openai.com/better-language-models/language-models.pdf) and the [OpenAI GPT-2 model card](https://github.com/openai/gpt-2/blob/master/model_card.md).
 
 | Metric | This project | Original GPT-2 reference |
 |---|---:|---:|
@@ -241,17 +242,17 @@ The closest historical reference is GPT-2 Small, which has approximately **124M 
 
 \* The historical GPT-2 time and cost figures refer to the full original training run, not exclusively to the 124M GPT-2 Small checkpoint. They are therefore useful as a scale comparison, but are not a controlled benchmark: the runs used different hardware, software, datasets, model sizes, and training budgets. Based on these figures, this project completed in roughly **48× less wall-clock time** and at roughly **1,720× lower estimated cost**.
 
-The much lower cost was enabled by training a smaller model for one epoch on a modern, locally available setup. It should not be interpreted as equivalent training compute or equivalent final model quality to the original GPT-2 research run.
+The cost difference mostly comes from the smaller model, one training epoch, and the local hardware. It is not an equivalent reproduction of the original GPT-2 training run.
 
 ## Generation result
 
-After training, the model generated:
+One short generation was:
 
 > The question is whether the water in the ocean is actually fresh. In this case the question is whether the sea is actually fresh.
 
-Generation completed successfully with the `<eos>` token. The model generated at approximately **150 tokens/s** on an **NVIDIA RTX 3050 Laptop GPU with 4 GB VRAM**.
+The model generated at approximately **150 tokens/s** on an **NVIDIA RTX 3050 Laptop GPU with 4 GB VRAM**.
 
-The output demonstrates locally coherent, grammatically correct English, but it is short and repetitive. This is expected for a roughly 104M-parameter model after a single training epoch.
+The output is sometimes grammatical, but it is also short and repetitive, which is not surprising for a 104M-parameter model trained for one epoch.
 
 ### Additional generation output
 
@@ -261,17 +262,15 @@ The death of the cat has been caused by several factors, including albinism, a l
 [generated 128 tokens in 0.81 s | 157.16 tok/s]
 ```
 
-This sample contains **128 generated tokens** and was produced in **0.81 s**, corresponding to **157.16 tokens/s**. It is broadly fluent but semantically unstable, with repetition and abrupt truncation, which is consistent with a small model trained for only one epoch.
+This sample contains **128 generated tokens** and took **0.81 s** (**157.16 tokens/s**). It is readable in places, but repetitive and semantically unstable.
 
-> **Important note:** This model is a standard next-token text-prediction model. It generates text by estimating which token is likely to come next; it does not perform reasoning, fact checking, or semantic verification. Therefore, many logical, factual, grammatical, and syntactic errors should be expected, as illustrated by the sample above. The generated text must not be treated as reliable information.
+> **Note:** This is a next-token prediction model. It does not fact-check or verify what it generates, so the output should not be treated as reliable information.
 
-## Conclusions
+## Notes
 
-1. Training completed without errors, and the model was also exported in Hugging Face format.
-2. Validation loss decreased from `3.908841` at step 5,000 to `3.282484` at the end of training, indicating clear learning progress.
-3. The final validation loss is slightly lower than the training loss, so the log does not show clear signs of overfitting.
-4. The lowest recorded training loss was `3.197763` at step 45,000, while the final checkpoint achieved the lowest validation loss in the run.
-5. Further quality improvements could come from additional epochs, learning-rate schedule tuning, a warmup phase, and evaluation with a larger set of prompts.
+The run completed without errors, and the model was also exported in Hugging Face format. Validation loss fell from `3.908841` at step 5,000 to `3.282484` at the end. The final validation loss was slightly below the final training loss, although this single run is not enough to draw strong conclusions about generalization.
+
+The lowest recorded training loss was `3.197763` at step 45,000. More training, a warmup schedule, different learning-rate settings, and a larger evaluation set would be reasonable next experiments.
 
 ## Artifacts
 

@@ -76,6 +76,31 @@ namespace {
         bool cpu = false;
     };
 
+    /**
+     * Selects the execution device without turning an unavailable CUDA
+     * runtime into a fatal error for the automatic mode.
+     *
+     * cudaGetDeviceCount can return errors such as cudaErrorNoDevice,
+     * cudaErrorInsufficientDriver, or cudaErrorInitializationError when the
+     * CUDA toolkit/runtime is present but no usable GPU is available. Those
+     * are all valid reasons to use the CPU when the user selected `auto`.
+     */
+    bool select_cpu_device(const std::string &requested_device) {
+        if (requested_device == "cpu") return true;
+        if (requested_device == "cuda") return false;
+
+        int device_count = 0;
+        const cudaError_t status = cudaGetDeviceCount(&device_count);
+        if (status == cudaSuccess && device_count > 0) return false;
+
+        // cudaGetDeviceCount leaves the runtime error pending. Clear it before
+        // constructing CPU tensors, otherwise a later CUDA API call can report
+        // this stale detection failure instead of the actual operation result.
+        const cudaError_t cleared_status = cudaGetLastError();
+        (void)cleared_status;
+        return true;
+    }
+
     [[noreturn]] void usage(const std::string &error = {}) {
         print_banner(std::cerr);
         if (!error.empty()) std::cerr << "Error: " << error << "\n\n";
@@ -363,14 +388,11 @@ int main(int argc, char **argv) {
         };
         const std::size_t context = json_size(config, "max_position_embeddings");
         Arguments runtime_args = args;
-        if (runtime_args.device == "auto") {
-            int device_count = 0;
-            const cudaError_t status = cudaGetDeviceCount(&device_count);
-            runtime_args.cpu = status != cudaSuccess || device_count == 0;
-            if (status != cudaSuccess) cudaGetLastError();
-        } else {
-            runtime_args.cpu = runtime_args.device == "cpu";
-        }
+        runtime_args.cpu = select_cpu_device(runtime_args.device);
+        if (runtime_args.device == "auto" && runtime_args.cpu)
+            std::cerr << ansi::yellow
+                      << "CUDA unavailable; falling back to CPU."
+                      << ansi::reset << '\n';
         if (runtime_args.max_context_tokens == 0) runtime_args.max_context_tokens = context;
         if (runtime_args.max_context_tokens > context) throw std::runtime_error(
             "--context exceeds max_position_embeddings");

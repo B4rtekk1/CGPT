@@ -100,6 +100,15 @@ set_target_properties(cgpt_train PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_R
 add_executable(cgpt_cli src/cli.cpp)
 target_link_libraries(cgpt_cli PRIVATE cgpt_core cgpt_tokenizer CUDA::cudart)
 set_target_properties(cgpt_cli PROPERTIES CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+if (MSVC)
+    # cuBLASLt is only needed by the CUDA generation path. Delay-load it so
+    # `--device auto`/`--device cpu` can run when the CUDA/cuBLAS DLL is not
+    # installed; the CPU path never constructs a CublasLtContext.
+    string(REGEX MATCH "^[0-9]+" CGPT_CUDA_MAJOR "${CMAKE_CUDA_COMPILER_VERSION}")
+    set(CGPT_CUBLASLT_DLL "cublasLt64_${CGPT_CUDA_MAJOR}.dll")
+    target_link_options(cgpt_cli PRIVATE "/DELAYLOAD:${CGPT_CUBLASLT_DLL}")
+    target_link_libraries(cgpt_cli PRIVATE delayimp.lib)
+endif()
 add_custom_command(TARGET cgpt_cli POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/outputdg/step-58874"
