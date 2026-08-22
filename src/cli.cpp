@@ -72,7 +72,9 @@ namespace {
         float frequency_penalty = 0.0F;
         std::size_t no_repeat_ngram_size = 0;
         std::uint64_t seed = 0;
-        std::string device = "auto";
+        // CPU is the safest default for machines without a compatible CUDA
+        // runtime or GPU. CUDA remains available explicitly via --device cuda.
+        std::string device = "cpu";
         bool cpu = false;
     };
 
@@ -120,7 +122,7 @@ namespace {
                 << "  --frequency-penalty X         per-occurrence token penalty (default: 0)\n"
                 << "  --no-repeat-ngram N            block repeated n-grams (default: 0)\n"
                 << "  --seed N                       random seed\n"
-                << "  --device auto|cpu|cuda         execution device (default: auto)\n"
+                << "  --device auto|cpu|cuda         execution device (default: cpu)\n"
                 << "\nREPL commands:\n"
                 << "  /set <parameter> <value>       change generation parameter\n"
                 << "  /params                        show current generation parameters\n"

@@ -72,6 +72,8 @@ To display CLI help and use common generation parameters:
 
 The REPL supports `/help`, `/params`, `/set <parameter> <value>`, and `/exit`.
 
+The CLI uses the CPU by default. To use CUDA explicitly, add `--device cuda`.
+
 ### Training
 
 Example training command using the configuration described in this report:
