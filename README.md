@@ -1,18 +1,14 @@
 # CUDA Generative Pretrained Transformer
 CGPT is an experimental GPT-style language model built from scratch with C++20 and CUDA. It includes the model code, custom CUDA kernels, training and text-generation tools, and a small test suite.
 
-This README also records the results of one training run of the 104M-parameter model.
-
 ## Training run
 
-The `104m` model was trained for one epoch on approximately 10 GB of `FineWeb-Edu` data. The run finished after **58,874 optimizer steps**.
+The `104m` model was trained for one epoch on 10 GB of `FineWeb-Edu` data. The run finished after **58,874 optimizer steps**.
 
 Final losses were:
 
 - training: **3.302037**
 - validation: **3.282484**
-
-The model and checkpoints are in `output/model-104m`.
 
 ## Table of contents
 
@@ -30,7 +26,7 @@ The model and checkpoints are in `output/model-104m`.
 
 ## Quick start
 
-The project builds a CUDA core library, the `cgpt_train` training executable, the `cgpt_cli` text-generation interface, and a unit-test suite. The main requirements are:
+The project builds a CUDA core library, the `cgpt_train` training executable, the `cgpt_cli` text-generation interface and a unit-test suite. The main requirements are:
 
 - CMake `4.3` or newer;
 - a C++20 compiler with CUDA support;
@@ -62,15 +58,6 @@ To generate text from a single prompt:
   --temperature 0.8 `
   --device cuda
 ```
-
-To display CLI help and use common generation parameters:
-
-```powershell
-.\build\Release\cgpt_cli.exe --help
-.\build\Release\cgpt_cli.exe --prompt "Hello" --top-k 40 --top-p 0.95 --seed 42
-```
-
-The REPL supports `/help`, `/params`, `/set <parameter> <value>`, and `/exit`.
 
 The CLI uses the CPU by default. To use CUDA explicitly, add `--device cuda`.
 
@@ -110,16 +97,6 @@ The generated documentation is written to the `html` and `latex` directories. To
 Start-Process .\html\index.html
 ```
 
-Useful helper scripts:
-
-```powershell
-python scripts\download_100mb.py
-python scripts\download_fineweb_edu.py
-.\scripts\profile_kernels.ps1
-```
-
-Data and model paths may need to be adjusted for the selected CMake generator.
-
 ## Experiment configuration
 
 | Parameter | Value |
@@ -138,28 +115,6 @@ Data and model paths may need to be adjusted for the selected CMake generator.
 | Validation fraction | 10% |
 | Validation interval | Every 5,000 steps |
 | Validation batches | 64 |
-
-The training run was started with:
-
-```bash
-./build/cgpt_train \
-  --input data/fineweb_edu_10gb.jsonl \
-  --tokenizer data/fineweb_edu_tokenizer_32k.json \
-  --output-dir output/model-104m \
-  --model 104m \
-  --vocab-size 32000 \
-  --batch-size 32 \
-  --sequence-length 1024 \
-  --epochs 1 \
-  --learning-rate 3e-4 \
-  --min-learning-rate 3e-5 \
-  --warmup-steps 0 \
-  --loss-scale 1024 \
-  --validation-fraction 0.1 \
-  --validation-interval 5000 \
-  --validation-batches 64 \
-  --save-avg-loss
-```
 
 ## Data preparation
 
